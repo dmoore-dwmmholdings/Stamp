@@ -714,7 +714,10 @@ class TestExport3mf:
         _names, model = self._model(path)
         ns = {"c": self.CORE}
 
-        objects = model.findall(".//c:object", ns)
+        objects = [
+            o for o in model.findall(".//c:object", ns)
+            if o.findall(".//c:triangle", ns)
+        ]
         assert len(objects) == len(split.bodies)
         for index, obj in enumerate(objects):
             expected = "0" if index == 0 else "1"
@@ -735,16 +738,38 @@ class TestExport3mf:
         assert names == {"[Content_Types].xml", "_rels/.rels", "3D/3dmodel.model"}
         assert not any(n.endswith(".config") for n in names)
 
-    def test_every_body_is_placed_on_the_plate(self, split, tmp_path):
+    def test_the_bodies_are_one_object_so_they_move_together(self, split, tmp_path):
+        """A slicer moves whatever a build item names.
+
+        One item per body puts each on the plate on its own, and orienting the
+        part then leaves the artwork behind.  The bodies are components of a
+        single object instead, so there is one thing to move and the colours
+        travel with it.
+        """
         from stamp.io.export import export_3mf
 
         path = tmp_path / "color.3mf"
         export_3mf(split.bodies, path)
         _names, model = self._model(path)
         ns = {"c": self.CORE}
+
         items = model.findall(".//c:item", ns)
-        assert len(items) == len(split.bodies)
-        assert all(i.get("transform") for i in items)
+        assert len(items) == 1, "one object on the plate, not one for each body"
+
+        assembly_id = items[0].get("objectid")
+        assembly = next(
+            o for o in model.findall(".//c:object", ns) if o.get("id") == assembly_id
+        )
+        components = assembly.findall(".//c:component", ns)
+        assert len(components) == len(split.bodies)
+        assert not assembly.findall(".//c:triangle", ns), "the assembly holds no mesh"
+
+        # Every component points at a body that does have a mesh.
+        mesh_ids = {
+            o.get("id") for o in model.findall(".//c:object", ns)
+            if o.findall(".//c:triangle", ns)
+        }
+        assert {c.get("objectid") for c in components} == mesh_ids
 
     def test_short_and_long_colours_are_both_accepted(self, split, tmp_path):
         from stamp.io.export import export_3mf

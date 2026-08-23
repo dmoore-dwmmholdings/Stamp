@@ -7,6 +7,7 @@ toolbar along the bottom.
 
 from __future__ import annotations
 
+import math
 import time
 from pathlib import Path
 
@@ -1467,6 +1468,11 @@ class MainWindow(QMainWindow):
             self._display_geometry(result.geometry, result.mode)
 
         self._refresh_status()
+        # Correct a value that will not build *before* anything that can open a
+        # dialog.  A modal dialog runs a nested event loop, so a later rebuild can
+        # finish inside it and this handler re-enters; the outer call would then
+        # act on a result that has already been replaced.
+        self._auto_apply_working_values(result)
         if (result.duration_ms > SLOW_REBUILD_MS and not self._draft_display
                 and not self._slow_offer_declined):
             self._offer_draft_display(result.duration_ms)
@@ -1497,7 +1503,6 @@ class MainWindow(QMainWindow):
             feature = self.selected_feature
             if feature is not None:
                 self._warn_profile_larger_than_face(feature)
-        self._auto_apply_working_values(result)
 
     def _auto_apply_working_values(self, result: RebuildResult) -> None:
         """A fillet or chamfer that failed names the largest value that works.
@@ -1507,6 +1512,8 @@ class MainWindow(QMainWindow):
         capped per modifier: a suggestion that itself fails produces a smaller
         one, and three tries is enough for any real artwork.
         """
+        if result is not self._last_result:
+            return  # a nested event loop replaced it while a dialog was open
         fixes = []
         for row in result.features:
             if not row.suggested_values:
@@ -1522,7 +1529,12 @@ class MainWindow(QMainWindow):
                     continue
                 if self._auto_value_attempts.get(modifier.id, 0) >= 3:
                     continue
-                if abs(modifier.value - value) < 1e-9:
+                # The panel shows three decimals.  Storing more than it can show
+                # means the number on screen is larger than the one that builds,
+                # and the next edit writes that larger number back and fails
+                # again.  Round down, so what is shown is what is stored.
+                value = math.floor(value * 1000.0) / 1000.0
+                if value <= 0 or abs(modifier.value - value) < 1e-9:
                     continue
                 self._auto_value_attempts[modifier.id] = (
                     self._auto_value_attempts.get(modifier.id, 0) + 1

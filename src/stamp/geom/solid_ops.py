@@ -538,9 +538,12 @@ MAX_SEARCHED_EDGES = 250
 SAFE_EDGE_FRACTION = 0.5
 
 #: Halvings the descent may spend before it gives up, by edge count.  Each one
-#: is a complete build.
-MAX_DESCENT_BUILDS = 12
-MAX_ESTIMATE_BUILDS = 4
+#: is a complete build, so a big set gets fewer - but never so few that the
+#: descent stops above :data:`MIN_USEFUL_VALUE` with the answer still ahead of
+#: it.  Stopping early is what makes the interface say a value cannot be found
+#: when one can, and then there is nothing to correct the user's value with.
+MAX_DESCENT_BUILDS = 16
+MAX_ESTIMATE_BUILDS = 8
 
 
 def smallest_detail(edges: list[TopoDS_Edge]) -> float:
@@ -577,6 +580,13 @@ def _descend_to_working_value(
     return None, failing
 
 
+def _descent_steps(seed: float) -> int:
+    """Halvings needed to walk *seed* down to the smallest useful value."""
+    if seed <= MIN_USEFUL_VALUE:
+        return 1
+    return int(math.ceil(math.log2(seed / MIN_USEFUL_VALUE))) + 1
+
+
 def _largest_working_value(
     shape: TopoDS_Shape, modifier: Modifier, edges: list[TopoDS_Edge]
 ) -> tuple[float | None, bool]:
@@ -596,10 +606,11 @@ def _largest_working_value(
     if shortest > 0:
         seed = min(seed, SAFE_EDGE_FRACTION * shortest)
 
+    ceiling = MAX_DESCENT_BUILDS if searchable else MAX_ESTIMATE_BUILDS
     working, failing = _descend_to_working_value(
         shape, modifier, edges,
         seed=seed,
-        budget=MAX_DESCENT_BUILDS if searchable else MAX_ESTIMATE_BUILDS,
+        budget=min(_descent_steps(seed), ceiling),
     )
     if working is None or not searchable:
         return working, False

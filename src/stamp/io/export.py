@@ -323,13 +323,24 @@ def export_3mf(
         )
         parts.append("    </triangles>\n   </mesh>\n  </object>\n")
 
-    parts.append(" </resources>\n <build>\n")
+    # The bodies go on the plate as one object built from components, not as one
+    # item each.  A slicer moves and turns whatever a build item names, so
+    # separate items leave the artwork behind when the part is oriented.
+    assembly_id = len(bodies) + 2
+    parts.append(f'  <object id="{assembly_id}" type="model" name="Stamp part">\n')
+    parts.append("   <components>\n")
     for index in range(len(bodies)):
         parts.append(
-            f'  <item objectid="{index + 2}"'
+            f'    <component objectid="{index + 2}"'
             f' transform="1 0 0 0 1 0 0 0 1 0 0 0"/>\n'
         )
-    parts.append(" </build>\n</model>\n")
+    parts.append("   </components>\n  </object>\n")
+    parts.append(
+        " </resources>\n <build>\n"
+        f'  <item objectid="{assembly_id}"'
+        ' transform="1 0 0 0 1 0 0 0 1 0 0 0"/>\n'
+        " </build>\n</model>\n"
+    )
 
     content_types = (
         '<?xml version="1.0" encoding="UTF-8"?>\n'

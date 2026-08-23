@@ -239,6 +239,43 @@ strict mode with no warnings and resolves every triangle to the right colour.
 That is a spec check, not a Bambu check - nothing here has been opened in Bambu
 Studio.
 
+## v0.2.2 - why the automatic value still did nothing
+
+Three separate causes, all found by driving the real window instead of the
+model:
+
+1. The value stored had more precision than the panel shows. The panel shows
+   three decimals, so a stored 0.09375 appeared as 0.094 - and the next edit
+   committed 0.094 back into the model, which is larger than the value that
+   works, so it failed again. Three of those and the attempt cap stopped
+   correcting for good, which is the "I have to type it in myself every time"
+   the user reported. The value is now rounded *down* to three decimals before
+   it is stored, so what is on screen is what is stored.
+
+2. `_auto_apply_working_values` ran at the end of `_on_rebuild_finished`, after
+   the slow-rebuild offer. That offer is a modal dialog, and a modal dialog runs
+   a nested event loop: a later rebuild can finish inside it and re-enter the
+   handler, and the outer call then acts on a result that has been replaced. A
+   failing fillet search on fine artwork passes the ten-second mark easily, so
+   this was reachable in the application and not in any test, because the tests
+   run with `interactive` off. The correction now runs before anything that can
+   open a dialog, and returns early if its result is no longer the current one.
+
+3. The descent gave up before reaching the smallest useful value on large edge
+   sets, so no value came back at all. The budget is now derived from the seed:
+   enough halvings to walk it down to `MIN_USEFUL_VALUE`, capped by the build
+   budget for the edge count.
+
+The 3MF bodies were one build item each. A slicer moves what a build item
+names, so orienting the part left the artwork behind on the plate. The bodies
+are now components of a single object, and there is one item.
+
+"The 3mf file has invalid config, load geometry data only" is not a fault in
+the file. Bambu Studio says it for every 3MF that is not one of its own
+projects - Fusion, FreeCAD and OnShape exports all produce it. Colours load
+normally alongside it. Removing it would mean writing a full Bambu project,
+which is the vendor path that broke v0.2.0.
+
 ## Timings on the standard test
 
 `bracket.step` / `bracket.stl` with `logo.svg`:

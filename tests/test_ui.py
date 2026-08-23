@@ -1184,3 +1184,126 @@ class TestWorkingValueIsAppliedAutomatically:
     def test_the_3mf_export_is_offered(self, window, qtbot, fixtures):
         self._drop_logo(window, qtbot, fixtures)
         assert window.action_export_3mf.isEnabled()
+
+
+@needs_gl
+class TestTheDefaultValueIsCorrectedToo:
+    """Add a fillet, take the default, and it must fix itself (§6.4).
+
+    This is the case a user actually meets: "+ Fillet" starts at 0.3 mm, fine
+    artwork cannot take that, and the correction has to happen without anyone
+    reading a number out of a message and typing it back in.  The first test of
+    this feature typed a value in by hand, which is not how anyone reaches it.
+    """
+
+    DEFAULT = 0.3
+
+    @pytest.fixture
+    def window(self, qtbot, fixtures):
+        from stamp.ui.main_window import MainWindow
+
+        win = MainWindow()
+        win.interactive = False
+        qtbot.addWidget(win)
+        win.show()
+        qtbot.waitExposed(win)
+        win.open_part(fixtures / "bracket.step")
+        self._settle(qtbot, win)
+        win.viewport.fit_all()
+        qtbot.wait(300)
+        yield win
+        win.rebuilder.shutdown()
+
+    def _settle(self, qtbot, window):
+        qtbot.wait(300)
+        for _ in range(400):
+            if not window.rebuilder.busy:
+                break
+            qtbot.wait(100)
+        qtbot.wait(200)
+
+    def _fine_feature(self, window, qtbot, fixtures):
+        """Artwork too fine for the default, made by shrinking the logo."""
+        from PySide6.QtCore import QMimeData, QPointF, QUrl
+        from PySide6.QtGui import QDropEvent
+
+        mime = QMimeData()
+        mime.setUrls([QUrl.fromLocalFile(str(fixtures / "logo.svg"))])
+        centre = window.viewport.mapTo(window, window.viewport.rect().center())
+        window.dropEvent(QDropEvent(
+            QPointF(centre), Qt.DropAction.CopyAction, mime,
+            Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier,
+        ))
+        self._settle(qtbot, window)
+        assert window.document.features, "the drop did not make a feature"
+        feature = window.document.features[0]
+        feature.placement.scale = (0.05, 0.05)
+        window.request_rebuild(immediate=True)
+        self._settle(qtbot, window)
+        window.tree.select_feature(feature.id)
+        qtbot.wait(50)
+        return feature
+
+    def test_the_default_fillet_is_corrected_without_being_typed(
+        self, window, qtbot, fixtures
+    ):
+        feature = self._fine_feature(window, qtbot, fixtures)
+        window._add_modifier("fillet")
+        assert feature.modifiers[0].value == self.DEFAULT
+
+        for _ in range(6):
+            self._settle(qtbot, window)
+            if feature.modifiers[0].value != self.DEFAULT:
+                break
+
+        value = feature.modifiers[0].value
+        assert value != self.DEFAULT, (
+            "the default was too large and nothing corrected it"
+        )
+        assert 0 < value < self.DEFAULT
+        assert "largest that works" in window.warning_label.text()
+
+    def test_the_corrected_value_leaves_no_warning_behind(
+        self, window, qtbot, fixtures
+    ):
+        """The value it settles on has to be one that really builds."""
+        feature = self._fine_feature(window, qtbot, fixtures)
+        window._add_modifier("fillet")
+        for _ in range(6):
+            self._settle(qtbot, window)
+            if feature.modifiers[0].value != self.DEFAULT:
+                break
+        self._settle(qtbot, window)
+
+        assert window._last_result is not None
+        row = window._last_result.result_for(feature.id)
+        assert row is not None
+        assert not row.suggested_values, (
+            f"the value it chose still does not build: {row.warnings}"
+        )
+
+    def test_a_chamfer_default_is_corrected_as_well(self, window, qtbot, fixtures):
+        feature = self._fine_feature(window, qtbot, fixtures)
+        window._add_modifier("chamfer")
+        for _ in range(6):
+            self._settle(qtbot, window)
+            if feature.modifiers[0].value != self.DEFAULT:
+                break
+        assert feature.modifiers[0].value != self.DEFAULT
+
+    def test_the_panel_shows_the_value_it_chose(self, window, qtbot, fixtures):
+        """The number in the box has to match the model, or the next edit undoes it."""
+        from PySide6.QtWidgets import QDoubleSpinBox
+
+        feature = self._fine_feature(window, qtbot, fixtures)
+        window._add_modifier("fillet")
+        for _ in range(6):
+            self._settle(qtbot, window)
+            if feature.modifiers[0].value != self.DEFAULT:
+                break
+        qtbot.wait(200)
+
+        boxes = window.properties._modifiers.findChildren(QDoubleSpinBox)
+        assert boxes, "no modifier row in the panel"
+        shown = [round(b.value(), 6) for b in boxes]
+        assert round(feature.modifiers[0].value, 6) in shown, shown
