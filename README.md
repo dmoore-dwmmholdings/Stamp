@@ -5,138 +5,136 @@
 [![CI](https://github.com/dmoore-dwmmholdings/Stamp/actions/workflows/ci.yml/badge.svg)](https://github.com/dmoore-dwmmholdings/Stamp/actions/workflows/ci.yml)
 [![License](https://img.shields.io/github/license/dmoore-dwmmholdings/Stamp)](LICENSE)
 [![Release](https://img.shields.io/github/v/release/dmoore-dwmmholdings/Stamp?include_prereleases)](https://github.com/dmoore-dwmmholdings/Stamp/releases)
-[![Last commit](https://img.shields.io/github/last-commit/dmoore-dwmmholdings/Stamp)](https://github.com/dmoore-dwmmholdings/Stamp/commits/main)
-[![Commits](https://img.shields.io/github/commit-activity/m/dmoore-dwmmholdings/Stamp)](https://github.com/dmoore-dwmmholdings/Stamp/commits/main)
 [![Python 3.12+](https://img.shields.io/badge/python-3.12%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
 [![Ruff](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/astral-sh/ruff/main/assets/badge/v2.json)](https://github.com/astral-sh/ruff)
 [![Visits](https://hits.sh/github.com/dmoore-dwmmholdings/Stamp.svg?label=visits&color=6e7681)](https://hits.sh/github.com/dmoore-dwmmholdings/Stamp/)
 
-Stamp is a desktop application. It puts 2D artwork onto 3D parts as geometry, not as an image.
+Stamp is a desktop app that puts 2D artwork onto 3D parts as real geometry — not a
+decal, not a texture.
 
-You have a 3D part, which is a STEP file or an STL file. You also have a 2D profile,
-which is an SVG, DXF or DWG file. The profile can be a logo, a serial number, a slot
-pattern or a keep-out shape. Stamp makes that profile into geometry on the part. The
-geometry can protrude, or go into the part, or cut through it. The edges can be
-circular or have a chamfer. You put the profile in position with the mouse. Then you
-type the accurate numbers. Then you export a STEP file for the machine shop and an
-STL file for the printer.
+You bring a 3D part (STEP or STL) and a 2D profile (SVG, DXF, or DWG): a logo, a
+serial number, a slot pattern, a keep-out shape. Stamp turns that profile into
+geometry on the part — raised, engraved, or cut clean through, with fillets or
+chamfers on the edges if you want them. Drag it into place with the mouse, type
+exact numbers where it matters, then export STEP for the machine shop and STL for
+the printer.
 
 ## Install
+
+Download the latest `Stamp-x.y.z-Setup.exe` from the
+[releases page](https://github.com/dmoore-dwmmholdings/Stamp/releases) and run it.
+It installs for the current user only, so no administrator password is needed, adds
+a Start menu shortcut, and registers the `.stamp` file type.
+
+On other platforms, or if you'd rather run from source:
 
 ```
 uv sync
 uv run stamp
 ```
 
-You can also give a file on the command line:
+You can also pass a file on the command line:
 
 ```
 uv run stamp tests/fixtures/bracket.step
 uv run stamp my_project.stamp
 ```
 
-## Workflow
+## The workflow
 
 1. Open a part.
 2. Add a profile.
-3. Click the face for the profile.
-4. Set the dimensions and the position in the properties panel.
-5. Set the depth and the operation.
-6. Add a fillet or a chamfer.
+3. Click the face it belongs on.
+4. Dial in the size and position in the properties panel.
+5. Pick the depth and the operation.
+6. Add a fillet or chamfer if you want one.
 7. Export.
 
 ## Text
 
-Stamp makes artwork from a message. A file is not necessary.
+No artwork file? Type it instead.
 
 1. Open a part.
-2. Push Ctrl+T, or click "+ Add text".
-3. Click the face for the text.
-4. Type the message in the properties panel.
-5. Set the font, the em size and the format.
-6. Set the depth and the operation.
+2. Press Ctrl+T, or click "+ Add text".
+3. Click the face the text belongs on.
+4. Type your text in the properties panel.
+5. Pick the font, size, and formatting.
+6. Pick the depth and the operation.
 
-The em size of the font is in millimeters. Text accepts each operation and each
-modifier that a logo accepts. Thus you can cut text into the part, or make it
-protrude, and give it a fillet or a chamfer.
+Font size is the em size in millimeters. Text supports everything a logo does — cut
+it into the part or raise it out, fillet or chamfer the edges. Formatting covers
+font, size, bold, italic, underline, alignment, wrap width, letter spacing, and line
+spacing (justify needs a wrap width).
 
-These controls set the format: the font, the em size, bold, italic, underline, the
-alignment, the wrap width, the letter spacing and the line spacing. Justify is
-possible only with a wrap width.
-
-A text feature keeps the message in the project file. Thus no artwork file can go
-missing.
+A text feature stores the text itself in the project file, so there is no artwork
+file to lose.
 
 ## Fillets and chamfers
 
-Stamp puts the fillet on all the edges of the selection in one operation. One edge
-that cannot accept the radius stops the operation for all of them. Thus the radius
-must suit the smallest detail of the artwork.
+A fillet applies to every edge of the selection in one operation, and one edge that
+can't take the radius fails it for all of them — so the radius has to suit the
+smallest detail in the artwork.
 
-If the radius is too large, Stamp finds a radius that works. The message names it,
-and a button adjacent to the value puts it in.
+If the radius is too large, Stamp finds one that works. The warning names it, and a
+button next to the value fills it in.
 
-Detailed artwork has small edges. Thus it accepts only a small radius. To get a
-larger radius, make the artwork larger or make it more simple.
+Detailed artwork has short edges and can only take a small radius. For a bigger
+radius, make the artwork bigger or simpler.
 
-A chamfer operates in the same manner. The distance has the same limit as the
-radius.
+Chamfers work the same way, and the distance has the same limit as the radius.
 
-## The two types of part
+## The two kinds of part
 
-A STEP file is a solid with accurate surfaces. An STL file is a set of triangles.
-Stamp does not mix the two.
+A STEP file is a solid with exact surfaces. An STL is a bag of triangles. Stamp
+never pretends one is the other.
 
 | Input | Boolean engine | Blend into the part | Export |
 |---|---|---|---|
 | STEP, IGES, BREP | OpenCascade | Yes | STEP and STL |
 | STL, 3MF, OBJ | manifold3d | No | STL only |
 
-The tool solid is always a B-rep, in the two conditions. Thus a fillet on the top
-edge of a logo that protrudes operates on an STL part. A blend into the surface
-around it is different. It is only possible with accurate surfaces.
+The tool solid is always a B-rep in both modes, which is why a fillet on the top
+edge of a raised logo works even on an STL part. Blending into the surrounding
+surface is different — that needs exact surfaces.
 
-If you start with an STL, you get an STL. Stamp does not make surfaces that it does
-not have. If a STEP file is necessary for the shop, start with a STEP file.
+STL in means STL out. Stamp won't invent surfaces it doesn't have, so if the shop
+needs a STEP file, start from a STEP file.
 
-## What Stamp does not do
+## What Stamp doesn't do
 
-- Full parametric sketches. Profiles come from files.
+- Full parametric sketching — profiles come from files.
 - Assemblies, multiple bodies, materials.
-- Changes to the initial geometry of the part.
+- Editing the part's original geometry.
 - Toolpaths, drawings, GD&T.
 - Cloud, accounts, plugins.
 
-## Files
+## Project layout
 
 | Path | Content |
 |---|---|
-| `src/stamp/core/` | The document, the anchors and the rebuild engine. |
-| `src/stamp/io/` | Import, normalization, export and the project archive. |
-| `src/stamp/geom/` | The tool solid, the OCC path and the mesh path. |
-| `src/stamp/ui/` | The window, the viewport, the tree and the panel. |
-| `tests/` | The test suite and the fixtures. |
-| `packaging/` | The PyInstaller specification. |
+| `src/stamp/core/` | The document, anchors, and the rebuild engine. |
+| `src/stamp/io/` | Import, normalization, export, and the project archive. |
+| `src/stamp/geom/` | The tool solid, the OCC path, and the mesh path. |
+| `src/stamp/ui/` | The window, viewport, feature tree, and properties panel. |
+| `tests/` | The test suite and its fixtures. |
+| `packaging/` | The PyInstaller spec and the installer script. |
 
-A `.stamp` project is a zip archive. It holds a manifest, a copy of the part, a copy
-of each profile, and a thumbnail. It holds no geometry, because all of it rebuilds
-from the sources. You can open it with any unzip tool.
+A `.stamp` project is a plain zip archive: a manifest, a copy of the part, a copy of
+each profile, and a thumbnail. No geometry is stored — everything rebuilds from the
+sources. Any unzip tool can open one.
 
-## Reports
+## Logs and crash reports
 
-Stamp writes a log at each start. On Windows the log is in
+Stamp writes a log on every start. On Windows it lives at
 `%LOCALAPPDATA%\Stamp\logs\stamp.log`.
 
-If Stamp stops without warning, the next start shows a prompt. You can also click
-"Report a crash" or "Report a bug" at any time.
+If Stamp crashes, the next start offers to report it, and "Report a crash" /
+"Report a bug" are available any time. Stamp drafts the email for you — details,
+machine info, the last lines of the log — so all you do is look it over and send it.
+Nothing is ever sent automatically. Since a `mailto:` link can't carry an
+attachment, the full report also goes to a file, and the email names it.
 
-Stamp writes the email for you. The email holds the details, the machine and the
-last lines of the log. Examine the email, then send it.
-
-Stamp sends no report on its own. An email link cannot carry a file, thus a full
-copy of the report goes to a file. The email gives the name of that file.
-
-## The Windows installer
+## Building the Windows installer
 
 ```
 python -m uv run python packaging/make_icons.py
@@ -144,9 +142,8 @@ python -m uv run pyinstaller packaging/stamp.spec --noconfirm --distpath build/d
 ISCC.exe packaging/stamp.iss
 ```
 
-The result is one file in `packaging/dist/`. It installs for one user, thus no
-administrator password is necessary. It makes a shortcut in the Start menu, and it
-can open `.stamp` files.
+The result is a single `Stamp-x.y.z-Setup.exe` in `packaging/dist/`. A tagged
+release builds this automatically and attaches it to the GitHub release.
 
 ## Development
 
@@ -154,21 +151,15 @@ can open `.stamp` files.
 uv run pytest
 uv run ruff check src tests
 uv run python tests/make_fixtures.py
-uv run pyinstaller packaging/stamp.spec --noconfirm
 ```
 
-Each push to GitHub starts the lint tool and the test suite on Windows and on Linux.
-The file `.github/workflows/ci.yml` controls this. The tests that show a window do
-not run there, because the machines have no display.
+Every push runs lint and the test suite on Windows and Linux via GitHub Actions
+(`.github/workflows/ci.yml`). Tests that need a real window and OpenGL are skipped
+there — the runners are headless.
 
-The file `PROGRESS.md` records the condition of each milestone and the results that
-are important to keep.
-
-## Documentation rules
-
-All prose in this repository obeys ASD-STE100 Simplified Technical English. The file
-`ste-glossary.txt` holds the technical nouns and technical verbs of the project.
+`PROGRESS.md` tracks milestone status and records the hard-won findings worth
+keeping.
 
 ## License
 
-The MIT license applies to Stamp. Refer to the file [`LICENSE`](LICENSE).
+MIT — see [`LICENSE`](LICENSE).

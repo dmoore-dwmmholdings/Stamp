@@ -1,28 +1,28 @@
 # Stamp progress
 
-This file records the progress against the milestones in section 11 of the
-specification. Update this file at the end of each work period.
+Tracks progress against the milestones in section 11 of the spec. Updated at the
+end of each work session.
 
 ## Environment
 
-The uv tool is installed with pip. It is not on the PATH. Thus you must start it as
-a Python module. The virtual environment is `.venv`, with Python 3.12.10.
+uv was installed with pip and isn't on PATH, so run it as a module. The virtual
+environment is `.venv` with Python 3.12.10.
 
-To start the application:
+Run the app:
 
 ```
 python -m uv run stamp
 python -m uv run stamp tests/fixtures/bracket.step
 ```
 
-To start the test suite and the lint tool:
+Tests and lint:
 
 ```
 python -m uv run pytest
 python -m uv run ruff check src tests
 ```
 
-To make the test fixtures again, and to make the package:
+Regenerate fixtures / build the package:
 
 ```
 python -m uv run python tests/make_fixtures.py
@@ -31,178 +31,173 @@ python -m uv run pyinstaller packaging/stamp.spec --noconfirm
 
 ## Milestones
 
-| Number | Milestone | Condition |
+| Number | Milestone | Status |
 |---|---|---|
-| M0 | Skeleton and OCC viewport. | Completed |
-| M1 | Import and preview. STEP, STL, SVG and DXF. | Completed |
-| M2 | One completed feature, from face selection to export. | Completed |
-| M3 | Placement with the mouse. Drag handles, snap, live preview. | Completed |
-| M4 | Feature tree, modifiers, rebuild, project files. | Completed |
-| M5 | Polish. Error messages, packages. | Completed for Windows |
+| M0 | Skeleton and OCC viewport. | Done |
+| M1 | Import and preview: STEP, STL, SVG, DXF. | Done |
+| M2 | One complete feature, from face selection to export. | Done |
+| M3 | Mouse placement: drag handles, snapping, live preview. | Done |
+| M4 | Feature tree, modifiers, rebuild, project files. | Done |
+| M5 | Polish: error messages, packaging. | Done for Windows |
 
-Version 1 is complete. The test suite holds the seven steps of section 14 as one test,
-and that test gives the correct result.
-
-The test suite has 229 tests. All of them give the correct result. The lint tool finds
-no errors.
+Version 1 is complete. The seven-step acceptance flow from section 14 exists as a
+single test, and it passes. The suite is 229 tests, all passing, with a clean ruff
+run.
 
 ## Modules
 
-| Module | Function |
+| Module | What it does |
 |---|---|
-| `units.py` | Unit tables. All internal values are millimeters. |
-| `core/document.py` | Document, BasePart, Feature. JSON only, no geometry. |
+| `units.py` | Unit tables. Everything internal is millimeters. |
+| `core/document.py` | Document, BasePart, Feature. Pure JSON data, no geometry. |
 | `core/refs.py` | FaceRef and the sketch plane. Section 8. |
-| `core/rebuild.py` | The rebuild engine and the cache. Section 6.6. |
+| `core/rebuild.py` | The rebuild engine and its cache. Section 6.6. |
 | `core/profiles.py` | The profile cache. Section 5.5, step 7. |
-| `core/snapping.py` | The snap targets. Section 6.2. |
-| `io/normalize.py` | The shared back half of each import. Section 5.5. |
-| `io/profile_import.py` | SVG, DXF and DWG. Sections 5.3 and 5.4. |
-| `io/part_import.py` | STEP, IGES, BREP, STL, 3MF and OBJ. Sections 5.1 and 5.2. |
+| `core/snapping.py` | Snap targets. Section 6.2. |
+| `io/normalize.py` | The shared back half of every import. Section 5.5. |
+| `io/profile_import.py` | SVG, DXF, and DWG. Sections 5.3 and 5.4. |
+| `io/part_import.py` | STEP, IGES, BREP, STL, 3MF, and OBJ. Sections 5.1 and 5.2. |
 | `io/export.py` | STEP and STL export. Section 9. |
 | `io/project.py` | The `.stamp` archive. Section 4.4. |
-| `geom/tool_solid.py` | Profile plus placement plus operation. Section 6.3. |
-| `geom/solid_ops.py` | OCC booleans, fillets and chamfers. Section 6.4. |
+| `io/text_profile.py` | Turns typed text into a profile. Section 5.3. |
+| `geom/tool_solid.py` | Profile + placement + operation. Section 6.3. |
+| `geom/solid_ops.py` | OCC booleans, fillets, chamfers. Section 6.4. |
 | `geom/mesh_ops.py` | The manifold3d path. Sections 2 and 6.5. |
-| `geom/mesh_regions.py` | Face selection on a mesh part. Section 6.1. |
+| `geom/mesh_regions.py` | Face selection on mesh parts. Section 6.1. |
 | `ui/viewport.py` | The OCC viewport widget. |
-| `ui/main_window.py` | The window and all the commands. Section 7. |
+| `ui/main_window.py` | The window and all commands. Section 7. |
 | `ui/feature_tree.py` | The feature tree on the left. |
 | `ui/properties.py` | The properties panel on the right. Section 6.2. |
-| `ui/handles.py` | The drag handles and the snap logic. |
-| `ui/dialogs.py` | The import and export prompts. |
-| `ui/rebuild_worker.py` | The worker thread and the debounce. |
-| `diagnostics.py` | The log, the crash dump and the crash flag. |
-| `reporting.py` | The crash report and the bug report. |
-| `io/text_profile.py` | Artwork from a text message. Section 5.3. |
+| `ui/handles.py` | Drag handles and snap logic. |
+| `ui/dialogs.py` | Import and export prompts. |
+| `ui/rebuild_worker.py` | The worker thread and debounce. |
+| `diagnostics.py` | Logging, crash dumps, the crash flag. |
+| `reporting.py` | Crash and bug reports. |
 
-## Results that are important to keep
+## Findings worth keeping
 
-The `WNT_Window` binding accepts a capsule, not an integer. `QWidget.winId()` gives an
-integer in PySide6. The function `ctypes.pythonapi.PyCapsule_New` makes the capsule from
-that integer. The function `ui/viewport.py::_handle_capsule` does this. This one step makes
-the full viewport possible.
+The `WNT_Window` binding takes a capsule, not an integer. `QWidget.winId()` returns
+an integer in PySide6; `ctypes.pythonapi.PyCapsule_New` wraps it
+(`ui/viewport.py::_handle_capsule`). This one step is what makes the whole viewport
+possible.
 
-A compound that goes into `SetTools` as one entry is not fully processed. Only its first
-solid goes into the boolean. Thus `solid_ops._split_compound` divides it first. The
-same trap is in manifold3d, and `mesh_ops.boolean` divides the tool there with the same procedure.
+A compound passed to `SetTools` as a single entry is not fully processed — only its
+first solid enters the boolean. `solid_ops._split_compound` splits it first. The
+same trap exists in manifold3d, so `mesh_ops.boolean` splits the tool the same way.
 
-The tool starts a small distance behind the sketch plane. The function
-`tool_solid.contact_overlap_for` gives that distance. A contact that is fully coplanar is the
-worst condition for the two boolean engines. It also causes `SectionEdges()` to give an
-empty list, and those edges are the blend targets of section 6.4B.
+The tool starts slightly sunk behind the sketch plane
+(`tool_solid.contact_overlap_for` gives the distance). Perfectly coplanar contact is
+the worst case for both boolean engines, and it also makes `SectionEdges()` return
+an empty list — and those edges are the blend targets in section 6.4B.
 
-Artwork elements frequently overlap. The function `normalize._resolve_overlaps` unions
-such elements in 2D with the non-zero fill rule. Without this step, the extrude makes a
-seam between two flat faces, and no fillet can go on that seam.
+Artwork elements overlap all the time. `normalize._resolve_overlaps` unions them in
+2D with the non-zero fill rule. Skip this and the extrude produces a seam between
+two flat faces that no fillet can attach to.
 
-An anchor on a base face resolves against the initial part. It does not resolve against
-the result that is not fully built. The method `_anchor_shape` of the rebuild engine does
-this. Section 8 of the specification gives this rule, and a test shows why.
+An anchor on a base face resolves against the original part, not against the
+half-built result (`_anchor_shape` in the rebuild engine). Section 8 of the spec
+states the rule, and a test shows why it matters.
 
-PySide6 keeps a `StrEnum` in a `QComboBox` as a plain string. The string comes back from
-`currentData()`, thus the properties panel makes it into the enum again. The method
-`to_dict` also accepts a plain string. Without the two steps, a change of the direction
-stops the undo stack in the middle of an event.
+PySide6 stores a `StrEnum` in a `QComboBox` as a plain string. `currentData()`
+returns the string, so the properties panel converts it back to the enum, and
+`to_dict` accepts plain strings too. Without both, changing the direction broke the
+undo stack mid-event.
 
-A toolbar puts a widget in a `QWidgetAction` and shows it again at each layout. Thus you
-must set the visibility on the `QWidgetAction`, not on the widget.
+A toolbar wraps widgets in `QWidgetAction` and re-shows them on every relayout — set
+visibility on the `QWidgetAction`, not the widget.
 
-The viewport is a native window with `WA_PaintOnScreen`. Thus a Qt widget cannot put an
-overlay on it. The drag handles are OCC point markers with a dimension in pixels. Thus
-they keep the same dimension on the screen at each zoom.
+The viewport is a native window with `WA_PaintOnScreen`, so Qt widgets can't overlay
+it. The drag handles are OCC point markers sized in pixels, which keeps them the
+same size on screen at every zoom.
 
-Undo must have the condition from before the change. The properties panel changes the feature and
-then reports it, but the tree reports first and changes after. Thus `_push_undo` puts the
-baseline from the end of the last change on the stack. A timer that fires immediately gets the new
-baseline after the current event.
+Undo needs the state from before the change. The properties panel mutates the
+feature and then signals, but the tree signals first and mutates after — so
+`_push_undo` pushes the baseline captured at the end of the previous change, and a
+zero-delay timer captures the new baseline after the current event.
 
-Each feature keeps its position in the frame of its own sketch plane. Two features on one
-flat surface can have different origins, because the origin is the point that the user
-clicked. Thus the snap logic changes each position through world coordinates first.
+Each feature stores its position in its own sketch plane's frame. Two features on
+the same flat surface can have different origins (the origin is wherever the user
+clicked), so the snap logic converts through world coordinates first.
 
-The `trimesh` ray functions are not usable, because the `rtree` package is not a
-dependency of Stamp. The module `geom/mesh_regions.py` thus has its own ray test in
-numpy. It is short, and it is fast at these dimensions.
+`trimesh`'s ray functions are unusable because `rtree` isn't a dependency, so
+`geom/mesh_regions.py` carries its own numpy ray test. It's short, and fast at
+these sizes.
 
-The region that is found on a mesh is fully coplanar with the part. Thus the highlight
-goes up 0.05 mm along the plane normal. Without that step, the two surfaces compete for
-the same depth, and you cannot see the highlight.
+A region found on a mesh is exactly coplanar with the part, so the highlight is
+lifted 0.05 mm along the plane normal. Without that, the two surfaces z-fight and
+the highlight is invisible.
 
-A `WNT_Window` that you make from a window handle starts at 640 x 480. Qt gives the native
-window its correct dimensions after one turn of the event loop. Thus a `MustBeResized` at start
-finds the initial dimensions, and the render fills only the lower left corner. The method
-`viewport._sync_window_size` starts `DoResize` first, and a `QTimer` starts that method again
-after the event loop turns. The first `fit_all` also uses the initial dimensions, thus the
-same method does the fit again one time.
+A `WNT_Window` created from a window handle starts at 640 x 480, and Qt only gives
+the native window its real size after one turn of the event loop — so a
+`MustBeResized` at startup sees the wrong size and the render fills only the lower
+left corner. `viewport._sync_window_size` calls `DoResize` immediately and again via
+`QTimer` after the loop turns; the first `fit_all` has the same problem, so it too
+runs a second time.
 
-The enum `Quantity_TOC_RGB` reads linear RGB values, not sRGB values. The color
-(0.13, 0.15, 0.19) given as linear RGB becomes GRAY43, which is a middle gray. Use
-`Quantity_TOC_sRGB` to give the value that other tools show. You could not see the face
-boundary lines until this change, because the color became lighter.
+`Quantity_TOC_RGB` interprets values as linear RGB. The color (0.13, 0.15, 0.19)
+fed in as linear comes out as GRAY43 — a medium gray. Use `Quantity_TOC_sRGB` to
+get what other tools display. The face boundary lines were invisible until this was
+fixed, because the background got lighter than intended.
 
-Face boundary lines show the contours of a shaded solid. Set them on the drawer of the object,
-not on the default drawer of the context. The default drawer also puts lines on the previews
-and on the drag handles.
+Face boundary lines show the contours of a shaded solid. Set them on the object's
+own drawer, not the context's default drawer — the default drawer also draws lines
+on previews and drag handles.
 
-A worker that stops because of a cancel gives no result. Thus it must report the cancel on a
-signal of its own. Without that signal the controller keeps its busy flag, and it starts no
-more rebuilds. One quick edit during a rebuild was sufficient to stop all rebuilds after it.
-The geometry on the screen then stayed at the position of the last good rebuild, and only the
-preview moved. Each request also has a generation number, because a cancel can come while the
-request stays in the queue of the thread.
+A worker that stops due to a cancel produces no result, so it must signal the
+cancel separately. Without that signal the controller's busy flag stuck and no
+rebuild ever ran again — one quick edit during a rebuild was enough. On screen, the
+geometry froze at the last good rebuild while only the preview moved. Each request
+also carries a generation number, because a cancel can arrive while the request is
+still queued in the thread.
 
-Qt gives the outline of each glyph through `QPainterPath`. Those outlines go into
-`normalize_groups` as one group for each line. Containment in that group makes the counter
-of an "o" a hole. One group for each contour is not correct, because each group is nested
-on its own, and the counter then becomes material.
+Qt hands out glyph outlines through `QPainterPath`. Those outlines go into
+`normalize_groups` as one group per line of text; containment within the group is
+what turns the counter of an "o" into a hole. One group per contour is wrong — each
+group nests independently, and the counter becomes solid material.
 
-A `mailto:` link has no field for an attachment. Thus Stamp cannot attach the log to the
-email. Stamp puts the full report on the clipboard, and the user pushes Ctrl+V. This is the
-one method that operates with a mail application and with a mail page in a browser. The link
-also has a limit of about 2 kB. That limit applies to the escaped link, not to the text.
+A `mailto:` link has no attachment field, so Stamp can't attach the log. Instead it
+puts the full report on the clipboard and the user presses Ctrl+V — the one approach
+that works with both mail apps and webmail. The link is also limited to roughly
+2 kB, and the limit applies to the escaped URL, not the visible text.
 
-The crash flag holds the process id. If that process continues to operate, the flag belongs
-to a second window, not to a run that stopped. Without the process id, two windows at the
-same time make an incorrect crash report.
+The crash flag stores the process id. If that process is still alive, the flag
+belongs to a second open window, not a crashed run. Without the pid, two windows
+open at once produced a bogus crash report.
 
-A fillet is one build for all the edges of the selection. One edge that cannot accept the
-value fails that build. Thus each edge gets the same value, or no edge gets a value. On
-artwork with 1233 edges, no radius between 0.05 mm and 0.4 mm was possible, but 0.005 mm
-was. The largest value a set accepts stays near the shortest edge in that set. The ratio
-was between 0.57 and 1.05 in the measurements. Thus `_largest_working_value` does a search
-when the count is not more than 250 edges. Above that count it makes an estimate from the
-shortest edge. A search costs one complete fillet for each step, which was 92 seconds on
-the largest set.
+A fillet is one build across all selected edges: every edge takes the value or none
+do. On artwork with 1233 edges, no radius between 0.05 mm and 0.4 mm worked, but
+0.005 mm did. The largest value a set accepts tracks the shortest edge in the set
+(ratio 0.57 to 1.05 in measurements), so `_largest_working_value` searches when the
+selection is 250 edges or fewer and estimates from the shortest edge above that. A
+search costs one full fillet per step — 92 seconds on the largest set.
 
-A fillet on part of the edges is possible. Groups of 40 edges, applied one after the other
-to the shape that results, gave 22 percent of the edges. Groups of 20 gave 40 percent, and
-a bisection gave 49 percent in 60 seconds. Stamp does not do this. Some letters with a
-circular edge and some letters with a sharp edge look worse than all of them sharp.
+Partial fillets are possible: groups of 40 edges applied sequentially to the
+running result filleted 22% of the edges; groups of 20 got 40%; bisection got 49%
+in 60 seconds. Stamp doesn't do it — a mix of rounded and sharp letters looks worse
+than all sharp.
 
-## Times on the standard test
+## Timings on the standard test
 
-The part is `bracket.step` or `bracket.stl` with the `logo.svg` profile.
+`bracket.step` / `bracket.stl` with `logo.svg`:
 
 - Tool solid: 0.5 ms
 - Fillet on 8 top edges: 25 ms
 - OCC boolean: 15 ms
 - Tessellation for the mesh path: 20 ms
 - manifold3d boolean: 3 ms
-- Rebuild from the cache: 0.1 ms
+- Rebuild from cache: 0.1 ms
 - Windows package: 311 MB
 
-## Differences from the specification
+## Deviations from the spec
 
-The package root is `src/stamp/`, which is the default layout of uv. Section 13 shows `app/`.
-The names of the modules in the package root agree with section 13.
+The package root is `src/stamp/` (uv's default layout); section 13 says `app/`.
+Module names inside the root match section 13.
 
-## Work that is not done
+## Not done
 
-1. The macOS and Linux packages are not made. Only Windows is. The PyInstaller
-   specification has the code for the macOS bundle, but no machine here can test it.
-2. DWG is best effort, which section 5.4 lets Stamp do. The ODA File Converter is not on this
-   machine, thus that path has no test. Stamp finds the converter at start, and it shows
-   the download address and a file picker if the converter is missing.
-3. The items in the "later" list of section 11 are not started. Cylindrical wrap is the
-   first of them.
+1. macOS and Linux packages. The PyInstaller spec has the macOS bundle code, but
+   there's no machine here to test it.
+2. DWG is best-effort, as section 5.4 allows. The ODA File Converter isn't on this
+   machine, so that path is untested. Stamp detects the converter at startup and
+   shows a download link and a file picker when it's missing.
+3. Nothing from section 11's "later" list. Cylindrical wrap is first in line.
