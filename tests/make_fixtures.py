@@ -236,12 +236,115 @@ def make_serial_dxf(path: Path) -> None:
     doc.saveas(path)
 
 
+def make_bracket_rev_b(path: Path) -> None:
+    """bracket.step, revised the way a real part gets revised.
+
+    The top face - where artwork goes - keeps its plane, so a stamp on it should
+    survive.  Everything around it changes: the holes move outward, the boss grows
+    and moves, and a rib appears along one edge.
+    """
+    from OCP.BRepAlgoAPI import BRepAlgoAPI_Cut, BRepAlgoAPI_Fuse
+    from OCP.BRepPrimAPI import BRepPrimAPI_MakeBox, BRepPrimAPI_MakeCylinder
+    from OCP.gp import gp_Ax2, gp_Dir, gp_Pnt
+
+    plate = BRepPrimAPI_MakeBox(gp_Pnt(0, 0, 0), 80.0, 40.0, 8.0).Shape()
+
+    # The boss is bigger and has moved along the plate.
+    boss = BRepPrimAPI_MakeCylinder(
+        gp_Ax2(gp_Pnt(64, 20, 8), gp_Dir(0, 0, 1)), 11.0, 7.0
+    ).Shape()
+    shape = BRepAlgoAPI_Fuse(plate, boss).Shape()
+
+    # A rib along the far edge, which is new topology the old part never had.
+    rib = BRepPrimAPI_MakeBox(gp_Pnt(0, 36.0, 8.0), 80.0, 4.0, 5.0).Shape()
+    shape = BRepAlgoAPI_Fuse(shape, rib).Shape()
+
+    # The mounting holes moved outward and grew.
+    for cx, cy in ((10.0, 8.0), (10.0, 32.0)):
+        hole = BRepPrimAPI_MakeCylinder(
+            gp_Ax2(gp_Pnt(cx, cy, -1), gp_Dir(0, 0, 1)), 3.5, 12.0
+        ).Shape()
+        shape = BRepAlgoAPI_Cut(shape, hole).Shape()
+
+    _write_step(shape, path)
+
+
+def make_bracket_thicker(path: Path) -> None:
+    """bracket.step with the plate 4 mm thicker.
+
+    The top face is still the top face, but it is no longer at z = 8, so a stamp
+    on it has to follow the face upward rather than stay at its old height.
+    """
+    from OCP.BRepAlgoAPI import BRepAlgoAPI_Cut, BRepAlgoAPI_Fuse
+    from OCP.BRepPrimAPI import BRepPrimAPI_MakeBox, BRepPrimAPI_MakeCylinder
+    from OCP.gp import gp_Ax2, gp_Dir, gp_Pnt
+
+    plate = BRepPrimAPI_MakeBox(gp_Pnt(0, 0, 0), 80.0, 40.0, 12.0).Shape()
+    boss = BRepPrimAPI_MakeCylinder(
+        gp_Ax2(gp_Pnt(60, 20, 12), gp_Dir(0, 0, 1)), 9.0, 6.0
+    ).Shape()
+    shape = BRepAlgoAPI_Fuse(plate, boss).Shape()
+    for cx, cy in ((12.0, 12.0), (12.0, 28.0)):
+        hole = BRepPrimAPI_MakeCylinder(
+            gp_Ax2(gp_Pnt(cx, cy, -1), gp_Dir(0, 0, 1)), 3.0, 16.0
+        ).Shape()
+        shape = BRepAlgoAPI_Cut(shape, hole).Shape()
+    _write_step(shape, path)
+
+
+def make_bracket_moved(path: Path) -> None:
+    """bracket.step exported from a different origin - the same part, moved.
+
+    CAD tools re-export from wherever the model sits, so this is the common case
+    that makes every stored point miss by a constant offset.
+    """
+    from OCP.BRepAlgoAPI import BRepAlgoAPI_Cut, BRepAlgoAPI_Fuse
+    from OCP.BRepPrimAPI import BRepPrimAPI_MakeBox, BRepPrimAPI_MakeCylinder
+    from OCP.gp import gp_Ax2, gp_Dir, gp_Pnt
+
+    dx, dy, dz = 120.0, -45.0, 30.0
+    plate = BRepPrimAPI_MakeBox(gp_Pnt(dx, dy, dz), 80.0, 40.0, 8.0).Shape()
+    boss = BRepPrimAPI_MakeCylinder(
+        gp_Ax2(gp_Pnt(dx + 60, dy + 20, dz + 8), gp_Dir(0, 0, 1)), 9.0, 6.0
+    ).Shape()
+    shape = BRepAlgoAPI_Fuse(plate, boss).Shape()
+    for cx, cy in ((12.0, 12.0), (12.0, 28.0)):
+        hole = BRepPrimAPI_MakeCylinder(
+            gp_Ax2(gp_Pnt(dx + cx, dy + cy, dz - 1), gp_Dir(0, 0, 1)), 3.0, 12.0
+        ).Shape()
+        shape = BRepAlgoAPI_Cut(shape, hole).Shape()
+    _write_step(shape, path)
+
+
+def make_bracket_rev_b_stl(path: Path) -> None:
+    """The revised bracket as a mesh, for the mesh-mode replacement path."""
+    import tempfile
+
+    from stamp.geom import mesh_ops
+
+    with tempfile.TemporaryDirectory() as folder:
+        step = Path(folder) / "rev_b.step"
+        make_bracket_rev_b(step)
+        from stamp.io.part_import import import_part
+
+        part = import_part(step).part
+        verts, tris = mesh_ops.triangulate(part.runtime, 0.05)
+
+    import trimesh
+
+    trimesh.Trimesh(vertices=verts, faces=tris, process=False).export(path)
+
+
 def main() -> None:
     FIXTURES.mkdir(parents=True, exist_ok=True)
     make_plate_step(FIXTURES / "plate.step")
     make_bracket_step(FIXTURES / "bracket.step")
     make_inch_plate_step(FIXTURES / "plate_inch.step")
     make_bracket_stl(FIXTURES / "bracket.stl")
+    make_bracket_rev_b(FIXTURES / "bracket_rev_b.step")
+    make_bracket_thicker(FIXTURES / "bracket_thicker.step")
+    make_bracket_moved(FIXTURES / "bracket_moved.step")
+    make_bracket_rev_b_stl(FIXTURES / "bracket_rev_b.stl")
     make_leaky_stl(FIXTURES / "leaky.stl")
     make_svgs()
     make_dxf(FIXTURES / "profile.dxf")

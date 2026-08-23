@@ -295,6 +295,32 @@ mutually exclusive, and the colours are worth more than a notice.
 The export dialog and the README now say so, so the message does not read as a
 fault.
 
+## v0.3.0
+
+`core/replace_part.py` swaps the part for a newer file and re-anchors the
+artwork. There is no new matching machinery in it: §8.2 already stores an anchor
+as geometry plus intent rather than a face index, so `resolve_face_ref` can be
+pointed at a shape it has never seen. The module adds the reporting and the
+recovery around it.
+
+Each feature comes back kept, moved or lost. Lost means the anchor is left
+exactly as it was so the rebuild flags it and the user picks a face again -
+deleting the feature would not be recoverable. A revision exported from a
+different origin is handled by trying a second pass with the two bounding-box
+centres aligned, and keeping whichever pass places more features and moves them
+less.
+
+Mesh parts have no faces to score, so a mesh anchor is re-fitted with
+`mesh_regions.region_at`, firing the ray from outside the stored plane back
+along its normal so it meets the near surface rather than the far one.
+
+The 3MF export no longer forces its colours on anyone. Bambu makes a new
+filament for every colour string it does not have (`bbs_3mf.cpp`, the loop over
+`m_group_id_to_color`), so the old defaults arrived as unwanted white and red
+entries next to the filaments actually loaded. The colours are remembered
+between exports, and they can be left out altogether - the parts stay separate
+and named, and no colour parsing window appears at all.
+
 ## Timings on the standard test
 
 `bracket.step` / `bracket.stl` with `logo.svg`:

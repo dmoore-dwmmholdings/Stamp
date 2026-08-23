@@ -1307,3 +1307,110 @@ class TestTheDefaultValueIsCorrectedToo:
         assert boxes, "no modifier row in the panel"
         shown = [round(b.value(), 6) for b in boxes]
         assert round(feature.modifiers[0].value, 6) in shown, shown
+
+
+@needs_gl
+class TestReplacePartCommand:
+    """Open a part, stamp it, swap in a revision - the artwork stays put (§8.2)."""
+
+    @pytest.fixture
+    def window(self, qtbot, fixtures):
+        from stamp.ui.main_window import MainWindow
+
+        win = MainWindow()
+        win.interactive = False
+        qtbot.addWidget(win)
+        win.show()
+        qtbot.waitExposed(win)
+        win.open_part(fixtures / "bracket.step")
+        self._settle(qtbot, win)
+        win.viewport.fit_all()
+        qtbot.wait(300)
+        yield win
+        win.rebuilder.shutdown()
+
+    def _settle(self, qtbot, window):
+        qtbot.wait(300)
+        for _ in range(300):
+            if not window.rebuilder.busy:
+                break
+            qtbot.wait(100)
+        qtbot.wait(200)
+
+    def _stamp_it(self, window, qtbot, fixtures):
+        from PySide6.QtCore import QMimeData, QPointF, QUrl
+        from PySide6.QtGui import QDropEvent
+
+        mime = QMimeData()
+        mime.setUrls([QUrl.fromLocalFile(str(fixtures / "logo.svg"))])
+        centre = window.viewport.mapTo(window, window.viewport.rect().center())
+        window.dropEvent(QDropEvent(
+            QPointF(centre), Qt.DropAction.CopyAction, mime,
+            Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier,
+        ))
+        self._settle(qtbot, window)
+        assert window.document.features, "the drop did not make a feature"
+        return window.document.features[0]
+
+    def test_the_stamp_survives_a_revision(self, window, qtbot, fixtures):
+        feature = self._stamp_it(window, qtbot, fixtures)
+        before = feature.placement.anchor.plane
+        assert before is not None
+
+        window.replace_part(fixtures / "bracket_rev_b.step")
+        self._settle(qtbot, window)
+
+        assert len(window.document.features) == 1
+        assert window.document.base.source_path.endswith("bracket_rev_b.step")
+        after = window.document.features[0].placement.anchor.plane
+        assert after is not None
+        assert abs(after.origin[2] - before.origin[2]) < 0.05
+
+    def test_the_part_rebuilds_clean_after_the_swap(self, window, qtbot, fixtures):
+        self._stamp_it(window, qtbot, fixtures)
+        window.replace_part(fixtures / "bracket_rev_b.step")
+        self._settle(qtbot, window)
+
+        assert window._last_result is not None
+        assert window._last_result.ok, window._last_result.errors
+        assert not window._last_result.errors
+
+    def test_a_thicker_part_carries_the_stamp_up(self, window, qtbot, fixtures):
+        feature = self._stamp_it(window, qtbot, fixtures)
+        assert feature.placement.anchor.plane.origin[2] == pytest.approx(8.0)
+
+        window.replace_part(fixtures / "bracket_thicker.step")
+        self._settle(qtbot, window)
+
+        plane = window.document.features[0].placement.anchor.plane
+        assert plane.origin[2] == pytest.approx(12.0, abs=1e-6)
+        assert window._last_result.ok
+
+    def test_replacing_is_undoable(self, window, qtbot, fixtures):
+        self._stamp_it(window, qtbot, fixtures)
+        window.replace_part(fixtures / "bracket_rev_b.step")
+        self._settle(qtbot, window)
+        assert window.action_undo.isEnabled()
+
+        window.undo()
+        self._settle(qtbot, window)
+        assert window.document.base.source_path.endswith("bracket.step")
+        assert len(window.document.features) == 1
+
+    def test_the_status_line_says_what_happened(self, window, qtbot, fixtures):
+        self._stamp_it(window, qtbot, fixtures)
+        window.replace_part(fixtures / "bracket_rev_b.step")
+        self._settle(qtbot, window)
+        assert "part was replaced" in window.statusBar().currentMessage().lower()
+
+    def test_replacing_with_a_part_that_will_not_open_changes_nothing(
+        self, window, qtbot, fixtures
+    ):
+        self._stamp_it(window, qtbot, fixtures)
+        before = window.document.base.source_path
+
+        window.replace_part(fixtures / "logo.svg")  # not a part at all
+        self._settle(qtbot, window)
+
+        assert window.document.base.source_path == before
+        assert len(window.document.features) == 1

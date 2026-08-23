@@ -257,15 +257,24 @@ def export_3mf(
     bodies: list,
     path: str | Path,
     *,
-    base_color: str = "#D8D8D8",
-    feature_color: str = "#D62E2E",
+    base_color: str = "#2B2B2B",
+    feature_color: str = "#C8A24A",
+    write_colors: bool = True,
 ) -> ExportResult:
-    """Write a multi-body 3MF whose artwork carries its own colour.
+    """Write a multi-body 3MF, optionally with a colour on every triangle.
 
-    Every body becomes an object, and every triangle of that body points at one
-    entry of a colour group.  Bambu Studio and Orca offer to map those groups to
-    filament slots on import, in the order they appear here: the base first, the
-    features second.  Other tools see a plain multi-object 3MF.
+    The bodies are components of one object, so the part moves in one piece.
+
+    With *write_colors* every triangle points at one entry of a colour group, and
+    Bambu Studio and Orca offer to map those groups to filament slots on import,
+    in the order written here: the base first, the features second.  A slicer
+    makes a new filament for every colour it does not already have, so colours
+    that do not match the ones loaded arrive as extra entries the user has to
+    undo - which is why the caller asks rather than assuming.
+
+    Without it the file carries no colour at all.  The parts are still separate
+    and still named, so a filament can be given to each by hand, and nothing is
+    asked on the way in.
     """
     import zipfile
     from xml.sax.saxutils import quoteattr
@@ -287,25 +296,35 @@ def export_3mf(
             raise ExportError(f"{value!r} is not a colour Stamp can write.")
         return "#" + text
 
-    header = (
-        '<?xml version="1.0" encoding="UTF-8"?>\n'
-        '<model unit="millimeter" xml:lang="en-US"\n'
-        ' xmlns="http://schemas.microsoft.com/3dmanufacturing/core/2015/02"\n'
-        f' xmlns:m="{MATERIAL_NS}">\n'
-        " <resources>\n"
-        '  <m:colorgroup id="1">\n'
-        f'   <m:color color="{color(base_color)}"/>\n'
-        f'   <m:color color="{color(feature_color)}"/>\n'
-        "  </m:colorgroup>\n"
-    )
+    if write_colors:
+        header = (
+            '<?xml version="1.0" encoding="UTF-8"?>\n'
+            '<model unit="millimeter" xml:lang="en-US"\n'
+            ' xmlns="http://schemas.microsoft.com/3dmanufacturing/core/2015/02"\n'
+            f' xmlns:m="{MATERIAL_NS}">\n'
+            " <resources>\n"
+            '  <m:colorgroup id="1">\n'
+            f'   <m:color color="{color(base_color)}"/>\n'
+            f'   <m:color color="{color(feature_color)}"/>\n'
+            "  </m:colorgroup>\n"
+        )
+    else:
+        # No colour group at all: nothing for a slicer to ask about on the way in.
+        header = (
+            '<?xml version="1.0" encoding="UTF-8"?>\n'
+            '<model unit="millimeter" xml:lang="en-US"\n'
+            ' xmlns="http://schemas.microsoft.com/3dmanufacturing/core/2015/02">\n'
+            " <resources>\n"
+        )
 
     parts: list[str] = [header]
     for index, body in enumerate(bodies):
         object_id = index + 2
         pindex = 0 if body.role == "base" else 1
+        colored = f' pid="1" pindex="{pindex}"' if write_colors else ""
         parts.append(
             f'  <object id="{object_id}" type="model" name={quoteattr(body.name)}'
-            f' pid="1" pindex="{pindex}">\n   <mesh>\n    <vertices>\n'
+            f'{colored}>\n   <mesh>\n    <vertices>\n'
         )
         parts.append(
             "".join(
@@ -314,13 +333,21 @@ def export_3mf(
             )
         )
         parts.append("    </vertices>\n    <triangles>\n")
-        parts.append(
-            "".join(
-                f'     <triangle v1="{t[0]}" v2="{t[1]}" v3="{t[2]}"'
-                f' pid="1" p1="{pindex}"/>\n'
-                for t in body.triangles
+        if write_colors:
+            parts.append(
+                "".join(
+                    f'     <triangle v1="{t[0]}" v2="{t[1]}" v3="{t[2]}"'
+                    f' pid="1" p1="{pindex}"/>\n'
+                    for t in body.triangles
+                )
             )
-        )
+        else:
+            parts.append(
+                "".join(
+                    f'     <triangle v1="{t[0]}" v2="{t[1]}" v3="{t[2]}"/>\n'
+                    for t in body.triangles
+                )
+            )
         parts.append("    </triangles>\n   </mesh>\n  </object>\n")
 
     # The bodies go on the plate as one object built from components, not as one

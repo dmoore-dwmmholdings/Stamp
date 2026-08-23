@@ -587,31 +587,56 @@ class Color3mfDialog(QDialog):
 
     PRESETS = [("Draft (0.1 mm)", 0.1), ("Normal (0.02 mm)", 0.02), ("Fine (0.005 mm)", 0.005)]
 
-    def __init__(self, feature_count: int, *, mode: str = "solid", parent=None) -> None:
+    #: What a fresh install offers.  A slicer makes a filament for every colour it
+    #: finds, so these are only a starting point - see :meth:`_pick`.
+    DEFAULT_BASE = "#2B2B2B"
+    DEFAULT_FEATURE = "#C8A24A"
+
+    def __init__(
+        self,
+        feature_count: int,
+        *,
+        mode: str = "solid",
+        base_color: str | None = None,
+        feature_color: str | None = None,
+        write_colors: bool = True,
+        parent=None,
+    ) -> None:
         super().__init__(parent)
         self.setWindowTitle("Export 3MF for color printing")
-        self._base_color = "#D8D8D8"
-        self._feature_color = "#D62E2E"
+        self._base_color = base_color or self.DEFAULT_BASE
+        self._feature_color = feature_color or self.DEFAULT_FEATURE
 
         layout = QVBoxLayout(self)
         note = QLabel(
             f"The base and {feature_count} feature bod"
             f"{'y' if feature_count == 1 else 'ies'} are written as one object with "
-            f"separate parts, each carrying its colour on every triangle. Bambu "
-            f"Studio and Orca show a colour parsing window on import and map the "
-            f"colours to filament slots in this order: the base first, the artwork "
-            f"second."
+            f"separate parts, so the part moves in one piece and you can give each "
+            f"part its own filament."
         )
         note.setWordWrap(True)
         layout.addWidget(note)
 
-        # Say this here, so the message does not read as a fault in the file.
+        self.color_box = QCheckBox("Write these colors into the file")
+        self.color_box.setChecked(write_colors)
+        self.color_box.setToolTip(
+            "On: the slicer offers to map these colors to filament slots when it "
+            "opens the file. "
+            "Off: the file carries no color, and you pick the filament for each "
+            "part in the slicer, as with any other 3MF."
+        )
+        self.color_box.toggled.connect(self._sync_enabled)
+        layout.addWidget(self.color_box)
+
+        # A slicer makes a new filament for every colour string it does not have.
+        # Matching the artwork colours to the filaments actually loaded is what
+        # stops a pile of unwanted entries appearing next to them.
         expected = QLabel(
-            "Bambu Studio says “The 3mf file has invalid config, load geometry "
-            "data only” for every 3MF it did not write itself. That is expected, "
-            "and the colours still arrive. Bambu reads per-triangle colours only "
-            "from a file it did not write, so a file that avoided the message would "
-            "lose them."
+            "Set these to the filaments you print with. Bambu Studio adds a "
+            "filament for every color it does not recognise, so colors that do not "
+            "match yours arrive as extra entries you have to change back. It also "
+            "says “The 3mf file has invalid config, load geometry data only” for "
+            "every file it did not write, which is expected and harmless."
         )
         expected.setWordWrap(True)
         expected.setStyleSheet("color: #8a8f98;")
@@ -642,6 +667,14 @@ class Color3mfDialog(QDialog):
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
+        self._sync_enabled(self.color_box.isChecked())
+
+    def _sync_enabled(self, on: bool) -> None:
+        self.base_button.setEnabled(on)
+        self.feature_button.setEnabled(on)
+
+    def write_colors(self) -> bool:
+        return self.color_box.isChecked()
 
     def _paint_buttons(self) -> None:
         for button, value in (
@@ -674,3 +707,67 @@ class Color3mfDialog(QDialog):
 
     def deflection_mm(self) -> float:
         return float(self.quality.currentData())
+
+
+class ReplaceReportDialog(QDialog):
+    """What happened to each stamp when the part was replaced - §8.2.
+
+    A replacement that silently moved artwork would be worse than one that
+    refused, so every feature is listed with what became of it, and the ones
+    needing attention are named rather than counted.
+    """
+
+    def __init__(self, report, part_name: str, parent=None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Part replaced")
+        self.setMinimumWidth(520)
+
+        layout = QVBoxLayout(self)
+        headline = QLabel(f"{part_name} is now the part. {report.summary()}")
+        headline.setWordWrap(True)
+        headline.setStyleSheet("font-weight: 600;")
+        layout.addWidget(headline)
+
+        for warning in report.warnings:
+            note = QLabel(warning)
+            note.setWordWrap(True)
+            note.setStyleSheet("color: #c58a2a;")
+            layout.addWidget(note)
+
+        rows = QListWidget()
+        for match in report.matches:
+            if match.status == "kept":
+                text = f"✓  {match.name} — stayed where it was"
+                color = None
+            elif match.status == "moved":
+                text = (
+                    f"→  {match.name} — followed its face, "
+                    f"{match.moved_mm:.2f} mm"
+                )
+                color = "#c58a2a"
+            else:
+                text = f"!  {match.name} — pick a face for it again"
+                color = "#c0453a"
+            if match.detail and match.status != "lost":
+                text += f" ({match.detail})"
+            item = QListWidgetItem(text)
+            if color:
+                from PySide6.QtGui import QColor
+
+                item.setForeground(QColor(color))
+            rows.addItem(item)
+        if report.matches:
+            rows.setMaximumHeight(min(240, 28 * len(report.matches) + 12))
+            layout.addWidget(rows)
+
+        if report.lost:
+            hint = QLabel(
+                "Select a feature that needs attention and use “Pick the face "
+                "again” in the panel on the right. Nothing was deleted."
+            )
+            hint.setWordWrap(True)
+            layout.addWidget(hint)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok)
+        buttons.accepted.connect(self.accept)
+        layout.addWidget(buttons)

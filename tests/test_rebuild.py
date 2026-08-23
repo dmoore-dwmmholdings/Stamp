@@ -822,3 +822,89 @@ class TestVersion:
         iss = (root / "packaging" / "stamp.iss").read_text(encoding="utf-8")
         match = re.search(r'#define AppVersion "([^"]+)"', iss)
         assert match and match.group(1) == stamp.__version__
+
+
+class TestColorlessExport:
+    """Writing no colour is a supported choice, not a degraded one.
+
+    A slicer makes a new filament for every colour string it does not already
+    have, so an export whose colours do not match the filaments loaded arrives
+    with extra entries the user has to undo.  Leaving the colour out avoids both
+    that and the mapping window, and the parts are still separate and named, so a
+    filament can be given to each by hand.
+    """
+
+    CORE = "http://schemas.microsoft.com/3dmanufacturing/core/2015/02"
+    MATERIAL = "http://schemas.microsoft.com/3dmanufacturing/material/2015/02"
+
+    @pytest.fixture
+    def split(self, bracket_step, fixtures, top_ref):
+        from stamp.geom import color_split
+
+        doc = Document(base=bracket_step)
+        doc.add_feature(
+            a_feature("boss", fixtures / "logo.svg", top_ref,
+                      kind=OperationKind.ADD, depth=2.0, direction=Direction.OUT_OF)
+        )
+        rebuilt = RebuildEngine(ProfileCache().get).rebuild(doc)
+        assert rebuilt.ok
+        return color_split.split_for_color(doc, rebuilt)
+
+    def _model(self, path):
+        import xml.etree.ElementTree as ET
+        import zipfile
+
+        with zipfile.ZipFile(path) as archive:
+            return ET.fromstring(archive.read("3D/3dmodel.model"))
+
+    def test_no_colour_group_and_no_triangle_refs(self, split, tmp_path):
+        from stamp.io.export import export_3mf
+
+        path = tmp_path / "plain.3mf"
+        export_3mf(split.bodies, path, write_colors=False)
+        model = self._model(path)
+
+        assert not model.findall(f".//{{{self.MATERIAL}}}colorgroup")
+        triangles = model.findall(f".//{{{self.CORE}}}triangle")
+        assert triangles
+        assert not any(t.get("pid") or t.get("p1") for t in triangles)
+        for obj in model.findall(f".//{{{self.CORE}}}object"):
+            assert obj.get("pid") is None
+            assert obj.get("pindex") is None
+
+    def test_the_parts_are_still_separate_and_named(self, split, tmp_path):
+        from stamp.io.export import export_3mf
+
+        path = tmp_path / "plain.3mf"
+        export_3mf(split.bodies, path, write_colors=False)
+        model = self._model(path)
+
+        meshes = [
+            o for o in model.findall(f".//{{{self.CORE}}}object")
+            if o.findall(f".//{{{self.CORE}}}triangle")
+        ]
+        assert len(meshes) == len(split.bodies)
+        assert [o.get("name") for o in meshes] == [b.name for b in split.bodies]
+        assert len(model.findall(f".//{{{self.CORE}}}item")) == 1
+
+    def test_it_still_reads_back(self, split, tmp_path):
+        trimesh = pytest.importorskip("trimesh")
+
+        from stamp.io.export import export_3mf
+
+        path = tmp_path / "plain.3mf"
+        export_3mf(split.bodies, path, write_colors=False)
+        scene = trimesh.load(str(path))
+        assert len(getattr(scene, "geometry", {})) == len(split.bodies)
+
+    def test_the_colours_written_are_the_ones_asked_for(self, split, tmp_path):
+        """Whatever the user picks is what a slicer sees - no defaults leaking."""
+        from stamp.io.export import export_3mf
+
+        path = tmp_path / "gold.3mf"
+        export_3mf(split.bodies, path, base_color="#000000",
+                   feature_color="#C8A24A", write_colors=True)
+        model = self._model(path)
+        colors = [c.get("color")
+                  for c in model.findall(f".//{{{self.MATERIAL}}}color")]
+        assert colors == ["#000000FF", "#C8A24AFF"]

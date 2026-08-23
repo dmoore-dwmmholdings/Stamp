@@ -98,7 +98,14 @@ feature. Raised artwork becomes its own solid, and engraved artwork becomes an
 inlay that fills the pocket flush with the surface — so a color printer can put
 the artwork in a second filament. Through cuts stay open.
 
-The file is a standard 3MF. Each body carries its color on every triangle,
+Set the colors to the filaments you actually print with. A slicer creates a new
+filament for every color it doesn't recognize, so colors that don't match yours
+arrive as extra entries you have to change back. Stamp remembers what you chose,
+so this is a one-time setup. You can also turn the colors off entirely: the file
+then carries no color, no slicer asks anything on the way in, and you pick the
+filament for each part yourself, as with any other 3MF.
+
+When colors are on, the file is a standard 3MF. Each body carries its color on every triangle,
 through the 3MF materials extension — which is what Bambu Studio's color parser
 actually reads. Open it in Bambu Studio or Orca and a color parsing window
 appears; the colors map to filament slots in the order they are written, the
@@ -112,6 +119,22 @@ with `BambuStudio-`, and it reads per-triangle colors **only** from files it did
 not write (`bbs_3mf.cpp`, the `!m_is_bbl_3mf` branch). A file that avoids the
 message would therefore lose its colors, so Stamp writes an honest third-party
 3MF and keeps them.
+
+## Updating the part
+
+A part gets revised. "Replace part" swaps in the newer file and leaves the
+artwork where you put it — Stamp re-resolves each stamp's anchor against the new
+geometry rather than by face number, so moved holes, a thicker plate or new
+features elsewhere don't disturb it.
+
+Afterwards it tells you what happened to each stamp: the ones that stayed put,
+the ones that followed the face they sit on (a thicker plate carries its
+engraving up with the top face), and the ones it could not place. Nothing is
+ever deleted — a stamp that cannot be matched keeps what it had and waits for
+you to pick a face again.
+
+If the new file was exported from a different origin, Stamp notices the offset
+between the two parts and moves the artwork with it.
 
 ## The two kinds of part
 

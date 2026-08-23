@@ -32,6 +32,7 @@ from PySide6.QtWidgets import (
 )
 
 from stamp import __version__, diagnostics, reporting
+from stamp.core import replace_part as replace_part_io
 from stamp.core import snapping
 from stamp.core.document import (
     Anchor,
@@ -298,6 +299,7 @@ class MainWindow(QMainWindow):
         self.action_open_part = add("Open part", self.open_part_dialog, "Ctrl+O")
         self.action_open_project = add("Open project", self.open_project_dialog)
         self.action_save = add("Save", self.save_project, "Ctrl+S")
+        self.action_replace_part = add("Replace part", self.replace_part_dialog)
         self.action_relink = add("Relink", self.relink_sources)
         bar.addSeparator()
         self.action_add_profile = add("+ Add profile", self.add_profile_dialog, "Ctrl+I")
@@ -575,6 +577,7 @@ class MainWindow(QMainWindow):
         self.action_add_profile.setEnabled(has_part)
         self.action_add_text.setEnabled(has_part)
         self.action_save.setEnabled(has_part)
+        self.action_replace_part.setEnabled(has_part)
         self.action_export_step.setEnabled(solid)
         self.action_export_stl.setEnabled(has_part)
         self.action_export_3mf.setEnabled(has_part)
@@ -810,6 +813,93 @@ class MainWindow(QMainWindow):
         # Run the (empty) rebuild so the status line has a volume from the start.
         self.request_rebuild(immediate=True)
         self.statusBar().showMessage(f"Opened {path.name}. Add a profile to place artwork on it.")
+
+    def replace_part_dialog(self) -> None:
+        patterns = " ".join(f"*{ext}" for ext in sorted(PART_EXTS))
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Replace the part with a newer file",
+            self._last_dir("part"), f"Parts ({patterns})",
+        )
+        if path:
+            self.replace_part(Path(path))
+
+    def replace_part(self, path: Path) -> None:
+        """Swap the part for a newer file and keep the artwork on it (§8.2).
+
+        The features are never touched on failure: one that cannot be matched
+        keeps the anchor it had, shows as broken, and waits for a face to be
+        picked again.  That is recoverable; deleting it would not be.
+        """
+        if self.document.base is None:
+            self._notify("There is no part to replace", "Open a part first.")
+            return
+
+        try:
+            result = import_part(path)
+        except PartImportError as exc:
+            self._notify("Stamp cannot open this part", str(exc))
+            return
+
+        if result.units_ambiguous:
+            size = result.part.size
+            dialog = dialogs.UnitPromptDialog(
+                size,
+                title="What unit is this file in?",
+                note=(
+                    f"{path.name} does not record a unit. Its bounding box is "
+                    f"{size[0]:.2f} × {size[1]:.2f} × {size[2]:.2f} in file numbers."
+                ),
+            )
+            if not self._ask(dialog):
+                return
+            if dialog.scale() != 1.0:
+                result = import_part(path, unit_scale=dialog.scale())
+
+        if result.part.mode != self.document.base.mode:
+            if not self._confirm(
+                "That is a different kind of part",
+                f"The project is in {self.document.base.mode} mode and "
+                f"{path.name} is a {result.part.mode}. Replacing it changes what "
+                f"Stamp can export and how the artwork is anchored.\n\nReplace anyway?",
+            ):
+                return
+
+        # Say what will happen before anything changes, when it is not all good.
+        report = replace_part_io.plan_replacement(self.document, result.part)
+        if report.lost and self.interactive:
+            names = ", ".join(m.name for m in report.lost)
+            if not self._confirm(
+                "Some artwork will not match",
+                f"{len(report.lost)} of {len(report.matches)} features cannot be "
+                f"placed on {path.name}: {names}.\n\nThey will be kept and marked "
+                f"so you can pick a face for them again.\n\nReplace the part?",
+            ):
+                return
+
+        self._push_undo("replace part")
+        report = replace_part_io.replace_part(self.document, result.part)
+
+        self.profiles.clear()
+        self.engine.invalidate()
+        self._mesh_pick_cache = None
+        self._mesh_region = None
+        self._last_result = None
+        self._remember_dir("part", path)
+
+        if result.part.warnings:
+            self._notify("Note about this part", "\n\n".join(result.part.warnings))
+
+        self._display_geometry(result.part.runtime, result.part.mode)
+        self.viewport.fit_all()
+        self._refresh_tree()
+        self._refresh_properties()
+        self._update_enabled_state()
+        self._update_title()
+        self.request_rebuild(immediate=True)
+
+        self.statusBar().showMessage(report.summary(), 12000)
+        if self.interactive:
+            dialogs.ReplaceReportDialog(report, path.name, parent=self).exec()
 
     # --------------------------------------------------------- profile loading
 
@@ -1834,11 +1924,22 @@ class MainWindow(QMainWindow):
         from stamp.geom import color_split
 
         feature_count = sum(1 for f in self.document.features if f.enabled)
+        # Remembered, because a slicer makes a filament for every colour it does
+        # not have: setting these to the filaments actually loaded, once, is what
+        # stops unwanted entries arriving with every export.
         dialog = dialogs.Color3mfDialog(
-            feature_count, mode=self.document.base.mode, parent=self
+            feature_count,
+            mode=self.document.base.mode,
+            base_color=self.settings.value("3mf/base_color", type=str) or None,
+            feature_color=self.settings.value("3mf/feature_color", type=str) or None,
+            write_colors=self.settings.value("3mf/write_colors", True, type=bool),
+            parent=self,
         )
         if not self._ask(dialog):
             return
+        self.settings.setValue("3mf/base_color", dialog.base_color())
+        self.settings.setValue("3mf/feature_color", dialog.feature_color())
+        self.settings.setValue("3mf/write_colors", dialog.write_colors())
 
         suggested = export_io.default_filename(self.document.name, "3mf")
         path, _ = QFileDialog.getSaveFileName(
@@ -1855,6 +1956,7 @@ class MainWindow(QMainWindow):
                 split.bodies, path,
                 base_color=dialog.base_color(),
                 feature_color=dialog.feature_color(),
+                write_colors=dialog.write_colors(),
             )
         except (color_split.ColorSplitError, export_io.ExportError) as exc:
             self._notify("Stamp could not write the 3MF", str(exc))
