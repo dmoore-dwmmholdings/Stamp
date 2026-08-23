@@ -41,8 +41,8 @@ python -m uv run pyinstaller packaging/stamp.spec --noconfirm
 | M5 | Polish: error messages, packaging. | Done for Windows |
 
 Version 1 is complete. The seven-step acceptance flow from section 14 exists as a
-single test, and it passes. The suite is 245 tests, all passing, with a clean ruff
-run. Headless (`QT_QPA_PLATFORM=offscreen`) 196 run and 49 skip — the skipped ones
+single test, and it passes. The suite is 263 tests, all passing, with a clean ruff
+run. Headless (`QT_QPA_PLATFORM=offscreen`) 210 run and 53 skip — the skipped ones
 need a real window and an OpenGL context.
 
 ## Modules
