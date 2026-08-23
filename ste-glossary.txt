@@ -1,0 +1,441 @@
+# ste-glossary.txt — project technical nouns and technical verbs (ASD-STE100 rules 1.5 / 1.12)
+# One term per line, case-insensitive, multi-word terms allowed, '#' starts a comment.
+
+# --- product and library names (category 19: computer science and ICT) ---
+Stamp
+Python
+PySide6
+Qt
+OpenCascade
+OCC
+OCP
+AIS
+V3d
+build123d
+manifold3d
+trimesh
+ezdxf
+ocpsvg
+svgelements
+uv
+pip
+pytest
+ruff
+PyInstaller
+Windows
+macOS
+Linux
+Wayland
+X11
+CQ-editor
+Illustrator
+Inkscape
+Fusion
+SolidWorks
+ODA File Converter
+
+# --- file formats and data (categories 15, 19) ---
+STEP
+STL
+SVG
+DXF
+DWG
+IGES
+BREP
+3MF
+OBJ
+PNG
+JSON
+zip
+archive
+manifest
+schema
+thumbnail
+glossary
+specification
+milestone
+dictionary
+checker
+
+# --- computer science terms (category 19) ---
+software
+application
+module
+package
+directory
+repository
+script
+source code
+identifier
+signal
+widget
+viewport
+window handle
+capsule
+integer
+pointer
+thread
+worker thread
+cache
+hash
+undo
+redo
+snapshot
+kernel
+binding
+dependency
+virtual environment
+fixture
+regression test
+unit test
+debounce
+tolerance slider
+progress bar
+status bar
+feature tree
+properties panel
+drag handle
+overlay
+gizmo
+toolbar
+checkbox
+dialog
+
+# --- geometry and engineering terms (category 7) ---
+geometry
+topology
+solid
+mesh
+triangle
+face
+edge
+vertex
+wire
+loop
+nesting
+winding
+profile
+artwork
+sketch plane
+datum plane
+normal
+axis
+origin
+bounding box
+centroid
+boolean
+fuse
+extrude
+extrusion
+prism
+draft angle
+fillet
+chamfer
+emboss
+pocket
+boss
+bracket
+plate
+serial number
+keep-out
+watertight
+manifold
+tessellation
+deflection
+B-rep
+parameterization
+millimeter
+inch
+volume
+
+# --- technical verbs (rule 1.12, categories 1, 2, 3) ---
+import
+export
+render
+orbit
+pan
+zoom
+tessellate
+rebuild
+resolve
+serialize
+decimate
+offset
+scale
+mirror
+
+# --- added while writing PROGRESS.md ---
+feature
+modifier
+preview
+message
+error message
+signature
+load
+select
+click
+angle
+default
+layout
+section
+package root
+file
+project
+mouse
+placement
+alignment
+shaded view
+light angle
+skeleton
+
+# --- added in the second work period ---
+pipeline
+interface
+engine
+test suite
+component
+contour
+silhouette
+overlap
+fill rule
+history
+tolerance
+epsilon
+warning
+count
+lint
+enum
+node
+wrapper
+compound
+glyph
+blend
+blend edge
+coplanar
+seam
+capsule
+integer
+viewBox
+transform
+circle
+rectangle
+base face
+base part
+significant figure
+machining tolerance
+micron
+
+# --- added in the third work period ---
+window
+main window
+panel
+toolbar
+status line
+mouse button
+keyboard
+shortcut
+prompt
+build
+thumbnail
+worker
+debounce
+handle
+emboss
+artwork
+logo
+STE
+parametric
+sketch
+body
+toolpath
+drawing
+cloud
+account
+plugin
+material
+assembly
+milestone
+specification
+repository
+target
+snap target
+element
+union
+non-zero
+baseline
+timer
+event
+string
+package
+zoom
+overlay
+marker
+extrude
+tessellation
+snap
+cylindrical wrap
+
+# --- added while answering a question about artwork import ---
+image
+pixel
+stroke
+fill
+button
+field
+vector
+JPG
+Ctrl
+Trace Bitmap
+drag
+
+# --- added while improving the viewport render ---
+sRGB
+linear RGB
+gray
+GRAY43
+line
+boundary
+face boundary
+drawer
+context
+shaded
+shading
+shadow
+shadow map
+light
+key light
+fill light
+ambient light
+event loop
+handle
+native
+request
+queue
+generation
+cancel
+rebuild controller
+busy flag
+em
+em size
+wrap
+wrap width
+spacing
+letter spacing
+line spacing
+font
+bold
+italic
+underline
+justify
+alignment
+mail application
+installer
+Start menu
+shortcut
+icon
+log
+crash
+report
+bug report
+crash report
+prompt
+outline
+glyph
+counter
+clipboard
+escape
+process id
+contour
+search
+bisection
+percent
+
+# --- added for the public repository (README badges, CI, license) ---
+GitHub
+GitHub Actions
+CI
+commit
+badge
+visit
+push
+display
+MIT
+MIT license
+LICENSE
+license
+workflow
+release
+img
+src
+alt
+
+# --- technical nouns found by a full check of README.md and PROGRESS.md ---
+radius
+email
+text
+path
+mm
+ms
+kB
+MB
+machine
+link
+user
+flag
+tree
+stack
+screen
+ray
+list
+letter
+highlight
+format
+converter
+shop
+plane
+region
+ratio
+coordinate
+world coordinates
+frame
+anchor
+document
+command
+browser
+attachment
+address
+administrator
+password
+page
+printer
+picker
+pattern
+numpy
+normalization
+dump
+download
+detail
+desktop
+controller
+bundle
+body
+version
+environment
+PATH
+process
+edit
+estimate
+prose
+noun
+verb
+rule
+table
+unzip
+FaceRef
+BasePart
+Simplified Technical English
+ASD-STE100
+English
+GD&T
+mail page
+attachment

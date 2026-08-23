@@ -1,0 +1,56 @@
+[project]
+name = "stamp"
+version = "0.1.0"
+description = "Put 2D artwork onto 3D parts as real geometry"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [
+    { name = "Dawson Moore", email = "dwmm127@gmail.com" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "build123d>=0.11.1",
+    "cadquery-ocp-novtk>=7.9.3.1.1",
+    "ezdxf>=1.4.4",
+    "lxml>=6.1.2",
+    "manifold3d>=3.5.2",
+    "networkx>=3.6.1",
+    "numpy>=2.5.2",
+    "ocpsvg>=0.6.0",
+    "pyside6>=6.11.2",
+    "trimesh>=5.0.0",
+]
+
+[project.urls]
+Repository = "https://github.com/dmoore-dwmmholdings/Stamp"
+Issues = "https://github.com/dmoore-dwmmholdings/Stamp/issues"
+
+[project.scripts]
+stamp = "stamp.main:main"
+
+[build-system]
+requires = ["uv_build>=0.12.5,<0.13.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "cadquery-ocp-stubs>=7.9.3.1.1",
+    "pyinstaller>=6.22.2",
+    "pytest>=9.1.1",
+    "pytest-qt>=4.5.0",
+    "ruff>=0.16.4",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["tests"]
+addopts = "-q"
+
+[tool.ruff]
+line-length = 96
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+ignore = ["E501", "B008"]
