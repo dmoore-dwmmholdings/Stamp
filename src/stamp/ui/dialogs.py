@@ -596,9 +596,10 @@ class Color3mfDialog(QDialog):
         layout = QVBoxLayout(self)
         note = QLabel(
             f"The base and {feature_count} feature bod"
-            f"{'y' if feature_count == 1 else 'ies'} are written as separate parts. "
-            f"In Bambu Studio, answer Yes when it asks to load them as one object "
-            f"with multiple parts; each part arrives bound to its filament slot."
+            f"{'y' if feature_count == 1 else 'ies'} are written as separate bodies, "
+            f"each with its colour on every triangle. Bambu Studio and Orca show a "
+            f"colour parsing window on import and map the colours to filament slots "
+            f"in this order: the base first, the artwork second."
         )
         note.setWordWrap(True)
         layout.addWidget(note)

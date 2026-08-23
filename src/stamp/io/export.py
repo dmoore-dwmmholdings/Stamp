@@ -239,6 +239,19 @@ __all__ = [
 
 # ------------------------------------------------------------------------- 3MF
 
+#: The 3MF materials and properties extension.  Bambu Studio's standard-3MF
+#: colour parser reads colours only from this extension's ``colorgroup``, and it
+#: wants the reference on the triangles themselves.  An object-level
+#: ``basematerials`` group - the obvious reading of the core spec - is ignored,
+#: and the model arrives in one colour.
+MATERIAL_NS = "http://schemas.microsoft.com/3dmanufacturing/material/2015/02"
+
+#: A Bambu Studio *project* carries ``Metadata/model_settings.config`` next to a
+#: ``project_settings.config`` and per-plate entries.  Writing the first without
+#: the rest makes Bambu take the project path and stop on the missing pieces,
+#: which loses the colours and shows a config error.  Stamp writes a plain
+#: standard 3MF instead.  Do not add a vendor config here without the whole set.
+
 
 def export_3mf(
     bodies: list,
@@ -247,16 +260,15 @@ def export_3mf(
     base_color: str = "#D8D8D8",
     feature_color: str = "#D62E2E",
 ) -> ExportResult:
-    """Write a multi-body 3MF for multi-color printing.
+    """Write a multi-body 3MF whose artwork carries its own colour.
 
-    Every body becomes its own object in the file, colored through a standard
-    ``basematerials`` group, and ``Metadata/model_settings.config`` assigns the
-    base to filament slot 1 and every feature body to slot 2.  Bambu Studio and
-    Orca read that assignment directly; any other 3MF consumer still gets a
-    plain multi-object model and ignores the extra file.
+    Every body becomes an object, and every triangle of that body points at one
+    entry of a colour group.  Bambu Studio and Orca offer to map those groups to
+    filament slots on import, in the order they appear here: the base first, the
+    features second.  Other tools see a plain multi-object 3MF.
     """
     import zipfile
-    from xml.sax.saxutils import escape
+    from xml.sax.saxutils import quoteattr
 
     path = Path(path)
     if not bodies:
@@ -266,30 +278,34 @@ def export_3mf(
         raise ExportError("There is nothing to export.")
 
     def color(value: str) -> str:
-        value = value.strip()
-        if not value.startswith("#"):
-            value = "#" + value
-        return value.upper()
+        text = str(value).strip().lstrip("#").upper()
+        if len(text) == 3:
+            text = "".join(c * 2 for c in text)
+        if len(text) == 6:
+            text += "FF"  # the extension wants RGBA
+        if len(text) != 8 or any(c not in "0123456789ABCDEF" for c in text):
+            raise ExportError(f"{value!r} is not a colour Stamp can write.")
+        return "#" + text
 
-    parts: list[str] = []
-    parts.append(
+    header = (
         '<?xml version="1.0" encoding="UTF-8"?>\n'
-        '<model unit="millimeter" xml:lang="en-US" '
-        'xmlns="http://schemas.microsoft.com/3dmanufacturing/core/2015/02">\n'
-        ' <resources>\n'
-        '  <basematerials id="1">\n'
-        f'   <base name="Base" displaycolor="{color(base_color)}"/>\n'
-        f'   <base name="Feature" displaycolor="{color(feature_color)}"/>\n'
-        '  </basematerials>\n'
+        '<model unit="millimeter" xml:lang="en-US"\n'
+        ' xmlns="http://schemas.microsoft.com/3dmanufacturing/core/2015/02"\n'
+        f' xmlns:m="{MATERIAL_NS}">\n'
+        " <resources>\n"
+        '  <m:colorgroup id="1">\n'
+        f'   <m:color color="{color(base_color)}"/>\n'
+        f'   <m:color color="{color(feature_color)}"/>\n'
+        "  </m:colorgroup>\n"
     )
-    config_rows: list[str] = []
+
+    parts: list[str] = [header]
     for index, body in enumerate(bodies):
         object_id = index + 2
         pindex = 0 if body.role == "base" else 1
-        name = escape(body.name, {'"': "&quot;"})
         parts.append(
-            f'  <object id="{object_id}" type="model" name="{name}" '
-            f'pid="1" pindex="{pindex}">\n   <mesh>\n    <vertices>\n'
+            f'  <object id="{object_id}" type="model" name={quoteattr(body.name)}'
+            f' pid="1" pindex="{pindex}">\n   <mesh>\n    <vertices>\n'
         )
         parts.append(
             "".join(
@@ -300,50 +316,42 @@ def export_3mf(
         parts.append("    </vertices>\n    <triangles>\n")
         parts.append(
             "".join(
-                f'     <triangle v1="{t[0]}" v2="{t[1]}" v3="{t[2]}"/>\n'
+                f'     <triangle v1="{t[0]}" v2="{t[1]}" v3="{t[2]}"'
+                f' pid="1" p1="{pindex}"/>\n'
                 for t in body.triangles
             )
         )
         parts.append("    </triangles>\n   </mesh>\n  </object>\n")
-        extruder = 1 if body.role == "base" else 2
-        config_rows.append(
-            f'  <object id="{object_id}">\n'
-            f'    <metadata key="name" value="{name}"/>\n'
-            f'    <metadata key="extruder" value="{extruder}"/>\n'
-            f'  </object>\n'
-        )
+
     parts.append(" </resources>\n <build>\n")
     for index in range(len(bodies)):
-        parts.append(f'  <item objectid="{index + 2}"/>\n')
+        parts.append(
+            f'  <item objectid="{index + 2}"'
+            f' transform="1 0 0 0 1 0 0 0 1 0 0 0"/>\n'
+        )
     parts.append(" </build>\n</model>\n")
-    model_xml = "".join(parts)
 
     content_types = (
         '<?xml version="1.0" encoding="UTF-8"?>\n'
         '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">\n'
-        ' <Default Extension="rels" '
-        'ContentType="application/vnd.openxmlformats-package.relationships+xml"/>\n'
-        ' <Default Extension="model" '
-        'ContentType="application/vnd.ms-package.3dmanufacturing-3dmodel+xml"/>\n'
-        ' <Default Extension="config" ContentType="text/xml"/>\n'
+        ' <Default Extension="rels"'
+        ' ContentType="application/vnd.openxmlformats-package.relationships+xml"/>\n'
+        ' <Default Extension="model"'
+        ' ContentType="application/vnd.ms-package.3dmanufacturing-3dmodel+xml"/>\n'
         "</Types>\n"
     )
     rels = (
         '<?xml version="1.0" encoding="UTF-8"?>\n'
-        '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">\n'
-        ' <Relationship Target="/3D/3dmodel.model" Id="rel-1" '
-        'Type="http://schemas.microsoft.com/3dmanufacturing/2013/01/3dmodel"/>\n'
+        '<Relationships'
+        ' xmlns="http://schemas.openxmlformats.org/package/2006/relationships">\n'
+        ' <Relationship Target="/3D/3dmodel.model" Id="rel-1"'
+        ' Type="http://schemas.microsoft.com/3dmanufacturing/2013/01/3dmodel"/>\n'
         "</Relationships>\n"
-    )
-    model_settings = (
-        '<?xml version="1.0" encoding="UTF-8"?>\n'
-        "<config>\n" + "".join(config_rows) + "</config>\n"
     )
 
     with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as archive:
         archive.writestr("[Content_Types].xml", content_types)
         archive.writestr("_rels/.rels", rels)
-        archive.writestr("3D/3dmodel.model", model_xml)
-        archive.writestr("Metadata/model_settings.config", model_settings)
+        archive.writestr("3D/3dmodel.model", "".join(parts))
 
     return ExportResult(path=path, size_bytes=path.stat().st_size, triangle_count=total)

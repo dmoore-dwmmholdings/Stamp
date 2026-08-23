@@ -209,6 +209,36 @@ bracket.step took minutes and failed; after it, 19-29 ms on plate.step and it
 succeeds. Fine artwork on a busy face can still be genuinely too fine, and the
 message says so.
 
+## v0.2.1 - two bugs shipped in v0.2.0
+
+The automatic fillet and chamfer value did nothing whenever the value asked for
+was more than about sixty-four times too large. `_bisect_working_value` halved
+between zero and the request in six steps, so its smallest probe was a
+sixty-fourth of it. Two millimetres of fillet on 2.5 mm text - an ordinary
+thing to type - never reached the 0.03 mm that works, returned nothing, and the
+correction had nothing to apply. The search now descends from half the shortest
+edge until a build succeeds, then closes in on the largest, so it finds a value
+at any ratio. The v0.2.0 test passed because it used a value only ten times too
+large, which bisection survives.
+
+The 3MF exported colours that Bambu Studio did not read, and a config error.
+Two causes:
+
+1. `Metadata/model_settings.config` alone makes Bambu treat the file as one of
+   its own projects. A project also carries `project_settings.config` and
+   per-plate entries, and without them the load stops with a config error and
+   falls back to geometry. Stamp no longer writes any vendor config.
+2. Colours were written as core-spec `basematerials` with an object-level
+   `pid`/`pindex`. Bambu's standard-3MF colour parser reads only the materials
+   extension `<m:colorgroup>`, and it wants the reference on the triangles.
+   Every triangle now carries `pid` and `p1`, and the object keeps its
+   object-level reference for other readers.
+
+lib3mf 2.5, the 3MF Consortium's own implementation, parses the result in
+strict mode with no warnings and resolves every triangle to the right colour.
+That is a spec check, not a Bambu check - nothing here has been opened in Bambu
+Studio.
+
 ## Timings on the standard test
 
 `bracket.step` / `bracket.stl` with `logo.svg`:

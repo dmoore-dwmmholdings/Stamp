@@ -98,13 +98,16 @@ feature. Raised artwork becomes its own solid, and engraved artwork becomes an
 inlay that fills the pocket flush with the surface — so a color printer can put
 the artwork in a second filament. Through cuts stay open.
 
-The file is a standard multi-object 3MF with display colors, plus the filament
-slot assignments Bambu Studio and OrcaSlicer read (base on slot 1, features on
-slot 2). Open it in Bambu Studio, answer **Yes** when it asks to load the parts
-as a single object with multiple parts, and slice — each body arrives bound to
-its filament, and the display colors are matched against your loaded filaments.
-Other slicers see a plain multi-object 3MF and let you assign materials per
-part.
+The file is a standard 3MF. Each body carries its color on every triangle,
+through the 3MF materials extension — which is what Bambu Studio's color parser
+actually reads. Open it in Bambu Studio or Orca and a color parsing window
+appears; the colors map to filament slots in the order they are written, the
+base first and the artwork second. Other slicers see a plain multi-object 3MF
+and let you assign a material per body.
+
+Stamp deliberately does not write Bambu's `model_settings.config`. That file
+alone makes Bambu treat the export as one of its own project files and stop on
+the parts a project would have, which loses the colors.
 
 ## The two kinds of part
 

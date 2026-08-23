@@ -1,6 +1,6 @@
 [project]
 name = "stamp"
-version = "0.2.0"
+version = "0.2.1"
 description = "Put 2D artwork onto 3D parts as real geometry"
 readme = "README.md"
 license = "MIT"

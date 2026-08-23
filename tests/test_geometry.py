@@ -370,3 +370,72 @@ class TestMeshMode:
         verts, tris = mesh_ops.triangulate(box, 0.01)
         assert len(verts) == 8
         assert len(tris) == 12
+
+
+class TestWorkingValueSearch:
+    """A value too large must always name one that works (§6.4).
+
+    The first version bisected between zero and the value asked for, in six
+    steps.  That never probes below a sixty-fourth of the request, so a request
+    a hundred times too large - 2 mm of fillet on 2.5 mm text - reported that
+    nothing at all would work, and the automatic correction had nothing to
+    apply.  The search descends first, then closes in.
+    """
+
+    def _tool(self, logo_profile, top_plane, bracket_step):
+        return build_tool_solid(
+            logo_profile, Placement(), add_op(0.8), top_plane,
+            part_diagonal=bracket_step.diagonal,
+        )
+
+    def _suggestion(self, tool, kind, requested):
+        modifier = Modifier(kind=kind, value=requested,
+                            target=EdgeSelector(role=EdgeRole.TOP))
+        edges = solid_ops.select_edges(tool.shape, modifier, tool.direction)
+        assert edges
+        return solid_ops.apply_modifier(tool.shape, modifier, edges, label="m"), edges
+
+    @pytest.mark.parametrize("requested", [2.0, 5.0, 20.0, 200.0])
+    def test_a_wildly_large_value_still_names_one_that_works(
+        self, logo_profile, top_plane, bracket_step, requested
+    ):
+        tool = self._tool(logo_profile, top_plane, bracket_step)
+        result, edges = self._suggestion(tool, ModifierKind.FILLET, requested)
+
+        assert not result.applied, "this value cannot work, so it must be refused"
+        assert result.suggested_value is not None, (
+            f"a request of {requested} mm produced no usable value"
+        )
+        assert result.suggested_value > 0
+
+        # The value offered has to survive a real build, not just look plausible.
+        ok, _ = solid_ops._try_modifier(
+            tool.shape,
+            Modifier(kind=ModifierKind.FILLET, value=result.suggested_value,
+                     target=EdgeSelector(role=EdgeRole.TOP)),
+            edges,
+            result.suggested_value,
+        )
+        assert ok, "the value offered must actually build"
+
+    def test_the_answer_does_not_depend_on_how_wrong_the_request_was(
+        self, logo_profile, top_plane, bracket_step
+    ):
+        tool = self._tool(logo_profile, top_plane, bracket_step)
+        answers = [
+            self._suggestion(tool, ModifierKind.FILLET, requested)[0].suggested_value
+            for requested in (2.0, 5.0, 20.0)
+        ]
+        assert all(a is not None for a in answers)
+        assert max(answers) - min(answers) < 0.1, answers
+
+    def test_a_chamfer_is_offered_a_value_too(self, logo_profile, top_plane, bracket_step):
+        tool = self._tool(logo_profile, top_plane, bracket_step)
+        result, _ = self._suggestion(tool, ModifierKind.CHAMFER, 20.0)
+        assert result.suggested_value is not None
+
+    def test_a_value_that_works_is_left_alone(self, logo_profile, top_plane, bracket_step):
+        tool = self._tool(logo_profile, top_plane, bracket_step)
+        result, _ = self._suggestion(tool, ModifierKind.FILLET, 0.2)
+        assert result.applied
+        assert result.suggested_value is None

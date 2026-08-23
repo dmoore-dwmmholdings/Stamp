@@ -529,16 +529,18 @@ def _failing_edges(
 
 #: Up to this many edges a build is under about two seconds, so the exact answer
 #: is worth searching for.  Above it, one build alone is ten seconds and a user
-#: is waiting, thus the answer is estimated instead.
+#: is waiting, thus the search is cut short instead.
 MAX_SEARCHED_EDGES = 250
 
 #: Measured against text and logo artwork, the largest value a set accepts ran
 #: between 0.57 and 1.05 of its shortest edge.  Half of the shortest edge is
-#: therefore a value that works, and it costs no search to find.
+#: therefore a good place to start looking, and it costs no search to find.
 SAFE_EDGE_FRACTION = 0.5
 
-#: Builds the estimate may spend.
-MAX_ESTIMATE_BUILDS = 3
+#: Halvings the descent may spend before it gives up, by edge count.  Each one
+#: is a complete build.
+MAX_DESCENT_BUILDS = 12
+MAX_ESTIMATE_BUILDS = 4
 
 
 def smallest_detail(edges: list[TopoDS_Edge]) -> float:
@@ -546,41 +548,33 @@ def smallest_detail(edges: list[TopoDS_Edge]) -> float:
     return min((edge_length(e) for e in edges), default=0.0)
 
 
-def _bisect_working_value(
-    shape: TopoDS_Shape, modifier: Modifier, edges: list[TopoDS_Edge]
-) -> float | None:
-    """The largest value that succeeds, to within the steps allowed."""
-    low, high = 0.0, modifier.value
-    best: float | None = None
-    for _ in range(BISECTION_STEPS):
-        mid = (low + high) / 2.0
-        if mid <= 1e-6:
-            break
-        ok, _ = _try_modifier(shape, modifier, edges, mid)
-        if ok:
-            best = mid
-            low = mid
-        else:
-            high = mid
-    return best
+def _descend_to_working_value(
+    shape: TopoDS_Shape,
+    modifier: Modifier,
+    edges: list[TopoDS_Edge],
+    *,
+    seed: float,
+    budget: int,
+) -> tuple[float | None, float]:
+    """Halve from *seed* until a build succeeds.
 
-
-def _estimate_working_value(
-    shape: TopoDS_Shape, modifier: Modifier, edges: list[TopoDS_Edge]
-) -> float | None:
-    """A value that works, found from the shortest edge rather than by search."""
-    shortest = smallest_detail(edges)
-    if shortest <= 0.0:
-        return None
-    candidate = min(SAFE_EDGE_FRACTION * shortest, modifier.value * 0.9)
-    for _ in range(MAX_ESTIMATE_BUILDS):
+    Returns the first value that works and the smallest one that did not.  The
+    descent is what makes the answer reliable: a plain bisection between zero and
+    the value the user asked for only ever probes down to a sixty-fourth of it, so
+    a request a hundred times too large returns nothing at all and the user is
+    told to fix it by hand.
+    """
+    candidate = seed
+    failing = modifier.value
+    for _ in range(budget):
         if candidate < MIN_USEFUL_VALUE:
-            return None
+            break
         ok, _ = _try_modifier(shape, modifier, edges, candidate)
         if ok:
-            return candidate
+            return candidate, failing
+        failing = candidate
         candidate /= 2.0
-    return None
+    return None, failing
 
 
 def _largest_working_value(
@@ -588,13 +582,40 @@ def _largest_working_value(
 ) -> tuple[float | None, bool]:
     """A value the whole set accepts, and whether it is the exact largest.
 
-    A search costs one complete fillet for each step.  That is affordable on a
-    few hundred edges and not affordable on a few thousand, thus the method
-    changes with the count and the caller is told which answer it received.
+    First descend to something that works, then close in on the largest.  A search
+    costs one complete build for each step, which is affordable on a few hundred
+    edges and not affordable on a few thousand, thus the tightening is skipped
+    above :data:`MAX_SEARCHED_EDGES` and the caller is told which answer it got.
     """
-    if len(edges) <= MAX_SEARCHED_EDGES:
-        return _bisect_working_value(shape, modifier, edges), True
-    return _estimate_working_value(shape, modifier, edges), False
+    if not edges or modifier.value <= 0:
+        return None, False
+
+    searchable = len(edges) <= MAX_SEARCHED_EDGES
+    seed = modifier.value * 0.5
+    shortest = smallest_detail(edges)
+    if shortest > 0:
+        seed = min(seed, SAFE_EDGE_FRACTION * shortest)
+
+    working, failing = _descend_to_working_value(
+        shape, modifier, edges,
+        seed=seed,
+        budget=MAX_DESCENT_BUILDS if searchable else MAX_ESTIMATE_BUILDS,
+    )
+    if working is None or not searchable:
+        return working, False
+
+    # Close the gap between what works and the smallest value that did not.
+    low, high = working, failing
+    for _ in range(BISECTION_STEPS):
+        mid = (low + high) / 2.0
+        if mid - low <= max(low * 0.05, 1e-4):
+            break
+        ok, _ = _try_modifier(shape, modifier, edges, mid)
+        if ok:
+            low = mid
+        else:
+            high = mid
+    return low, True
 
 
 # ------------------------------------------------------------------- validity

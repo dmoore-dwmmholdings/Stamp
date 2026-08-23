@@ -205,3 +205,42 @@ class TestTextFeature:
         target = tmp_path / "text.stamp"
         save(doc, target)
         assert target.exists()
+
+
+class TestTextGetsAWorkingValue:
+    """Small text with a large fillet is the case the first search could not do.
+
+    2 mm of fillet on 2.5 mm text is roughly a hundred times too large.  A
+    bisection between zero and the request only reaches a sixty-fourth of it, so
+    every probe failed and the user was told the artwork was too fine, with no
+    value to fall back to and nothing for the automatic correction to apply.
+    """
+
+    def test_a_large_fillet_on_small_text_is_given_a_value(self, qapp):
+        from stamp.core.document import Plane
+        from stamp.geom import solid_ops
+        from stamp.geom.tool_solid import build_tool_solid
+        from stamp.io.text_profile import build_text_profile
+
+        profile = build_text_profile(TextSpec(text="AB", size_mm=2.5))
+        plane = Plane(origin=(30.0, 20.0, 8.0), normal=(0.0, 0.0, 1.0),
+                      u_axis=(1.0, 0.0, 0.0))
+        tool = build_tool_solid(
+            profile, Placement(),
+            Operation(kind=OperationKind.CUT, depth_mode=DepthMode.BLIND, depth=0.5,
+                      direction=Direction.INTO),
+            plane, part_diagonal=80.0,
+        )
+        modifier = Modifier(kind=ModifierKind.FILLET, value=2.0,
+                            target=EdgeSelector(role=EdgeRole.TOP))
+        edges = solid_ops.select_edges(tool.shape, modifier, tool.direction)
+        assert edges
+
+        result = solid_ops.apply_modifier(tool.shape, modifier, edges, label="text")
+        assert not result.applied
+        assert result.suggested_value is not None, (
+            "small text with a large fillet must still be given a value to use"
+        )
+        ok, _ = solid_ops._try_modifier(tool.shape, modifier, edges,
+                                        result.suggested_value)
+        assert ok, "the value offered must actually build"

@@ -10,7 +10,7 @@
 ; administrator password.
 
 #define AppName "Stamp"
-#define AppVersion "0.2.0"
+#define AppVersion "0.2.1"
 #define AppPublisher "DWMM Holdings"
 #define AppExeName "Stamp.exe"
 #define SourceDir "..\build\dist\Stamp"

@@ -2,4 +2,4 @@
 
 #: The single source of the application version.  pyproject.toml and the
 #: installer script carry the same number; a test keeps them in agreement.
-__version__ = "0.2.0"
+__version__ = "0.2.1"

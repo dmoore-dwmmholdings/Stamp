@@ -656,60 +656,130 @@ class TestColorSplit:
 
 
 class TestExport3mf:
-    """The 3MF writer - one object per body, colors, and filament slots."""
+    """The 3MF writer - a standard file whose triangles carry their colour.
 
-    def test_the_archive_holds_the_model_and_the_slots(self, bracket_step, fixtures,
-                                                       top_ref, tmp_path):
-        import xml.etree.ElementTree as ET
-        import zipfile
+    Bambu Studio's standard-3MF colour parser reads the materials extension
+    colour group and the per-triangle references, and nothing else.  An
+    object-level basematerials group is ignored, and a lone
+    Metadata/model_settings.config makes it take the Bambu *project* path and
+    stop on the pieces a project would have, which is why neither appears here.
+    """
 
+    CORE = "http://schemas.microsoft.com/3dmanufacturing/core/2015/02"
+    MATERIAL = "http://schemas.microsoft.com/3dmanufacturing/material/2015/02"
+
+    @pytest.fixture
+    def split(self, bracket_step, fixtures, top_ref):
         from stamp.geom import color_split
-        from stamp.io.export import export_3mf
 
         doc = Document(base=bracket_step)
         doc.add_feature(
             a_feature("boss", fixtures / "logo.svg", top_ref,
                       kind=OperationKind.ADD, depth=2.0, direction=Direction.OUT_OF)
         )
-        engine = RebuildEngine(ProfileCache().get)
-        rebuilt = engine.rebuild(doc)
+        rebuilt = RebuildEngine(ProfileCache().get).rebuild(doc)
         assert rebuilt.ok
-        split = color_split.split_for_color(doc, rebuilt)
+        return color_split.split_for_color(doc, rebuilt)
+
+    def _model(self, path):
+        import xml.etree.ElementTree as ET
+        import zipfile
+
+        with zipfile.ZipFile(path) as archive:
+            names = set(archive.namelist())
+            model = ET.fromstring(archive.read("3D/3dmodel.model"))
+        return names, model
+
+    def test_the_colour_group_carries_both_colours_in_order(self, split, tmp_path):
+        from stamp.io.export import export_3mf
 
         path = tmp_path / "color.3mf"
         result = export_3mf(split.bodies, path, base_color="#101010",
                             feature_color="#D62E2E")
         assert result.triangle_count > 0
 
-        with zipfile.ZipFile(path) as archive:
-            names = set(archive.namelist())
-            assert "3D/3dmodel.model" in names
-            assert "Metadata/model_settings.config" in names
-            assert "[Content_Types].xml" in names
-            assert "_rels/.rels" in names
+        _names, model = self._model(path)
+        ns = {"c": self.CORE, "m": self.MATERIAL}
+        groups = model.findall(".//m:colorgroup", ns)
+        assert len(groups) == 1, "one group, so the slots map in a known order"
+        colors = [c.get("color") for c in groups[0].findall("m:color", ns)]
+        # The base is first, so it lands on the first filament slot.
+        assert colors == ["#101010FF", "#D62E2EFF"], colors
 
-            ns = {"m": "http://schemas.microsoft.com/3dmanufacturing/core/2015/02"}
-            model = ET.fromstring(archive.read("3D/3dmodel.model"))
-            objects = model.findall(".//m:object", ns)
-            assert len(objects) == 2
-            colors = [b.get("displaycolor") for b in model.findall(".//m:base", ns)]
-            assert colors == ["#101010", "#D62E2E"]
-            assert len(model.findall(".//m:item", ns)) == 2
+    def test_every_triangle_names_its_colour(self, split, tmp_path):
+        from stamp.io.export import export_3mf
 
-            config = ET.fromstring(archive.read("Metadata/model_settings.config"))
-            extruders = [
-                meta.get("value")
-                for obj in config.findall("object")
-                for meta in obj.findall("metadata")
-                if meta.get("key") == "extruder"
-            ]
-            assert extruders == ["1", "2"]
+        path = tmp_path / "color.3mf"
+        export_3mf(split.bodies, path)
+        _names, model = self._model(path)
+        ns = {"c": self.CORE}
+
+        objects = model.findall(".//c:object", ns)
+        assert len(objects) == len(split.bodies)
+        for index, obj in enumerate(objects):
+            expected = "0" if index == 0 else "1"
+            assert obj.get("pid") == "1"
+            assert obj.get("pindex") == expected
+            triangles = obj.findall(".//c:triangle", ns)
+            assert triangles
+            references = {(t.get("pid"), t.get("p1")) for t in triangles}
+            assert references == {("1", expected)}, references
+
+    def test_no_vendor_config_is_written(self, split, tmp_path):
+        """A half-written Bambu project is worse than none: it errors on load."""
+        from stamp.io.export import export_3mf
+
+        path = tmp_path / "color.3mf"
+        export_3mf(split.bodies, path)
+        names, _model = self._model(path)
+        assert names == {"[Content_Types].xml", "_rels/.rels", "3D/3dmodel.model"}
+        assert not any(n.endswith(".config") for n in names)
+
+    def test_every_body_is_placed_on_the_plate(self, split, tmp_path):
+        from stamp.io.export import export_3mf
+
+        path = tmp_path / "color.3mf"
+        export_3mf(split.bodies, path)
+        _names, model = self._model(path)
+        ns = {"c": self.CORE}
+        items = model.findall(".//c:item", ns)
+        assert len(items) == len(split.bodies)
+        assert all(i.get("transform") for i in items)
+
+    def test_short_and_long_colours_are_both_accepted(self, split, tmp_path):
+        from stamp.io.export import export_3mf
+
+        path = tmp_path / "color.3mf"
+        export_3mf(split.bodies, path, base_color="fff", feature_color="#00ff00")
+        _names, model = self._model(path)
+        ns = {"m": self.MATERIAL}
+        colors = [c.get("color") for c in model.findall(".//m:color", ns)]
+        assert colors == ["#FFFFFFFF", "#00FF00FF"]
+
+    def test_a_colour_that_is_not_a_colour_is_refused(self, split, tmp_path):
+        from stamp.io.export import ExportError, export_3mf
+
+        with pytest.raises(ExportError):
+            export_3mf(split.bodies, tmp_path / "bad.3mf", base_color="mauve")
 
     def test_an_empty_export_is_refused(self, tmp_path):
         from stamp.io.export import ExportError, export_3mf
 
         with pytest.raises(ExportError):
             export_3mf([], tmp_path / "empty.3mf")
+
+    def test_the_file_reads_back_as_separate_named_bodies(self, split, tmp_path):
+        """trimesh is a third-party reader: if it agrees, the file is not private."""
+        trimesh = pytest.importorskip("trimesh")
+
+        from stamp.io.export import export_3mf
+
+        path = tmp_path / "color.3mf"
+        export_3mf(split.bodies, path)
+        scene = trimesh.load(str(path))
+        geometries = getattr(scene, "geometry", None)
+        assert geometries is not None
+        assert len(geometries) == len(split.bodies)
 
 
 class TestVersion:
