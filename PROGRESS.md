@@ -41,8 +41,9 @@ python -m uv run pyinstaller packaging/stamp.spec --noconfirm
 | M5 | Polish: error messages, packaging. | Done for Windows |
 
 Version 1 is complete. The seven-step acceptance flow from section 14 exists as a
-single test, and it passes. The suite is 229 tests, all passing, with a clean ruff
-run.
+single test, and it passes. The suite is 245 tests, all passing, with a clean ruff
+run. Headless (`QT_QPA_PLATFORM=offscreen`) 196 run and 49 skip — the skipped ones
+need a real window and an OpenGL context.
 
 ## Modules
 
@@ -64,6 +65,7 @@ run.
 | `geom/solid_ops.py` | OCC booleans, fillets, chamfers. Section 6.4. |
 | `geom/mesh_ops.py` | The manifold3d path. Sections 2 and 6.5. |
 | `geom/mesh_regions.py` | Face selection on mesh parts. Section 6.1. |
+| `geom/color_split.py` | One body per feature, for multi-color printing. |
 | `ui/viewport.py` | The OCC viewport widget. |
 | `ui/main_window.py` | The window and all commands. Section 7. |
 | `ui/feature_tree.py` | The feature tree on the left. |
@@ -175,6 +177,37 @@ Partial fillets are possible: groups of 40 edges applied sequentially to the
 running result filleted 22% of the edges; groups of 20 got 40%; bisection got 49%
 in 60 seconds. Stamp doesn't do it — a mix of rounded and sharp letters looks worse
 than all sharp.
+
+## v0.2.0
+
+- The window title now carries the version. `stamp.__version__` is the single
+  source; a test keeps pyproject.toml and packaging/stamp.iss in agreement.
+- A fillet or chamfer value that fails is corrected automatically: the rebuild's
+  suggested value goes straight into the modifier and the part rebuilds with it.
+  The "Use N" button in the properties panel is gone. Attempts are capped at
+  three per modifier in case an estimated suggestion itself fails.
+- Modifiers on "edges at the face" (EdgeRole.BOTTOM) were applied to the tool
+  solid, which points them the wrong way: a chamfer at the base of a boss cut an
+  undercut notch into the boss, and a chamfer on a pocket rim left an
+  overhanging lip. They now run through the same post-boolean path as BLEND, so
+  a base modifier flares outward and a rim modifier widens the mouth. On mesh
+  parts they are unavailable, like BLEND.
+- "Export 3MF" writes one body per feature plus the base for multi-color
+  printing (`geom/color_split.py` + `export_3mf`). Raised features become
+  `result ∩ tool`, engraved features become the inlay `(base ∩ tool) − result`,
+  so the bodies mate exactly. The archive is a standard multi-object 3MF with
+  basematerials display colors plus Bambu/Orca `Metadata/model_settings.config`
+  extruder slots (base = 1, features = 2). Through cuts stay open on purpose.
+- `solid_ops.boolean` gained the "common" kind and `mesh_ops.boolean` gained
+  "intersect" for the color split.
+
+The union leaves sliver edges about one contact overlap long stitched into the
+joint ring, and one of them refuses any radius worth seeing — which fails the
+whole build, because a fillet is one build for every edge. `find_blend_edges`
+takes a `min_length` and drops them. Before the filter, a ring modifier on
+bracket.step took minutes and failed; after it, 19-29 ms on plate.step and it
+succeeds. Fine artwork on a busy face can still be genuinely too fine, and the
+message says so.
 
 ## Timings on the standard test
 

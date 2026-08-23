@@ -30,7 +30,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from stamp import diagnostics, reporting
+from stamp import __version__, diagnostics, reporting
 from stamp.core import snapping
 from stamp.core.document import (
     Anchor,
@@ -103,7 +103,7 @@ class MainWindow(QMainWindow):
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
-        self.setWindowTitle("Stamp")
+        self.setWindowTitle(f"Stamp {__version__}")
         self.resize(1400, 880)
         self.setAcceptDrops(True)
 
@@ -126,6 +126,8 @@ class MainWindow(QMainWindow):
         self._busy_since = 0.0
         self._busy_step = ""
         self._mesh_pick_cache: dict | None = None
+        self._auto_value_attempts: dict[str, int] = {}
+        self._auto_value_note = ""
         self._mesh_region = None
         self._undo_baseline = self.document.snapshot()
 
@@ -302,6 +304,7 @@ class MainWindow(QMainWindow):
         bar.addSeparator()
         self.action_export_step = add("Export STEP", self.export_step)
         self.action_export_stl = add("Export STL", self.export_stl)
+        self.action_export_3mf = add("Export 3MF", self.export_3mf)
         self.action_export_quote = add("Export for quote", self.export_for_quote)
         bar.addSeparator()
 
@@ -563,7 +566,7 @@ class MainWindow(QMainWindow):
     def _update_title(self) -> None:
         name = self._project_path.name if self._project_path else "Untitled"
         mark = " •" if self._dirty else ""
-        self.setWindowTitle(f"Stamp — {name}{mark}")
+        self.setWindowTitle(f"Stamp {__version__} — {name}{mark}")
 
     def _update_enabled_state(self) -> None:
         has_part = self.document.base is not None
@@ -573,6 +576,7 @@ class MainWindow(QMainWindow):
         self.action_save.setEnabled(has_part)
         self.action_export_step.setEnabled(solid)
         self.action_export_stl.setEnabled(has_part)
+        self.action_export_3mf.setEnabled(has_part)
         self.action_export_quote.setEnabled(has_part)
         self.action_undo.setEnabled(self.undo_stack.can_undo())
         self.action_redo.setEnabled(self.undo_stack.can_redo())
@@ -595,13 +599,9 @@ class MainWindow(QMainWindow):
             self.handles.set_feature(None, None)
             return
         size = self._native_size(feature)
-        result = None
-        if self._last_result is not None:
-            result = self._last_result.result_for(feature.id)
         self.properties.show_feature(
             self.document, feature, size,
             mesh_mode=self.document.base is not None and self.document.base.mode == "mesh",
-            suggestions=getattr(result, "suggested_values", None),
         )
         self._refresh_snap_targets(feature)
         self.handles.set_feature(feature, size)
@@ -1478,6 +1478,11 @@ class MainWindow(QMainWindow):
         elif warnings:
             self.warning_label.setText(warnings[-1])
             self.warning_label.setStyleSheet("color: #c58a2a;")
+        elif self._auto_value_note:
+            # The corrected rebuild came back clean; say what was changed and why.
+            self.warning_label.setText(self._auto_value_note)
+            self.warning_label.setStyleSheet("color: #c58a2a;")
+            self._auto_value_note = ""
         else:
             self.warning_label.setText("")
 
@@ -1492,6 +1497,58 @@ class MainWindow(QMainWindow):
             feature = self.selected_feature
             if feature is not None:
                 self._warn_profile_larger_than_face(feature)
+        self._auto_apply_working_values(result)
+
+    def _auto_apply_working_values(self, result: RebuildResult) -> None:
+        """A fillet or chamfer that failed names the largest value that works.
+
+        That value goes straight into the modifier and the part rebuilds with it,
+        so the user never has to copy a number out of a message.  Attempts are
+        capped per modifier: a suggestion that itself fails produces a smaller
+        one, and three tries is enough for any real artwork.
+        """
+        fixes = []
+        for row in result.features:
+            if not row.suggested_values:
+                continue
+            feature = next(
+                (f for f in self.document.features if f.id == row.feature_id), None
+            )
+            if feature is None:
+                continue
+            for modifier in feature.modifiers:
+                value = row.suggested_values.get(modifier.id)
+                if value is None or value <= 0:
+                    continue
+                if self._auto_value_attempts.get(modifier.id, 0) >= 3:
+                    continue
+                if abs(modifier.value - value) < 1e-9:
+                    continue
+                self._auto_value_attempts[modifier.id] = (
+                    self._auto_value_attempts.get(modifier.id, 0) + 1
+                )
+                previous = modifier.value
+                modifier.value = float(value)
+                word = "radius" if modifier.kind is ModifierKind.FILLET else "distance"
+                fixes.append(
+                    f"{feature.name} – {modifier.label}: a {word} of {previous:g} mm "
+                    f"was too large, so Stamp set {value:.3f} mm, the largest that works."
+                )
+        # A modifier that came back without a suggestion is healthy again.
+        suggested_now = {
+            mid for row in result.features for mid in row.suggested_values
+        }
+        for mid in list(self._auto_value_attempts):
+            if mid not in suggested_now:
+                del self._auto_value_attempts[mid]
+        if not fixes:
+            return
+        self._auto_value_note = fixes[-1]
+        self.statusBar().showMessage(fixes[-1], 10000)
+        self._push_undo("working value")
+        self._refresh_properties()
+        self._refresh_tree()
+        self.request_rebuild()
 
     def _on_rebuild_failed(self, message: str) -> None:
         self.warning_label.setText(message)
@@ -1751,6 +1808,46 @@ class MainWindow(QMainWindow):
         except export_io.ExportError as exc:
             self._notify("Stamp could not write the STL", str(exc))
             return
+        self._remember_dir("export", Path(path))
+        self._report_export(result)
+
+    def export_3mf(self) -> None:
+        """Write one body per feature plus the base, for multi-color printing."""
+        if self.document.base is None:
+            return
+        if self._last_result is None or self._last_result.geometry is None:
+            self._notify("Nothing to export", "Rebuild the part first.")
+            return
+
+        from stamp.geom import color_split
+
+        feature_count = sum(1 for f in self.document.features if f.enabled)
+        dialog = dialogs.Color3mfDialog(
+            feature_count, mode=self.document.base.mode, parent=self
+        )
+        if not self._ask(dialog):
+            return
+
+        suggested = export_io.default_filename(self.document.name, "3mf")
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Export 3MF", str(Path(self._last_dir("export")) / suggested),
+            "3MF files (*.3mf)",
+        )
+        if not path:
+            return
+        try:
+            split = color_split.split_for_color(
+                self.document, self._last_result, deflection=dialog.deflection_mm()
+            )
+            result = export_io.export_3mf(
+                split.bodies, path,
+                base_color=dialog.base_color(),
+                feature_color=dialog.feature_color(),
+            )
+        except (color_split.ColorSplitError, export_io.ExportError) as exc:
+            self._notify("Stamp could not write the 3MF", str(exc))
+            return
+        result.warnings.extend(split.warnings)
         self._remember_dir("export", Path(path))
         self._report_export(result)
 

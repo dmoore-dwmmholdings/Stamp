@@ -459,3 +459,271 @@ class TestModifierValueThatWorks:
         result = engine.rebuild(doc)
         assert result.ok
         assert result.warnings == []
+
+
+class TestFaceModifierOrientation:
+    """Modifiers on the edges at the face act on the joined result, not the tool.
+
+    Applied to the tool they point the wrong way: a chamfer at the base of a boss
+    cuts an undercut notch into the boss, and a chamfer on a pocket rim leaves an
+    overhanging lip.  Applied to the result, a base modifier flares outward into
+    the part and a rim modifier widens the mouth.
+    """
+
+    @pytest.fixture
+    def plate(self, fixtures):
+        from stamp.io.part_import import import_part
+
+        return import_part(fixtures / "plate.step").part
+
+    @pytest.fixture
+    def plate_ref(self, plate):
+        for face in faces_of(plate.runtime):
+            if surface_kind(face) != "plane":
+                continue
+            center = face_center(face)
+            if abs(center[2] - 5.0) < 1e-6 and face_normal_at(face, center)[2] > 0.9:
+                return make_face_ref(face, (center[0], center[1], 5.0))
+        pytest.fail("no top face on the plate")
+
+    def _build(self, plate, fixtures, ref, *, kind, direction, modifiers=()):
+        doc = Document(base=plate)
+        doc.add_feature(
+            a_feature("f", fixtures / "logo.svg", ref, kind=kind, depth=2.0,
+                      direction=direction, modifiers=modifiers)
+        )
+        result = RebuildEngine(ProfileCache().get).rebuild(doc)
+        assert result.ok
+        assert result.warnings == [], result.warnings
+        return result.geometry
+
+    @staticmethod
+    def _centroid(shape):
+        from OCP.BRepGProp import BRepGProp
+        from OCP.GProp import GProp_GProps
+
+        props = GProp_GProps()
+        BRepGProp.VolumeProperties_s(shape, props)
+        return props.CentreOfMass().Z(), props.Mass()
+
+    def _difference(self, plain, modified):
+        from stamp.geom import solid_ops
+
+        removed = solid_ops.boolean(plain, modified, "cut", collect_history=False).shape
+        added = solid_ops.boolean(modified, plain, "cut", collect_history=False).shape
+        removed_z, removed_mm3 = self._centroid(removed)
+        added_z, added_mm3 = self._centroid(added)
+        return removed_mm3, removed_z, added_mm3, added_z
+
+    def test_a_base_chamfer_flares_out_into_the_part(self, plate, fixtures, plate_ref):
+        chamfer = Modifier(kind=ModifierKind.CHAMFER, value=0.3,
+                           target=EdgeSelector(role=EdgeRole.BOTTOM))
+        plain = self._build(plate, fixtures, plate_ref,
+                            kind=OperationKind.ADD, direction=Direction.OUT_OF)
+        flared = self._build(plate, fixtures, plate_ref,
+                             kind=OperationKind.ADD, direction=Direction.OUT_OF,
+                             modifiers=[chamfer])
+        removed_mm3, _, added_mm3, added_z = self._difference(plain, flared)
+        assert added_mm3 > 1.0, "the chamfer must add a flare around the base"
+        assert removed_mm3 < 0.01, "it must not cut a notch into the boss"
+        assert abs(added_z - 5.0) < 0.5, "the flare sits where the boss meets the face"
+
+    def test_a_rim_chamfer_widens_the_pocket_mouth(self, plate, fixtures, plate_ref):
+        chamfer = Modifier(kind=ModifierKind.CHAMFER, value=0.3,
+                           target=EdgeSelector(role=EdgeRole.BOTTOM))
+        plain = self._build(plate, fixtures, plate_ref,
+                            kind=OperationKind.CUT, direction=Direction.INTO)
+        widened = self._build(plate, fixtures, plate_ref,
+                              kind=OperationKind.CUT, direction=Direction.INTO,
+                              modifiers=[chamfer])
+        removed_mm3, removed_z, added_mm3, _ = self._difference(plain, widened)
+        assert removed_mm3 > 1.0, "the chamfer must open the rim outward"
+        assert added_mm3 < 0.01, "it must not leave an overhanging lip"
+        assert abs(removed_z - 5.0) < 0.5, "the widening sits at the rim"
+
+    def test_a_base_fillet_also_adds_material(self, plate, fixtures, plate_ref):
+        fillet = Modifier(kind=ModifierKind.FILLET, value=0.3,
+                          target=EdgeSelector(role=EdgeRole.BOTTOM))
+        plain = self._build(plate, fixtures, plate_ref,
+                            kind=OperationKind.ADD, direction=Direction.OUT_OF)
+        blended = self._build(plate, fixtures, plate_ref,
+                              kind=OperationKind.ADD, direction=Direction.OUT_OF,
+                              modifiers=[fillet])
+        removed_mm3, _, added_mm3, _ = self._difference(plain, blended)
+        assert added_mm3 > 1.0
+        assert removed_mm3 < 0.01
+
+    def test_the_top_edges_are_untouched_by_the_change(self, plate, fixtures, plate_ref):
+        """A modifier on the far end of the sweep still works on the tool."""
+        chamfer = Modifier(kind=ModifierKind.CHAMFER, value=0.3,
+                           target=EdgeSelector(role=EdgeRole.TOP))
+        plain = self._build(plate, fixtures, plate_ref,
+                            kind=OperationKind.ADD, direction=Direction.OUT_OF)
+        topped = self._build(plate, fixtures, plate_ref,
+                             kind=OperationKind.ADD, direction=Direction.OUT_OF,
+                             modifiers=[chamfer])
+        removed_mm3, removed_z, added_mm3, _ = self._difference(plain, topped)
+        assert removed_mm3 > 1.0, "the top chamfer takes material off the crown"
+        assert added_mm3 < 0.01
+        assert abs(removed_z - 7.0) < 0.5, "the crown of a 2 mm boss on a 5 mm plate"
+
+
+class TestColorSplit:
+    """The multi-color export divides the result along feature boundaries."""
+
+    def test_solid_bodies_partition_the_result(self, bracket_step, fixtures, top_ref):
+        from stamp.geom import color_split, solid_ops
+
+        doc = Document(base=bracket_step)
+        doc.add_feature(
+            a_feature("boss", fixtures / "logo.svg", top_ref,
+                      kind=OperationKind.ADD, depth=2.0, direction=Direction.OUT_OF)
+        )
+        engine = RebuildEngine(ProfileCache().get)
+        result = engine.rebuild(doc)
+        assert result.ok
+
+        split = color_split.split_for_color(doc, result)
+        assert [b.role for b in split.bodies] == ["base", "feature"]
+        assert all(b.triangle_count > 0 for b in split.bodies)
+        assert result.volume > solid_ops.volume(bracket_step.runtime)
+
+    def test_an_engraving_becomes_a_flush_inlay(self, bracket_step, fixtures, top_ref):
+        import numpy as np
+
+        from stamp.geom import color_split
+
+        doc = Document(base=bracket_step)
+        doc.add_feature(
+            a_feature("mark", fixtures / "logo.svg", top_ref,
+                      kind=OperationKind.CUT, depth=1.0, direction=Direction.INTO)
+        )
+        engine = RebuildEngine(ProfileCache().get)
+        result = engine.rebuild(doc)
+        assert result.ok
+
+        split = color_split.split_for_color(doc, result)
+        inlays = [b for b in split.bodies if b.role == "feature"]
+        assert len(inlays) == 1
+        # The inlay fills the pocket flush: its top is at the face, its bottom at
+        # the pocket floor.
+        z = np.asarray(inlays[0].vertices)[:, 2]
+        assert abs(float(z.max()) - 8.0) < 1e-3
+        assert abs(float(z.min()) - 7.0) < 1e-3
+
+    def test_a_through_cut_stays_open(self, bracket_step, fixtures, top_ref):
+        from stamp.geom import color_split
+
+        doc = Document(base=bracket_step)
+        doc.add_feature(
+            a_feature("hole", fixtures / "logo.svg", top_ref,
+                      kind=OperationKind.CUT, depth=2.0, direction=Direction.INTO)
+        )
+        doc.features[0].operation.depth_mode = DepthMode.THROUGH_ALL
+        engine = RebuildEngine(ProfileCache().get)
+        result = engine.rebuild(doc)
+        assert result.ok
+
+        split = color_split.split_for_color(doc, result)
+        assert [b.role for b in split.bodies] == ["base"]
+        assert any("stays open" in w for w in split.warnings)
+
+    def test_mesh_mode_splits_too(self, bracket_stl, fixtures):
+        from stamp.core.document import Plane
+        from stamp.geom import color_split
+
+        doc = Document(base=bracket_stl)
+        feature = Feature(
+            name="boss",
+            profile=ProfileRef(source_path=str(fixtures / "logo.svg"),
+                               source_hash=file_hash(fixtures / "logo.svg")),
+            placement=Placement(anchor=Anchor(
+                kind=AnchorKind.MESH_REGION,
+                plane=Plane(origin=(30.0, 20.0, 8.0), normal=(0.0, 0.0, 1.0),
+                            u_axis=(1.0, 0.0, 0.0)),
+            )),
+            operation=Operation(kind=OperationKind.ADD, depth_mode=DepthMode.BLIND,
+                                depth=2.0, direction=Direction.OUT_OF),
+        )
+        doc.add_feature(feature)
+        engine = RebuildEngine(ProfileCache().get)
+        result = engine.rebuild(doc)
+        assert result.ok
+
+        split = color_split.split_for_color(doc, result)
+        assert [b.role for b in split.bodies] == ["base", "feature"]
+        assert all(b.triangle_count > 0 for b in split.bodies)
+
+
+class TestExport3mf:
+    """The 3MF writer - one object per body, colors, and filament slots."""
+
+    def test_the_archive_holds_the_model_and_the_slots(self, bracket_step, fixtures,
+                                                       top_ref, tmp_path):
+        import xml.etree.ElementTree as ET
+        import zipfile
+
+        from stamp.geom import color_split
+        from stamp.io.export import export_3mf
+
+        doc = Document(base=bracket_step)
+        doc.add_feature(
+            a_feature("boss", fixtures / "logo.svg", top_ref,
+                      kind=OperationKind.ADD, depth=2.0, direction=Direction.OUT_OF)
+        )
+        engine = RebuildEngine(ProfileCache().get)
+        rebuilt = engine.rebuild(doc)
+        assert rebuilt.ok
+        split = color_split.split_for_color(doc, rebuilt)
+
+        path = tmp_path / "color.3mf"
+        result = export_3mf(split.bodies, path, base_color="#101010",
+                            feature_color="#D62E2E")
+        assert result.triangle_count > 0
+
+        with zipfile.ZipFile(path) as archive:
+            names = set(archive.namelist())
+            assert "3D/3dmodel.model" in names
+            assert "Metadata/model_settings.config" in names
+            assert "[Content_Types].xml" in names
+            assert "_rels/.rels" in names
+
+            ns = {"m": "http://schemas.microsoft.com/3dmanufacturing/core/2015/02"}
+            model = ET.fromstring(archive.read("3D/3dmodel.model"))
+            objects = model.findall(".//m:object", ns)
+            assert len(objects) == 2
+            colors = [b.get("displaycolor") for b in model.findall(".//m:base", ns)]
+            assert colors == ["#101010", "#D62E2E"]
+            assert len(model.findall(".//m:item", ns)) == 2
+
+            config = ET.fromstring(archive.read("Metadata/model_settings.config"))
+            extruders = [
+                meta.get("value")
+                for obj in config.findall("object")
+                for meta in obj.findall("metadata")
+                if meta.get("key") == "extruder"
+            ]
+            assert extruders == ["1", "2"]
+
+    def test_an_empty_export_is_refused(self, tmp_path):
+        from stamp.io.export import ExportError, export_3mf
+
+        with pytest.raises(ExportError):
+            export_3mf([], tmp_path / "empty.3mf")
+
+
+class TestVersion:
+    """One version number, three places that carry it."""
+
+    def test_package_pyproject_and_installer_agree(self):
+        import re
+        from pathlib import Path as P
+
+        import stamp
+
+        root = P(__file__).parent.parent
+        pyproject = (root / "pyproject.toml").read_text(encoding="utf-8")
+        assert f'version = "{stamp.__version__}"' in pyproject
+        iss = (root / "packaging" / "stamp.iss").read_text(encoding="utf-8")
+        match = re.search(r'#define AppVersion "([^"]+)"', iss)
+        assert match and match.group(1) == stamp.__version__

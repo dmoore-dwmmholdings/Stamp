@@ -1,3 +1,5 @@
 """Stamp — place 2D vector artwork onto 3D parts as real geometry."""
 
-__version__ = "0.1.0"
+#: The single source of the application version.  pyproject.toml and the
+#: installer script carry the same number; a test keeps them in agreement.
+__version__ = "0.2.0"

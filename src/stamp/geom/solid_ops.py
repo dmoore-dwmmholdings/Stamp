@@ -14,7 +14,7 @@ import math
 from dataclasses import dataclass, field
 
 from OCP.BRepAdaptor import BRepAdaptor_Curve
-from OCP.BRepAlgoAPI import BRepAlgoAPI_Cut, BRepAlgoAPI_Fuse
+from OCP.BRepAlgoAPI import BRepAlgoAPI_Common, BRepAlgoAPI_Cut, BRepAlgoAPI_Fuse
 from OCP.BRepCheck import BRepCheck_Analyzer
 from OCP.BRepGProp import BRepGProp
 from OCP.GProp import GProp_GProps
@@ -128,7 +128,10 @@ def boolean(
     bbox_diagonal: float = 100.0,
     collect_history: bool = True,
 ) -> BooleanResult:
-    """Fuse or cut, with one fuzzy retry.  ``kind`` is ``"add"`` or ``"cut"``."""
+    """Fuse, cut or intersect, with one fuzzy retry.
+
+    ``kind`` is ``"add"``, ``"cut"`` or ``"common"``.
+    """
     warnings: list[str] = []
     before = volume(base)
 
@@ -183,7 +186,12 @@ def _split_compound(shape: TopoDS_Shape) -> list[TopoDS_Shape]:
 
 
 def _run_boolean(base, tool, kind: str, fuzzy: float, collect_history: bool):
-    op = BRepAlgoAPI_Fuse() if kind == "add" else BRepAlgoAPI_Cut()
+    if kind == "add":
+        op = BRepAlgoAPI_Fuse()
+    elif kind == "common":
+        op = BRepAlgoAPI_Common()
+    else:
+        op = BRepAlgoAPI_Cut()
     args = TopTools_ListOfShape()
     args.Append(base)
     tools = TopTools_ListOfShape()
@@ -345,6 +353,7 @@ def find_blend_edges(
     direction: tuple[float, float, float] | None = None,
     *,
     tolerance: float = 1e-4,
+    min_length: float = 0.0,
 ) -> list[TopoDS_Edge]:
     """Find the edges where the feature meets the base surface - the §6.4B targets.
 
@@ -357,10 +366,20 @@ def find_blend_edges(
     Section edges are filtered to those that survive into the result.  When the list
     is empty anyway, the fallback derives them from the tool's own bottom edges,
     which come straight from the profile and so are deterministic across rebuilds.
+
+    *min_length* drops slivers.  The tool starts a hair behind the sketch plane, and
+    that step leaves edges about one overlap long stitched into the ring.  They are
+    an artifact, not artwork, and one of them refuses any value large enough to see -
+    which fails the whole build, because a fillet is one build for every edge.
     """
     result_edges = edges_of(result)
     kept = [e for e in section_edges if any(e.IsSame(r) for r in result_edges)]
     if kept:
+        if min_length > 0:
+            trimmed = [e for e in kept if edge_length(e) > min_length]
+            # Never hand back nothing: a ring of only short edges is still the ring.
+            if trimmed:
+                return trimmed
         return kept
     if tool is None or direction is None:
         return []
@@ -427,13 +446,13 @@ def apply_modifier(
         message = (
             f"{name}: a {word} of {modifier.value:g} mm is too large for this "
             f"artwork. The largest that works is about {suggested:.3f} mm. The "
-            f"smallest detail here is {detail:.3f} mm. The part is shown without it."
+            f"smallest detail here is {detail:.3f} mm."
         )
     elif suggested is not None:
         message = (
             f"{name}: a {word} of {modifier.value:g} mm is too large for this "
             f"artwork. A {word} of {suggested:.3f} mm works on every edge. The "
-            f"smallest detail here is {detail:.3f} mm. The part is shown without it."
+            f"smallest detail here is {detail:.3f} mm."
         )
     else:
         message = (

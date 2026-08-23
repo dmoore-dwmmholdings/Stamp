@@ -235,3 +235,115 @@ __all__ = [
     "export_stl",
     "triangle_count_for",
 ]
+
+
+# ------------------------------------------------------------------------- 3MF
+
+
+def export_3mf(
+    bodies: list,
+    path: str | Path,
+    *,
+    base_color: str = "#D8D8D8",
+    feature_color: str = "#D62E2E",
+) -> ExportResult:
+    """Write a multi-body 3MF for multi-color printing.
+
+    Every body becomes its own object in the file, colored through a standard
+    ``basematerials`` group, and ``Metadata/model_settings.config`` assigns the
+    base to filament slot 1 and every feature body to slot 2.  Bambu Studio and
+    Orca read that assignment directly; any other 3MF consumer still gets a
+    plain multi-object model and ignores the extra file.
+    """
+    import zipfile
+    from xml.sax.saxutils import escape
+
+    path = Path(path)
+    if not bodies:
+        raise ExportError("There is nothing to export.")
+    total = sum(int(len(b.triangles)) for b in bodies)
+    if total == 0:
+        raise ExportError("There is nothing to export.")
+
+    def color(value: str) -> str:
+        value = value.strip()
+        if not value.startswith("#"):
+            value = "#" + value
+        return value.upper()
+
+    parts: list[str] = []
+    parts.append(
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<model unit="millimeter" xml:lang="en-US" '
+        'xmlns="http://schemas.microsoft.com/3dmanufacturing/core/2015/02">\n'
+        ' <resources>\n'
+        '  <basematerials id="1">\n'
+        f'   <base name="Base" displaycolor="{color(base_color)}"/>\n'
+        f'   <base name="Feature" displaycolor="{color(feature_color)}"/>\n'
+        '  </basematerials>\n'
+    )
+    config_rows: list[str] = []
+    for index, body in enumerate(bodies):
+        object_id = index + 2
+        pindex = 0 if body.role == "base" else 1
+        name = escape(body.name, {'"': "&quot;"})
+        parts.append(
+            f'  <object id="{object_id}" type="model" name="{name}" '
+            f'pid="1" pindex="{pindex}">\n   <mesh>\n    <vertices>\n'
+        )
+        parts.append(
+            "".join(
+                f'     <vertex x="{v[0]:.6f}" y="{v[1]:.6f}" z="{v[2]:.6f}"/>\n'
+                for v in body.vertices
+            )
+        )
+        parts.append("    </vertices>\n    <triangles>\n")
+        parts.append(
+            "".join(
+                f'     <triangle v1="{t[0]}" v2="{t[1]}" v3="{t[2]}"/>\n'
+                for t in body.triangles
+            )
+        )
+        parts.append("    </triangles>\n   </mesh>\n  </object>\n")
+        extruder = 1 if body.role == "base" else 2
+        config_rows.append(
+            f'  <object id="{object_id}">\n'
+            f'    <metadata key="name" value="{name}"/>\n'
+            f'    <metadata key="extruder" value="{extruder}"/>\n'
+            f'  </object>\n'
+        )
+    parts.append(" </resources>\n <build>\n")
+    for index in range(len(bodies)):
+        parts.append(f'  <item objectid="{index + 2}"/>\n')
+    parts.append(" </build>\n</model>\n")
+    model_xml = "".join(parts)
+
+    content_types = (
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">\n'
+        ' <Default Extension="rels" '
+        'ContentType="application/vnd.openxmlformats-package.relationships+xml"/>\n'
+        ' <Default Extension="model" '
+        'ContentType="application/vnd.ms-package.3dmanufacturing-3dmodel+xml"/>\n'
+        ' <Default Extension="config" ContentType="text/xml"/>\n'
+        "</Types>\n"
+    )
+    rels = (
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">\n'
+        ' <Relationship Target="/3D/3dmodel.model" Id="rel-1" '
+        'Type="http://schemas.microsoft.com/3dmanufacturing/2013/01/3dmodel"/>\n'
+        "</Relationships>\n"
+    )
+    model_settings = (
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        "<config>\n" + "".join(config_rows) + "</config>\n"
+    )
+
+    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("[Content_Types].xml", content_types)
+        archive.writestr("_rels/.rels", rels)
+        archive.writestr("3D/3dmodel.model", model_xml)
+        archive.writestr("Metadata/model_settings.config", model_settings)
+
+    return ExportResult(path=path, size_bytes=path.stat().st_size, triangle_count=total)

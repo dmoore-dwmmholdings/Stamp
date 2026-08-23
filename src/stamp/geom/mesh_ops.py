@@ -120,18 +120,26 @@ def weld(
 
 
 def boolean(base_manifold, tool_manifold, kind: str) -> MeshBooleanResult:
-    """Fuse or cut in the mesh engine.  ``kind`` is ``"add"`` or ``"cut"``.
+    """Fuse, cut or intersect in the mesh engine.
+
+    ``kind`` is ``"add"``, ``"cut"`` or ``"intersect"``.
 
     The tool is applied one component at a time.  A five-character serial number is
     five disconnected solids, and a single union against all five at once leaves
     some of them unmerged - the same trap as handing OpenCascade a compound (see
     ``solid_ops._split_compound``).
     """
-    if kind not in ("add", "cut"):
+    if kind not in ("add", "cut", "intersect"):
         raise ValueError(f"Unknown boolean kind {kind!r}")
 
     warnings: list[str] = []
     before = base_manifold.volume()
+
+    if kind == "intersect":
+        # An intersection against a multi-piece tool is the union of the piecewise
+        # intersections, not a chain, so it is computed directly.
+        result = base_manifold ^ tool_manifold
+        return MeshBooleanResult(manifold=result, warnings=warnings)
 
     pieces = tool_manifold.decompose() or [tool_manifold]
     result = base_manifold

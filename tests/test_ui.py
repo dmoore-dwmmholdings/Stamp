@@ -1077,3 +1077,110 @@ class TestMeshPicking:
         second = window._mesh_pick_data()
         assert first is second
         assert "adjacency" in first
+
+
+@needs_gl
+class TestVersionInTheWindow:
+    """The running version is visible without opening a file (§7)."""
+
+    @pytest.fixture
+    def window(self, qtbot):
+        from stamp.ui.main_window import MainWindow
+
+        win = MainWindow()
+        win.interactive = False
+        qtbot.addWidget(win)
+        win.show()
+        qtbot.waitExposed(win)
+        yield win
+        win.rebuilder.shutdown()
+
+    def test_the_title_carries_the_version(self, window):
+        import stamp
+
+        assert stamp.__version__ in window.windowTitle()
+
+    def test_the_version_survives_a_title_refresh(self, window):
+        import stamp
+
+        window._update_title()
+        title = window.windowTitle()
+        assert stamp.__version__ in title
+        assert "Untitled" in title
+
+
+@needs_gl
+class TestWorkingValueIsAppliedAutomatically:
+    """A fillet that is too large is corrected without asking (§6.4)."""
+
+    @pytest.fixture
+    def window(self, qtbot, fixtures):
+        from stamp.ui.main_window import MainWindow
+
+        win = MainWindow()
+        win.interactive = False
+        qtbot.addWidget(win)
+        win.show()
+        qtbot.waitExposed(win)
+        win.open_part(fixtures / "bracket.step")
+        self._settle(qtbot, win)
+        win.viewport.fit_all()
+        qtbot.wait(300)
+        yield win
+        win.rebuilder.shutdown()
+
+    def _settle(self, qtbot, window):
+        qtbot.wait(300)
+        for _ in range(300):
+            if not window.rebuilder.busy:
+                break
+            qtbot.wait(100)
+        qtbot.wait(200)
+
+    def _drop_logo(self, window, qtbot, fixtures):
+        from PySide6.QtCore import QMimeData, QPointF, QUrl
+        from PySide6.QtGui import QDropEvent
+
+        mime = QMimeData()
+        mime.setUrls([QUrl.fromLocalFile(str(fixtures / "logo.svg"))])
+        centre = window.viewport.mapTo(window, window.viewport.rect().center())
+        window.dropEvent(QDropEvent(
+            QPointF(centre), Qt.DropAction.CopyAction, mime,
+            Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier,
+        ))
+        self._settle(qtbot, window)
+        assert window.document.features, "the drop did not make a feature"
+        return window.document.features[0]
+
+    def test_a_value_that_is_too_large_is_replaced(self, window, qtbot, fixtures):
+        from stamp.core.document import EdgeRole, EdgeSelector, Modifier, ModifierKind
+
+        feature = self._drop_logo(window, qtbot, fixtures)
+        # 9 mm is far larger than any edge of this artwork can take.
+        feature.modifiers.append(
+            Modifier(kind=ModifierKind.FILLET, value=9.0,
+                     target=EdgeSelector(role=EdgeRole.TOP))
+        )
+        window.request_rebuild(immediate=True)
+        for _ in range(8):
+            self._settle(qtbot, window)
+            if feature.modifiers[0].value < 9.0:
+                break
+
+        assert feature.modifiers[0].value < 9.0, "the value must be corrected for the user"
+        assert feature.modifiers[0].value > 0.0
+        assert "largest that works" in window.warning_label.text()
+
+    def test_the_panel_has_no_button_to_push(self, window, qtbot, fixtures):
+        """The correction is automatic, so the old "Use N" button is gone."""
+        from PySide6.QtWidgets import QPushButton
+
+        self._drop_logo(window, qtbot, fixtures)
+        window._add_modifier("fillet")
+        self._settle(qtbot, window)
+        captions = [b.text() for b in window.properties.findChildren(QPushButton)]
+        assert not any(c.startswith("Use ") for c in captions), captions
+
+    def test_the_3mf_export_is_offered(self, window, qtbot, fixtures):
+        self._drop_logo(window, qtbot, fixtures)
+        assert window.action_export_3mf.isEnabled()

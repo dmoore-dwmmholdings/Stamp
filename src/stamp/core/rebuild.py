@@ -280,7 +280,12 @@ class RebuildEngine:
         # Target A: modifiers on the feature's own edges, applied to the tool solid.
         tool_shape = tool.shape
         for modifier in feature.modifiers:
-            if modifier.target.role is EdgeRole.BLEND:
+            if modifier.target.role in (EdgeRole.BLEND, EdgeRole.BOTTOM):
+                # Both act where the feature meets the base surface, so they are
+                # applied to the result after the boolean (target B).  Applied to
+                # the tool instead, they point the wrong way: a chamfer at the base
+                # of a boss cuts an undercut notch, and a chamfer on a pocket rim
+                # leaves an overhanging lip.
                 continue
             edges = solid_ops.select_edges(tool_shape, modifier, tool.direction)
             step(f"{modifier.kind} on {len(edges)} edges")
@@ -333,10 +338,14 @@ class RebuildEngine:
         shape = boolean.shape
 
         # Target B: blend into the base surface, from the boolean's own history.
-        blends = [m for m in feature.modifiers if m.target.role is EdgeRole.BLEND]
+        blends = [
+            m for m in feature.modifiers
+            if m.target.role in (EdgeRole.BLEND, EdgeRole.BOTTOM)
+        ]
         if blends:
             edges = solid_ops.find_blend_edges(
-                shape, boolean.section_edges, tool_shape, tool.direction
+                shape, boolean.section_edges, tool_shape, tool.direction,
+                min_length=max(tool.contact_overlap * 3.0, 1e-5),
             )
             for modifier in blends:
                 applied = solid_ops.apply_modifier(
@@ -350,7 +359,10 @@ class RebuildEngine:
         return shape, out
 
     def _boolean_mesh(self, feature, geometry, tool_shape, kind, out):
-        blends = [m for m in feature.modifiers if m.target.role is EdgeRole.BLEND]
+        blends = [
+            m for m in feature.modifiers
+            if m.target.role in (EdgeRole.BLEND, EdgeRole.BOTTOM)
+        ]
         if blends:
             out.warnings.append(f"{feature.name}: {mesh_ops.BLEND_NOT_AVAILABLE}")
         try:

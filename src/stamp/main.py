@@ -14,7 +14,7 @@ from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import QApplication
 
-from stamp import diagnostics
+from stamp import __version__, diagnostics
 from stamp.io.part_import import PART_EXTS
 from stamp.ui.main_window import MainWindow
 
@@ -26,6 +26,7 @@ def main(argv: list[str] | None = None) -> int:
     QApplication.setAttribute(Qt.ApplicationAttribute.AA_ShareOpenGLContexts, True)
     app = QApplication(argv)
     app.setApplicationName("Stamp")
+    app.setApplicationVersion(__version__)
     app.setOrganizationName("Stamp")
 
     icon = Path(__file__).resolve().parent / "resources" / "stamp.ico"

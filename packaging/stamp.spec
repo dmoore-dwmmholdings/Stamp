@@ -7,6 +7,7 @@
 # it has to be collected wholesale.  The same is true of manifold3d.  Everything
 # else is ordinary.
 
+import re
 import sys
 from pathlib import Path
 
@@ -14,6 +15,12 @@ from PyInstaller.utils.hooks import collect_all, collect_data_files
 
 BLOCK_CIPHER = None
 ROOT = Path(SPECPATH).parent
+
+# Read the version from the package rather than repeating it here.
+VERSION = re.search(
+    r'__version__ = "([^"]+)"',
+    (ROOT / "src" / "stamp" / "__init__.py").read_text(encoding="utf-8"),
+).group(1)
 
 datas = []
 binaries = []
@@ -123,6 +130,6 @@ if sys.platform == "darwin":
         bundle_identifier="com.stamp.app",
         info_plist={
             "NSHighResolutionCapable": True,
-            "CFBundleShortVersionString": "0.1.0",
+            "CFBundleShortVersionString": VERSION,
         },
     )

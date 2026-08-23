@@ -1,13 +1,17 @@
-<img src="stamp-logo.svg" width="110" align="right" alt="Stamp logo">
+<p align="center">
+  <img src="stamp-logo.svg" width="140" alt="Stamp logo">
+</p>
 
-# Stamp
+<h1 align="center">Stamp</h1>
 
-[![CI](https://github.com/dmoore-dwmmholdings/Stamp/actions/workflows/ci.yml/badge.svg)](https://github.com/dmoore-dwmmholdings/Stamp/actions/workflows/ci.yml)
-[![License](https://img.shields.io/github/license/dmoore-dwmmholdings/Stamp)](LICENSE)
-[![Release](https://img.shields.io/github/v/release/dmoore-dwmmholdings/Stamp?include_prereleases)](https://github.com/dmoore-dwmmholdings/Stamp/releases)
-[![Python 3.12+](https://img.shields.io/badge/python-3.12%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
-[![Ruff](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/astral-sh/ruff/main/assets/badge/v2.json)](https://github.com/astral-sh/ruff)
-[![Visits](https://hits.sh/github.com/dmoore-dwmmholdings/Stamp.svg?label=visits&color=6e7681)](https://hits.sh/github.com/dmoore-dwmmholdings/Stamp/)
+<p align="center">
+  <a href="https://github.com/dmoore-dwmmholdings/Stamp/actions/workflows/ci.yml"><img src="https://github.com/dmoore-dwmmholdings/Stamp/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/github/license/dmoore-dwmmholdings/Stamp" alt="License"></a>
+  <a href="https://github.com/dmoore-dwmmholdings/Stamp/releases"><img src="https://img.shields.io/github/v/release/dmoore-dwmmholdings/Stamp?include_prereleases" alt="Release"></a>
+  <a href="https://www.python.org/"><img src="https://img.shields.io/badge/python-3.12%2B-3776AB?logo=python&logoColor=white" alt="Python 3.12+"></a>
+  <a href="https://github.com/astral-sh/ruff"><img src="https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/astral-sh/ruff/main/assets/badge/v2.json" alt="Ruff"></a>
+  <a href="https://hits.sh/github.com/dmoore-dwmmholdings/Stamp/"><img src="https://hits.sh/github.com/dmoore-dwmmholdings/Stamp.svg?label=visits&color=6e7681" alt="Visits"></a>
+</p>
 
 Stamp is a desktop app that puts 2D artwork onto 3D parts as real geometry — not a
 decal, not a texture.
@@ -75,13 +79,32 @@ A fillet applies to every edge of the selection in one operation, and one edge t
 can't take the radius fails it for all of them — so the radius has to suit the
 smallest detail in the artwork.
 
-If the radius is too large, Stamp finds one that works. The warning names it, and a
-button next to the value fills it in.
+If the radius is too large, Stamp finds the largest one that works, applies it
+automatically, and tells you what it did.
 
 Detailed artwork has short edges and can only take a small radius. For a bigger
 radius, make the artwork bigger or simpler.
 
 Chamfers work the same way, and the distance has the same limit as the radius.
+
+Modifiers aimed at the edges where a feature meets the part act on the joined
+result: at the base of a raised feature they flare outward into the surface, and
+on the rim of a pocket they widen the mouth.
+
+## Multi-color printing
+
+"Export 3MF" writes the part as separate bodies: the base, plus one body per
+feature. Raised artwork becomes its own solid, and engraved artwork becomes an
+inlay that fills the pocket flush with the surface — so a color printer can put
+the artwork in a second filament. Through cuts stay open.
+
+The file is a standard multi-object 3MF with display colors, plus the filament
+slot assignments Bambu Studio and OrcaSlicer read (base on slot 1, features on
+slot 2). Open it in Bambu Studio, answer **Yes** when it asks to load the parts
+as a single object with multiple parts, and slice — each body arrives bound to
+its filament, and the display colors are matched against your loaded filaments.
+Other slicers see a plain multi-object 3MF and let you assign materials per
+part.
 
 ## The two kinds of part
 

@@ -11,6 +11,7 @@ from pathlib import Path
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QCheckBox,
+    QColorDialog,
     QComboBox,
     QDialog,
     QDialogButtonBox,
@@ -574,3 +575,88 @@ __all__ = [
     "relink_prompt",
     "warn",
 ]
+
+
+class Color3mfDialog(QDialog):
+    """Colors and quality for the multi-color 3MF export - §9.
+
+    The file carries one body per feature plus the base, each bound to a filament
+    slot, so a color printer (Bambu, Orca and friends) prints the artwork in a
+    second color without any painting in the slicer.
+    """
+
+    PRESETS = [("Draft (0.1 mm)", 0.1), ("Normal (0.02 mm)", 0.02), ("Fine (0.005 mm)", 0.005)]
+
+    def __init__(self, feature_count: int, *, mode: str = "solid", parent=None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Export 3MF for color printing")
+        self._base_color = "#D8D8D8"
+        self._feature_color = "#D62E2E"
+
+        layout = QVBoxLayout(self)
+        note = QLabel(
+            f"The base and {feature_count} feature bod"
+            f"{'y' if feature_count == 1 else 'ies'} are written as separate parts. "
+            f"In Bambu Studio, answer Yes when it asks to load them as one object "
+            f"with multiple parts; each part arrives bound to its filament slot."
+        )
+        note.setWordWrap(True)
+        layout.addWidget(note)
+
+        form = QFormLayout()
+        self.base_button = QPushButton()
+        self.base_button.clicked.connect(lambda: self._pick("base"))
+        self.feature_button = QPushButton()
+        self.feature_button.clicked.connect(lambda: self._pick("feature"))
+        self._paint_buttons()
+        form.addRow("Base color (slot 1):", self.base_button)
+        form.addRow("Feature color (slot 2):", self.feature_button)
+
+        self.quality = QComboBox()
+        for caption, value in self.PRESETS:
+            self.quality.addItem(caption, value)
+        self.quality.setCurrentIndex(1)
+        if mode == "mesh":
+            self.quality.setEnabled(False)
+            self.quality.setToolTip("A mesh part is exported at its own resolution.")
+        form.addRow("Quality:", self.quality)
+        layout.addLayout(form)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def _paint_buttons(self) -> None:
+        for button, value in (
+            (self.base_button, self._base_color),
+            (self.feature_button, self._feature_color),
+        ):
+            button.setText(value)
+            button.setStyleSheet(
+                f"QPushButton {{ background-color: {value}; padding: 4px 12px; }}"
+            )
+
+    def _pick(self, which: str) -> None:
+        from PySide6.QtGui import QColor
+
+        current = self._base_color if which == "base" else self._feature_color
+        chosen = QColorDialog.getColor(QColor(current), self, "Pick a color")
+        if not chosen.isValid():
+            return
+        if which == "base":
+            self._base_color = chosen.name().upper()
+        else:
+            self._feature_color = chosen.name().upper()
+        self._paint_buttons()
+
+    def base_color(self) -> str:
+        return self._base_color
+
+    def feature_color(self) -> str:
+        return self._feature_color
+
+    def deflection_mm(self) -> float:
+        return float(self.quality.currentData())

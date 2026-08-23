@@ -88,7 +88,6 @@ class PropertiesPanel(QScrollArea):
 
         self._document: Document | None = None
         self._feature: Feature | None = None
-        self._suggestions: dict[str, float] = {}
         self._native_size = (1.0, 1.0)
         self._updating = False
 
@@ -474,11 +473,9 @@ class PropertiesPanel(QScrollArea):
         native_size: tuple[float, float],
         *,
         mesh_mode: bool = False,
-        suggestions: dict[str, float] | None = None,
     ) -> None:
         self._document = document
         self._feature = feature
-        self._suggestions = dict(suggestions or {})
         self._native_size = (max(native_size[0], 1e-9), max(native_size[1], 1e-9))
 
         self._empty.setVisible(False)
@@ -528,12 +525,7 @@ class PropertiesPanel(QScrollArea):
         cutting = feature.operation.kind is OperationKind.CUT
         for modifier in feature.modifiers:
             self._modifier_layout.addWidget(
-                self._modifier_row(
-                    modifier,
-                    mesh_mode=mesh_mode,
-                    cutting=cutting,
-                    suggested=self._suggestions.get(modifier.id),
-                )
+                self._modifier_row(modifier, mesh_mode=mesh_mode, cutting=cutting)
             )
 
         if mesh_mode:
@@ -549,7 +541,6 @@ class PropertiesPanel(QScrollArea):
         *,
         mesh_mode: bool,
         cutting: bool = False,
-        suggested: float | None = None,
     ) -> QWidget:
         row = QWidget()
         layout = QHBoxLayout(row)
@@ -581,7 +572,7 @@ class PropertiesPanel(QScrollArea):
         ]
         for role, caption in options:
             target.addItem(caption, role)
-            if role is EdgeRole.BLEND and mesh_mode:
+            if role in (EdgeRole.BLEND, EdgeRole.BOTTOM) and mesh_mode:
                 index = target.count() - 1
                 target.model().item(index).setEnabled(False)
         target.setCurrentIndex(target.findData(modifier.target.role))
@@ -598,25 +589,7 @@ class PropertiesPanel(QScrollArea):
         value.valueChanged.connect(lambda v, m=modifier: self._set_modifier_value(m, v))
         layout.addWidget(value)
 
-        if suggested is not None:
-            # The rebuild found a value the whole edge set accepts.  One push puts
-            # it in, because the alternative is reading it out of a message.
-            use = QPushButton(f"Use {suggested:g}")
-            use.setToolTip(
-                f"{suggested:g} mm works on every edge of this artwork. "
-                f"The value now set is too large for the smallest detail."
-            )
-            use.setStyleSheet("QPushButton { color: #c58a2a; }")
-            use.clicked.connect(
-                lambda _=False, m=modifier, v=suggested: self._use_suggested(m, v)
-            )
-            layout.addWidget(use)
         return row
-
-    def _use_suggested(self, modifier: Modifier, value: float) -> None:
-        """Put the value that works into the field, and rebuild."""
-        modifier.value = float(value)
-        self.changed.emit("modifier value")
 
     # ------------------------------------------------------------------- edits
 
