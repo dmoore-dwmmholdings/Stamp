@@ -276,6 +276,25 @@ projects - Fusion, FreeCAD and OnShape exports all produce it. Colours load
 normally alongside it. Removing it would mean writing a full Bambu project,
 which is the vendor path that broke v0.2.0.
 
+## Why Bambu always says the config is invalid
+
+`bbs_3mf.cpp` in BambuStudio sets `m_is_bbl_3mf` in exactly one place
+(`_handle_end_metadata`): when `<metadata name="Application">` starts with
+`"BambuStudio-"`. Nothing else sets it. Every 3MF from any other tool is
+therefore "a 3mf from other vendor" and gets the notice - Fusion, FreeCAD and
+OnShape exports all produce it.
+
+The notice cannot be removed without claiming BambuStudio wrote the file, and
+that claim would cost the colours. The per-triangle colour data is collected
+under `if (!m_is_bbl_3mf && sub_object->geometry.triangle_colors.size() ==
+triangles_count)` and handed out through `get_volume_color_data()`, which is
+what the colour parsing window uses. Setting the flag skips that branch, so a
+file that avoids the message arrives with no colours at all. The two are
+mutually exclusive, and the colours are worth more than a notice.
+
+The export dialog and the README now say so, so the message does not read as a
+fault.
+
 ## Timings on the standard test
 
 `bracket.step` / `bracket.stl` with `logo.svg`:

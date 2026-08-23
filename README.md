@@ -105,9 +105,13 @@ appears; the colors map to filament slots in the order they are written, the
 base first and the artwork second. Other slicers see a plain multi-object 3MF
 and let you assign a material per body.
 
-Stamp deliberately does not write Bambu's `model_settings.config`. That file
-alone makes Bambu treat the export as one of its own project files and stop on
-the parts a project would have, which loses the colors.
+Bambu Studio reports "The 3mf file has invalid config, load geometry data only"
+when it opens the file. That is expected, and the colors still arrive. Bambu
+treats a 3MF as its own project only when the file claims `Application` starts
+with `BambuStudio-`, and it reads per-triangle colors **only** from files it did
+not write (`bbs_3mf.cpp`, the `!m_is_bbl_3mf` branch). A file that avoids the
+message would therefore lose its colors, so Stamp writes an honest third-party
+3MF and keeps them.
 
 ## The two kinds of part
 

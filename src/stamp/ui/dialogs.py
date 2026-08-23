@@ -596,13 +596,26 @@ class Color3mfDialog(QDialog):
         layout = QVBoxLayout(self)
         note = QLabel(
             f"The base and {feature_count} feature bod"
-            f"{'y' if feature_count == 1 else 'ies'} are written as separate bodies, "
-            f"each with its colour on every triangle. Bambu Studio and Orca show a "
-            f"colour parsing window on import and map the colours to filament slots "
-            f"in this order: the base first, the artwork second."
+            f"{'y' if feature_count == 1 else 'ies'} are written as one object with "
+            f"separate parts, each carrying its colour on every triangle. Bambu "
+            f"Studio and Orca show a colour parsing window on import and map the "
+            f"colours to filament slots in this order: the base first, the artwork "
+            f"second."
         )
         note.setWordWrap(True)
         layout.addWidget(note)
+
+        # Say this here, so the message does not read as a fault in the file.
+        expected = QLabel(
+            "Bambu Studio says “The 3mf file has invalid config, load geometry "
+            "data only” for every 3MF it did not write itself. That is expected, "
+            "and the colours still arrive. Bambu reads per-triangle colours only "
+            "from a file it did not write, so a file that avoided the message would "
+            "lose them."
+        )
+        expected.setWordWrap(True)
+        expected.setStyleSheet("color: #8a8f98;")
+        layout.addWidget(expected)
 
         form = QFormLayout()
         self.base_button = QPushButton()
