@@ -21,6 +21,7 @@ from PySide6.QtWidgets import (
     QGroupBox,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
     QPlainTextEdit,
     QPushButton,
     QRadioButton,
@@ -33,6 +34,7 @@ from PySide6.QtWidgets import (
 
 from stamp.core.document import (
     BasePart,
+    CodeKind,
     DepthMode,
     Direction,
     Document,
@@ -102,13 +104,15 @@ class PropertiesPanel(QScrollArea):
 
         self._empty = self._build_empty()
         self._text = self._build_text()
+        self._code = self._build_code()
+        self._metadata = self._build_metadata()
         self._placement = self._build_placement()
         self._operation = self._build_operation()
         self._pattern = self._build_pattern()
         self._modifiers = self._build_modifiers()
 
         for widget in (
-            self._empty, self._text, self._placement, self._operation, self._pattern, self._modifiers
+            self._empty, self._text, self._code, self._metadata, self._placement, self._operation, self._pattern, self._modifiers
         ):
             self._layout.addWidget(widget)
         self._layout.addStretch(1)
@@ -228,6 +232,85 @@ class PropertiesPanel(QScrollArea):
         note.setWordWrap(True)
         layout.addWidget(note)
         return box
+
+    def _build_code(self) -> QWidget:
+        box = QGroupBox("Code")
+        form = QFormLayout(box)
+        self.code_payload = QPlainTextEdit()
+        self.code_payload.setFixedHeight(54)
+        self.code_payload.textChanged.connect(self._on_code_changed)
+        form.addRow("Payload:", self.code_payload)
+        self.code_kind = QComboBox()
+        self.code_kind.addItem("QR", CodeKind.QR)
+        self.code_kind.addItem("Data Matrix", CodeKind.DATA_MATRIX)
+        self.code_kind.currentIndexChanged.connect(self._on_code_changed)
+        form.addRow("Type:", self.code_kind)
+        self.code_module = NumberField(minimum=0.01, step=0.1)
+        self.code_module.valueChanged.connect(self._on_code_changed)
+        form.addRow("Module:", self.code_module)
+        return box
+
+    def _build_metadata(self) -> QWidget:
+        box = QGroupBox("Manufacturing")
+        form = QFormLayout(box)
+        self.meta_identifier = QLineEdit()
+        self.meta_process = QLineEdit()
+        self.meta_material = QLineEdit()
+        self.meta_color = QLineEdit()
+        self.meta_notes = QPlainTextEdit()
+        self.meta_notes.setFixedHeight(52)
+        for field in (self.meta_identifier, self.meta_process, self.meta_material, self.meta_color):
+            field.editingFinished.connect(self._on_metadata_changed)
+        self.meta_notes.textChanged.connect(self._on_metadata_changed)
+        form.addRow("ID:", self.meta_identifier)
+        form.addRow("Process:", self.meta_process)
+        form.addRow("Material:", self.meta_material)
+        form.addRow("Color:", self.meta_color)
+        form.addRow("Notes:", self.meta_notes)
+        return box
+
+    def _on_metadata_changed(self) -> None:
+        if self._updating or self._feature is None:
+            return
+        meta = self._feature.metadata
+        values = {
+            "identifier": self.meta_identifier.text(), "process": self.meta_process.text(),
+            "material": self.meta_material.text(), "color": self.meta_color.text(),
+            "notes": self.meta_notes.toPlainText(),
+        }
+        if any(getattr(meta, key) != value for key, value in values.items()):
+            for key, value in values.items():
+                setattr(meta, key, value)
+            self.changed.emit("manufacturing metadata")
+
+    def _fill_metadata(self, feature: Feature) -> None:
+        meta = feature.metadata
+        self._updating = True
+        self.meta_identifier.setText(meta.identifier)
+        self.meta_process.setText(meta.process)
+        self.meta_material.setText(meta.material)
+        self.meta_color.setText(meta.color)
+        self.meta_notes.setPlainText(meta.notes)
+        self._updating = False
+
+    def _on_code_changed(self, *_args) -> None:
+        if self._updating or self._feature is None or self._feature.profile.code is None:
+            return
+        spec = self._feature.profile.code
+        spec.payload = self.code_payload.toPlainText()
+        spec.kind = CodeKind(self.code_kind.currentData())
+        spec.module_mm = self.code_module.value()
+        self.changed.emit("code")
+
+    def _fill_code(self, feature: Feature) -> None:
+        spec = feature.profile.code
+        if spec is None:
+            return
+        self._updating = True
+        self.code_payload.setPlainText(spec.payload)
+        self.code_kind.setCurrentIndex(self.code_kind.findData(spec.kind))
+        self.code_module.set_silently(spec.module_mm)
+        self._updating = False
 
     # --------------------------------------------------------------- text edits
 
@@ -531,8 +614,13 @@ class PropertiesPanel(QScrollArea):
         for widget in (self._placement, self._operation, self._pattern, self._modifiers):
             widget.setVisible(True)
         self._text.setVisible(feature.profile.is_text)
+        self._code.setVisible(feature.profile.is_code)
+        self._metadata.setVisible(True)
         if feature.profile.is_text:
             self._fill_text(feature)
+        if feature.profile.is_code:
+            self._fill_code(feature)
+        self._fill_metadata(feature)
 
         self._updating = True
         placement = feature.placement

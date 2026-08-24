@@ -7,12 +7,16 @@ reconstruction, so a document that started from an STL cannot produce a STEP.
 from __future__ import annotations
 
 import datetime as _dt
+import json
+import tempfile
+import zipfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 from OCP.TopoDS import TopoDS_Shape
 
+from stamp.core.inspection import inspect_document
 from stamp.geom import mesh_ops, solid_ops
 
 if TYPE_CHECKING:
@@ -79,6 +83,7 @@ def preflight_export(
             report.errors.append("The export location is not a folder.")
     if document.base.warnings:
         report.warnings.extend(document.base.warnings)
+    report.warnings.extend(inspect_document(document))
     for feature in document.features:
         for modifier in feature.modifiers:
             if modifier.enabled and modifier.value < 0.05:
@@ -115,6 +120,62 @@ def default_filename(project_name: str, extension: str) -> str:
     stamp = _dt.date.today().strftime("%Y%m%d")
     safe = "".join(c for c in project_name if c.isalnum() or c in "-_") or "stamp"
     return f"{safe}_{stamp}.{extension.lstrip('.')}"
+
+
+def export_job_package(document, geometry: object, path: str | Path, *, fmt: str | None = None,
+                       screenshot: bytes | None = None, rebuild=None) -> ExportResult:
+    """Write a portable production handoff ZIP without changing the open project."""
+    from stamp.io import project as project_io
+
+    if document.base is None:
+        raise ExportError("There is no part to package.")
+    fmt = (fmt or ("step" if document.base.mode == "solid" else "stl")).lower().lstrip(".")
+    report = preflight_export(document, rebuild, fmt, path)
+    report.require_ok()
+    path = Path(path)
+    if path.suffix.lower() != ".zip":
+        path = path.with_suffix(".zip")
+    with tempfile.TemporaryDirectory(prefix="stamp-package-") as temp_name:
+        temp = Path(temp_name)
+        model = temp / default_filename(document.name, fmt)
+        if fmt == "step":
+            export_step(geometry, model)
+        elif fmt == "stl":
+            export_stl(geometry, model, mode=document.base.mode)
+        else:
+            raise ExportError("Job packages currently support STEP or STL models.")
+        project_path = project_io.save(document, temp / f"{document.name}.stamp", thumbnail=screenshot)
+        manifest = {
+            "project": document.name, "generated": _dt.datetime.now(tz=_dt.UTC).isoformat(),
+            "format": fmt, "warnings": report.warnings,
+            "features": [{"name": f.name, "metadata": f.metadata.to_dict()} for f in document.features],
+        }
+        (temp / "preflight.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+        summary = temp / "production-summary.pdf"
+        lines = [f"<h1>{document.name}</h1>", f"<p>Model: {model.name}</p>", "<h2>Features</h2><ul>"]
+        for feature in document.features:
+            meta = feature.metadata
+            lines.append(f"<li><b>{feature.name}</b> {meta.identifier} {meta.process}<br>{meta.notes}</li>")
+        lines.append("</ul><h2>Warnings</h2><ul>" + "".join(f"<li>{w}</li>" for w in report.warnings) + "</ul>")
+        try:
+            from PySide6.QtCore import QSizeF
+            from PySide6.QtGui import QPageSize, QPdfWriter, QTextDocument
+
+            writer = QPdfWriter(str(summary))
+            writer.setPageSize(QPageSize(QSizeF(210, 297), QPageSize.Unit.Millimeter))
+            report_doc = QTextDocument()
+            report_doc.setHtml("\n".join(lines))
+            report_doc.print_(writer)
+        except Exception as exc:
+            raise ExportError(f"Stamp could not create the production PDF: {exc}") from exc
+        with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as archive:
+            for item in (model, project_path, temp / "preflight.json", summary):
+                archive.write(item, item.name)
+            if screenshot:
+                image = temp / "thumbnail.png"
+                image.write_bytes(screenshot)
+                archive.write(image, image.name)
+    return ExportResult(path=path, size_bytes=path.stat().st_size, warnings=report.warnings)
 
 
 # ------------------------------------------------------------------------ STEP
@@ -296,6 +357,7 @@ __all__ = [
     "STL_QUALITY",
     "default_filename",
     "export_for_quote",
+    "export_job_package",
     "export_step",
     "export_stl",
     "preflight_export",

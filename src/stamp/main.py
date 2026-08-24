@@ -13,7 +13,11 @@ from pathlib import Path
 
 from stamp import __version__, diagnostics
 from stamp.batch import BatchError, run_batch
-from stamp.io.part_import import PART_EXTS
+from stamp.core.profiles import ProfileCache
+from stamp.core.rebuild import RebuildEngine
+from stamp.io import export as export_io
+from stamp.io.part_import import PART_EXTS, import_part
+from stamp.io.project import open_project
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -24,6 +28,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--csv")
     parser.add_argument("--output-dir")
     parser.add_argument("--format", choices=("step", "stl", "3mf"))
+    parser.add_argument("--project")
+    parser.add_argument("--output")
     args, _unknown = parser.parse_known_args(argv[1:])
     if args.command == "batch":
         if not all((args.template, args.csv, args.output_dir, args.format)):
@@ -37,6 +43,24 @@ def main(argv: list[str] | None = None) -> int:
         for row in report.rows:
             print(f"{row.status}: {row.input} -> {row.output} {row.detail}".rstrip())
         return 1 if report.stopped else 0
+    if args.command == "package":
+        if not all((args.project, args.output)):
+            print("stamp package requires --project and --output", file=sys.stderr)
+            return 2
+        try:
+            opened = open_project(args.project)
+            if opened.missing or opened.document.base is None:
+                raise RuntimeError("The project has missing sources or no base part.")
+            opened.document.base = import_part(opened.document.base.source_path).part
+            result = RebuildEngine(ProfileCache().get).rebuild(opened.document)
+            written = export_io.export_job_package(
+                opened.document, result.geometry, args.output, fmt=args.format, rebuild=result
+            )
+        except Exception as exc:
+            print(f"stamp package: {exc}", file=sys.stderr)
+            return 2
+        print(written.path)
+        return 0
 
     from PySide6.QtCore import Qt, QTimer
     from PySide6.QtGui import QIcon

@@ -39,6 +39,8 @@ from stamp.core import snapping
 from stamp.core.document import (
     Anchor,
     AnchorKind,
+    CodeSpec,
+    DatumDefinition,
     Document,
     EdgeRole,
     EdgeSelector,
@@ -54,7 +56,14 @@ from stamp.core.document import (
 )
 from stamp.core.profiles import ProfileCache
 from stamp.core.rebuild import RebuildEngine, RebuildResult
-from stamp.core.refs import make_face_ref, plane_from_face, resolve_face_ref
+from stamp.core.refs import (
+    make_edge_ref,
+    make_face_ref,
+    make_hole_ref,
+    make_vertex_ref,
+    plane_from_face,
+    resolve_face_ref,
+)
 from stamp.geom import mesh_regions
 from stamp.geom.mesh_regions import DEFAULT_TOLERANCE_DEG
 from stamp.io import export as export_io
@@ -123,7 +132,11 @@ class MainWindow(QMainWindow):
         self._last_result: RebuildResult | None = None
         self._pending_profile: ProfileRef | None = None
         self._pending_profile_size: tuple[float, float] = (0.0, 0.0)
+        self._pending_feature_template: Feature | None = None
         self._picking_to_face = False
+        self._picking_alignment_edge = False
+        self._picking_origin_vertex = False
+        self._picking_hole_center = False
         self._dirty = False
         self._draft_display = False
         self._slow_offer_declined = False
@@ -306,11 +319,21 @@ class MainWindow(QMainWindow):
         bar.addSeparator()
         self.action_add_profile = add("+ Add profile", self.add_profile_dialog, "Ctrl+I")
         self.action_add_text = add("+ Add text", self.add_text_dialog, "Ctrl+T")
+        self.action_add_code = add("+ Add code", self.add_code_dialog)
+        self.action_save_preset = add("Save stamp preset", self.save_preset)
+        self.action_insert_preset = add("Insert stamp preset", self.insert_preset)
+        self.action_align_edge = add("Align stamp to edge", self.pick_alignment_edge)
+        self.action_origin_vertex = add("Set stamp origin to vertex", self.pick_origin_vertex)
+        self.action_origin_hole = add("Set stamp origin to hole", self.pick_origin_hole)
+        self.action_create_datum = add("Create datum from stamp", self.create_datum_from_feature)
+        self.action_place_datum = add("Place stamp on datum", self.place_on_datum)
+        self.action_inspection_limits = add("Manufacturing limits", self.edit_inspection_limits)
         bar.addSeparator()
         self.action_export_step = add("Export STEP", self.export_step)
         self.action_export_stl = add("Export STL", self.export_stl)
         self.action_export_3mf = add("Export 3MF", self.export_3mf)
         self.action_export_quote = add("Export for quote", self.export_for_quote)
+        self.action_export_package = add("Export job package", self.export_job_package)
         self.action_batch = add("Batch stamp", self.batch_stamp)
         bar.addSeparator()
 
@@ -364,6 +387,7 @@ class MainWindow(QMainWindow):
         self.selection_box = QComboBox()
         self.selection_box.addItem("Select: faces", "face")
         self.selection_box.addItem("Select: edges", "edge")
+        self.selection_box.addItem("Select: vertices", "vertex")
         self.selection_box.currentIndexChanged.connect(
             lambda: self.viewport.set_selection_mode(self.selection_box.currentData())
         )
@@ -579,11 +603,13 @@ class MainWindow(QMainWindow):
         solid = has_part and self.document.base.mode == "solid"
         self.action_add_profile.setEnabled(has_part)
         self.action_add_text.setEnabled(has_part)
+        self.action_add_code.setEnabled(has_part)
         self.action_save.setEnabled(has_part)
         self.action_replace_part.setEnabled(has_part)
         self.action_export_step.setEnabled(solid)
         self.action_export_stl.setEnabled(has_part)
         self.action_export_3mf.setEnabled(has_part)
+        self.action_export_package.setEnabled(has_part)
         self.action_export_quote.setEnabled(has_part)
         self.action_undo.setEnabled(self.undo_stack.can_undo())
         self.action_redo.setEnabled(self.undo_stack.can_redo())
@@ -923,6 +949,155 @@ class MainWindow(QMainWindow):
         """
         self.add_text_feature()
 
+    def add_code_dialog(self) -> None:
+        """Create a generated code and use the normal face-placement flow."""
+        if self.document.base is None:
+            return
+        payload, accepted = QInputDialog.getText(self, "Add code", "Payload", text="STAMP")
+        if not accepted:
+            return
+        kind, accepted = QInputDialog.getItem(
+            self, "Add code", "Symbology", ["QR", "Data Matrix"], 0, False
+        )
+        if not accepted:
+            return
+        from stamp.core.document import CodeKind
+
+        spec = CodeSpec(kind=CodeKind.QR if kind == "QR" else CodeKind.DATA_MATRIX, payload=payload)
+        ref = ProfileRef(code=spec)
+        try:
+            profile = self.profiles.get(ref)
+        except Exception as exc:
+            self._notify("Stamp cannot create this code", str(exc))
+            return
+        self.profiles.put(ref, profile)
+        self._pending_profile = ref
+        self._pending_feature_template = None
+        self._pending_profile_size = (profile.width, profile.height)
+        self.viewport.set_selection_mode("face")
+        self.selection_box.setCurrentIndex(0)
+        self.statusBar().showMessage("Click the face for the code. Press Esc to cancel.")
+
+    def save_preset(self) -> None:
+        if self.selected_feature is None:
+            self._notify("Choose a stamp", "Select a feature in the tree before saving a preset.")
+            return
+        from stamp.io.presets import save_preset
+
+        suggested = Path(self._last_dir("project")) / f"{self.selected_feature.name}.stamp-preset"
+        path, _ = QFileDialog.getSaveFileName(self, "Save stamp preset", str(suggested), "Stamp presets (*.stamp-preset)")
+        if not path:
+            return
+        try:
+            written = save_preset(self.selected_feature, path)
+        except Exception as exc:
+            self._notify("Stamp could not save the preset", str(exc))
+            return
+        self._notify("Preset saved", f"Saved {written.name}.")
+
+    def insert_preset(self) -> None:
+        if self.document.base is None:
+            return
+        from stamp.io.presets import load_preset
+
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Insert stamp preset", self._last_dir("project"), "Stamp presets (*.stamp-preset)"
+        )
+        if not path:
+            return
+        try:
+            feature = load_preset(path, Path(self._last_dir("project")) / ".stamp_presets")
+            profile = self.profiles.get(feature.profile)
+        except Exception as exc:
+            self._notify("Stamp could not open the preset", str(exc))
+            return
+        self.profiles.put(feature.profile, profile)
+        self._pending_profile = feature.profile
+        self._pending_feature_template = feature
+        self._pending_profile_size = (profile.width, profile.height)
+        self.viewport.set_selection_mode("face")
+        self.selection_box.setCurrentIndex(0)
+        self.statusBar().showMessage("Click the face for the preset. Press Esc to cancel.")
+
+    def pick_alignment_edge(self) -> None:
+        if self.document.base is None or self.document.base.mode != "solid" or self.selected_feature is None:
+            self._notify("Choose a solid stamp", "Select a feature on a solid part before choosing an alignment edge.")
+            return
+        self._picking_alignment_edge = True
+        self.viewport.set_selection_mode("edge")
+        self.selection_box.setCurrentIndex(1)
+        self.statusBar().showMessage("Click an edge to set the stamp origin and horizontal direction. Press Esc to cancel.")
+
+    def pick_origin_vertex(self) -> None:
+        if self.document.base is None or self.document.base.mode != "solid" or self.selected_feature is None:
+            self._notify("Choose a solid stamp", "Select a feature on a solid part before choosing a vertex.")
+            return
+        self._picking_origin_vertex = True
+        self.viewport.set_selection_mode("vertex")
+        self.selection_box.setCurrentIndex(2)
+        self.statusBar().showMessage("Click a vertex to set the stamp origin. Press Esc to cancel.")
+
+    def pick_origin_hole(self) -> None:
+        if self.document.base is None or self.document.base.mode != "solid" or self.selected_feature is None:
+            self._notify("Choose a solid stamp", "Select a feature on a solid part before choosing a hole.")
+            return
+        self._picking_hole_center = True
+        self.viewport.set_selection_mode("face")
+        self.selection_box.setCurrentIndex(0)
+        self.statusBar().showMessage("Click a cylindrical hole wall to set the stamp origin. Press Esc to cancel.")
+
+    def create_datum_from_feature(self) -> None:
+        feature = self.selected_feature
+        if feature is None or feature.placement.anchor.plane is None:
+            self._notify("Choose a stamp", "Select a placed feature to create a named datum from its plane.")
+            return
+        name, accepted = QInputDialog.getText(self, "Create datum", "Name", text=f"{feature.name} datum")
+        if not accepted or not name.strip():
+            return
+        self._push_undo("create datum")
+        self.document.datums.append(DatumDefinition(name=name.strip(), plane=feature.placement.anchor.plane))
+        self.statusBar().showMessage(f"Created datum {name.strip()}.", 5000)
+
+    def place_on_datum(self) -> None:
+        feature = self.selected_feature
+        if feature is None:
+            return
+        choices = [(datum.name, datum.id) for datum in self.document.datums]
+        choices.extend((name, name) for name in ("XY", "XZ", "YZ"))
+        labels = [item[0] for item in choices]
+        if not labels:
+            return
+        label, accepted = QInputDialog.getItem(self, "Place stamp on datum", "Datum", labels, 0, False)
+        if not accepted:
+            return
+        datum_id = dict(choices)[label]
+        self._push_undo("place on datum")
+        feature.placement.anchor = Anchor(kind=AnchorKind.DATUM, datum=datum_id)
+        self.request_rebuild(immediate=True)
+
+    def edit_inspection_limits(self) -> None:
+        settings = self.document.inspection
+        detail, accepted = QInputDialog.getDouble(
+            self, "Manufacturing limits", "Minimum detail (mm)", settings.min_detail_mm, 0.01, 100.0, 3
+        )
+        if not accepted:
+            return
+        depth, accepted = QInputDialog.getDouble(
+            self, "Manufacturing limits", "Minimum depth (mm)", settings.min_depth_mm, 0.01, 100.0, 3
+        )
+        if not accepted:
+            return
+        clearance, accepted = QInputDialog.getDouble(
+            self, "Manufacturing limits", "Minimum edge/hole clearance (mm)", settings.min_clearance_mm, 0.01, 100.0, 3
+        )
+        if not accepted:
+            return
+        self._push_undo("manufacturing limits")
+        settings.min_detail_mm = detail
+        settings.min_depth_mm = depth
+        settings.min_clearance_mm = clearance
+        self.statusBar().showMessage("Manufacturing limits updated.", 5000)
+
     def add_text_feature(self, face_pick=None) -> None:
         """Start a text feature, then wait for the user to click the face.
 
@@ -933,6 +1108,7 @@ class MainWindow(QMainWindow):
             return
         ref = ProfileRef(text=TextSpec(text="TEXT", size_mm=self._default_text_size()))
         self._pending_profile = ref
+        self._pending_feature_template = None
         self._pending_profile_size = (0.0, 0.0)
         if face_pick is not None:
             self._create_feature(ref, *face_pick)
@@ -1009,6 +1185,7 @@ class MainWindow(QMainWindow):
         self._remember_dir("profile", path)
 
         self._pending_profile = ref
+        self._pending_feature_template = None
         self._pending_profile_size = (result.profile.width, result.profile.height)
         if face_pick is not None:
             self._create_feature(ref, *face_pick)
@@ -1066,6 +1243,42 @@ class MainWindow(QMainWindow):
             return
         if shape is None or shape.IsNull():
             return
+        if self._picking_origin_vertex:
+            if shape.ShapeType() != TopAbs_ShapeEnum.TopAbs_VERTEX or self.selected_feature is None:
+                return
+            self._push_undo("set origin to vertex")
+            self.selected_feature.placement.anchor.origin_ref = make_vertex_ref(TopoDS.Vertex_s(shape))
+            self._picking_origin_vertex = False
+            self.viewport.set_selection_mode("face")
+            self.selection_box.setCurrentIndex(0)
+            self.request_rebuild(immediate=True)
+            return
+        if self._picking_hole_center:
+            if shape.ShapeType() != TopAbs_ShapeEnum.TopAbs_FACE or self.selected_feature is None:
+                return
+            try:
+                point_ref = make_hole_ref(TopoDS.Face_s(shape), (point.X(), point.Y(), point.Z()))
+            except Exception as exc:
+                self._notify("That is not a hole", str(exc))
+                return
+            self._push_undo("set origin to hole")
+            self.selected_feature.placement.anchor.origin_ref = point_ref
+            self._picking_hole_center = False
+            self.request_rebuild(immediate=True)
+            return
+        if self._picking_alignment_edge:
+            if shape.ShapeType() != TopAbs_ShapeEnum.TopAbs_EDGE:
+                return
+            feature = self.selected_feature
+            if feature is None:
+                return
+            self._push_undo("align to edge")
+            feature.placement.anchor.alignment_ref = make_edge_ref(TopoDS.Edge_s(shape))
+            self._picking_alignment_edge = False
+            self.viewport.set_selection_mode("face")
+            self.selection_box.setCurrentIndex(0)
+            self.request_rebuild(immediate=True)
+            return
         if shape.ShapeType() != TopAbs_ShapeEnum.TopAbs_FACE:
             return
         face = TopoDS.Face_s(shape)
@@ -1091,6 +1304,8 @@ class MainWindow(QMainWindow):
         if ref.is_text:
             first = (ref.text.text.strip().splitlines() or ["Text"])[0]
             name = (first[:24] or "Text")
+        elif ref.is_code:
+            name = "QR code" if str(ref.code.kind) == "qr" else "Data Matrix"
         else:
             name = Path(ref.source_path).stem or "Feature"
         feature = Feature(
@@ -1105,9 +1320,25 @@ class MainWindow(QMainWindow):
                 direction=self._default_direction(),
             ),
         )
+        if self._pending_feature_template is not None:
+            template = self._pending_feature_template.copy_with_new_id()
+            feature.name = template.name
+            feature.operation = template.operation
+            feature.modifiers = template.modifiers
+            feature.pattern = template.pattern
+            feature.metadata = template.metadata
+            feature.inspection = template.inspection
+            feature.placement.offset_2d = template.placement.offset_2d
+            feature.placement.rotation = template.placement.rotation
+            feature.placement.scale = template.placement.scale
+            feature.placement.uniform_scale = template.placement.uniform_scale
+            feature.placement.mirror_u = template.placement.mirror_u
+            feature.placement.mirror_v = template.placement.mirror_v
+            feature.placement.lift = template.placement.lift
         self._push_undo("add feature")
         self.document.add_feature(feature)
         self._pending_profile = None
+        self._pending_feature_template = None
 
         if warnings:
             self._notify("Note about this face", "\n\n".join(warnings))
@@ -1458,7 +1689,7 @@ class MainWindow(QMainWindow):
         if self.document.base is None or self.document.base.mode != "solid":
             return None
         try:
-            plane, _ = resolve_anchor(feature.placement.anchor, self.document.base.runtime)
+            plane, _ = resolve_anchor(feature.placement.anchor, self.document.base.runtime, self.document.datums)
         except Exception:
             return None
         from stamp.core.refs import resolve_face_ref
@@ -2030,6 +2261,35 @@ class MainWindow(QMainWindow):
         names = "\n".join(f"  {r.path.name}  ({r.size_text})" for r in written)
         if self.interactive:
             dialogs.inform(self, "Quote files written", f"Written to {folder}:\n\n{names}")
+
+    def export_job_package(self) -> None:
+        if self.document.base is None:
+            return
+        fmt = "step" if self.document.base.mode == "solid" else "stl"
+        preflight = export_io.preflight_export(self.document, self._last_result, fmt)
+        if not preflight.ok:
+            self._notify("Job package needs attention", "\n".join(preflight.errors))
+            return
+        if preflight.warnings and not self._confirm(
+            "Package warnings", "\n\n".join(preflight.warnings) + "\n\nContinue?"
+        ):
+            return
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Export job package", str(Path(self._last_dir("export")) / f"{self.document.name}.zip"),
+            "ZIP packages (*.zip)"
+        )
+        if not path:
+            return
+        try:
+            result = export_io.export_job_package(
+                self.document, self._geometry(), path, fmt=fmt,
+                screenshot=self._thumbnail(), rebuild=self._last_result,
+            )
+        except Exception as exc:
+            self._notify("Stamp could not write the job package", str(exc))
+            return
+        self._remember_dir("export", Path(path))
+        self._report_export(result)
 
     def batch_stamp(self) -> None:
         """Small guided front end for the same runner exposed as ``stamp batch``."""

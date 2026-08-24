@@ -53,6 +53,8 @@ def _substitute(document: Document, values: dict[str, str]) -> None:
     for feature in document.features:
         if feature.profile.text is not None:
             feature.profile.text.text = _TOKEN.sub(replace, feature.profile.text.text)
+        if feature.profile.code is not None:
+            feature.profile.code.payload = _TOKEN.sub(replace, feature.profile.code.payload)
 
 
 def run_batch(template: str | Path, csv_path: str | Path, output_dir: str | Path, fmt: str) -> BatchReport:

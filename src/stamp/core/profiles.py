@@ -44,8 +44,8 @@ class ProfileCache:
         )
 
     def path_for(self, ref: ProfileRef) -> Path:
-        if ref.is_text:
-            raise MissingSource("a text feature has no file")
+        if ref.is_text or ref.is_code:
+            raise MissingSource("a generated feature has no file")
         path = Path(self.relinks.get(ref.source_path, ref.source_path))
         if not path.exists():
             raise MissingSource(ref.source_path)
@@ -62,6 +62,12 @@ class ProfileCache:
             from stamp.io.text_profile import build_text_profile
 
             profile = build_text_profile(ref.text)
+            self._cache[key] = profile
+            return profile
+        if ref.is_code:
+            from stamp.io.code_profile import build_code_profile
+
+            profile = build_code_profile(ref.code)
             self._cache[key] = profile
             return profile
         result = import_profile(self.path_for(ref), self.options_for(ref))

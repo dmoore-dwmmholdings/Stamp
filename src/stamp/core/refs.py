@@ -19,9 +19,9 @@ from OCP.gp import gp_Pnt, gp_Vec
 from OCP.GProp import GProp_GProps
 from OCP.TopAbs import TopAbs_Orientation, TopAbs_ShapeEnum
 from OCP.TopExp import TopExp_Explorer
-from OCP.TopoDS import TopoDS, TopoDS_Face, TopoDS_Shape
+from OCP.TopoDS import TopoDS, TopoDS_Edge, TopoDS_Face, TopoDS_Shape
 
-from stamp.core.document import Anchor, AnchorKind, FaceRef, Plane
+from stamp.core.document import Anchor, AnchorKind, EdgeRef, FaceRef, Plane, PointRef
 
 #: A candidate face must score at least this well to be accepted (§8.2).
 ACCEPT_THRESHOLD = 0.55
@@ -160,6 +160,85 @@ def make_face_ref(
         bbox_center=face_center(face),
         origin_feature_id=origin_feature_id,
     )
+
+
+def make_edge_ref(edge: TopoDS_Edge) -> EdgeRef:
+    """Capture an edge by its middle point, tangent, and length—not its index."""
+    from OCP.BRepAdaptor import BRepAdaptor_Curve
+    from OCP.GCPnts import GCPnts_AbscissaPoint
+
+    curve = BRepAdaptor_Curve(edge)
+    first, last = BRep_Tool.Range_s(edge)
+    parameter = (first + last) / 2.0
+    mid = gp_Pnt()
+    tangent = gp_Vec()
+    curve.D1(parameter, mid, tangent)
+    try:
+        length = GCPnts_AbscissaPoint.Length_s(curve)
+    except Exception:
+        length = 0.0
+    return EdgeRef((mid.X(), mid.Y(), mid.Z()), (tangent.X(), tangent.Y(), tangent.Z()), length)
+
+
+def make_vertex_ref(vertex) -> PointRef:
+    point = BRep_Tool.Pnt_s(vertex)
+    return PointRef((point.X(), point.Y(), point.Z()), "vertex")
+
+
+def make_hole_ref(face: TopoDS_Face, point: tuple[float, float, float]) -> PointRef:
+    """Capture the axis-origin of a cylindrical hole face."""
+    ref = make_face_ref(face, point)
+    if ref.surface_type != "cylinder":
+        raise ReferenceError("Pick the cylindrical wall of a hole to use its centre.")
+    origin = tuple(ref.surface_params.get("origin", ref.point))
+    return PointRef(origin, "hole", ref)
+
+
+def resolve_point_ref(ref: PointRef, shape: TopoDS_Shape) -> tuple[float, float, float]:
+    if ref.kind == "hole" and ref.face_ref is not None:
+        face = resolve_face_ref(ref.face_ref, shape).face
+        params = surface_parameters(face)
+        return tuple(params.get("origin", ref.point))
+    diagonal = _shape_diagonal(shape) or 1.0
+    best: tuple[float, tuple[float, float, float]] | None = None
+    explorer = TopExp_Explorer(shape, TopAbs_ShapeEnum.TopAbs_VERTEX)
+    while explorer.More():
+        point = BRep_Tool.Pnt_s(TopoDS.Vertex_s(explorer.Current()))
+        candidate = (point.X(), point.Y(), point.Z())
+        distance = math.dist(candidate, ref.point)
+        if best is None or distance < best[0]:
+            best = (distance, candidate)
+        explorer.Next()
+    if best is None or best[0] > diagonal * 0.25:
+        raise ReferenceError("The placement vertex no longer matches this part. Pick a vertex again.")
+    return best[1]
+
+
+def resolve_edge_ref(ref: EdgeRef, shape: TopoDS_Shape) -> EdgeRef:
+    """Find the closest like-for-like edge, refusing an implausible match."""
+    diagonal = _shape_diagonal(shape) or 1.0
+    best: tuple[float, EdgeRef] | None = None
+    explorer = TopExp_Explorer(shape, TopAbs_ShapeEnum.TopAbs_EDGE)
+    while explorer.More():
+        edge = TopoDS.Edge_s(explorer.Current())
+        try:
+            candidate = make_edge_ref(edge)
+        except Exception:
+            explorer.Next()
+            continue
+        distance = math.dist(ref.midpoint, candidate.midpoint) / diagonal
+        a, b = ref.tangent, candidate.tangent
+        mag_a = math.sqrt(sum(v * v for v in a)) or 1.0
+        mag_b = math.sqrt(sum(v * v for v in b)) or 1.0
+        direction = abs(sum(x * y for x, y in zip(a, b, strict=True)) / (mag_a * mag_b))
+        length = min(ref.length, candidate.length) / max(ref.length, candidate.length, 1e-9)
+        score = 0.55 * max(0.0, 1.0 - distance / 0.25) + 0.3 * direction + 0.15 * length
+        if best is None or score > best[0]:
+            best = (score, candidate)
+        explorer.Next()
+    if best is None or best[0] < ACCEPT_THRESHOLD:
+        raise ReferenceError("The alignment edge no longer matches this part. Pick an edge again.")
+    return best[1]
 
 
 # --------------------------------------------------------------------- resolve
@@ -313,7 +392,7 @@ def plane_from_face(
     return Plane(origin=origin, normal=normal, u_axis=u_axis), warnings
 
 
-def resolve_anchor(anchor: Anchor, shape: TopoDS_Shape) -> tuple[Plane, list[str]]:
+def resolve_anchor(anchor: Anchor, shape: TopoDS_Shape, datums=None) -> tuple[Plane, list[str]]:
     """Turn a stored anchor into a live sketch plane."""
     if anchor.kind is AnchorKind.MESH_REGION:
         # The base mesh is immutable, so the plane fitted when the user clicked is
@@ -328,6 +407,13 @@ def resolve_anchor(anchor: Anchor, shape: TopoDS_Shape) -> tuple[Plane, list[str
 
     if anchor.kind is AnchorKind.DATUM:
         name = (anchor.datum or "XY").upper()
+        for datum in datums or []:
+            if anchor.datum in (datum.id, datum.name):
+                plane = datum.plane
+                if anchor.datum_offset:
+                    origin = tuple(o + n * anchor.datum_offset for o, n in zip(plane.origin, plane.normal, strict=True))
+                    return Plane(origin, plane.normal, plane.u_axis), []
+                return plane, []
         if name not in DATUM_PLANES:
             raise ReferenceError(f"Unknown datum plane {name!r}.")
         origin, normal, u_axis = DATUM_PLANES[name]
@@ -340,6 +426,11 @@ def resolve_anchor(anchor: Anchor, shape: TopoDS_Shape) -> tuple[Plane, list[str
 
     resolved = resolve_face_ref(anchor.face_ref, shape)
     plane, warnings = plane_from_face(resolved.face, anchor.face_ref.point)
+    if anchor.alignment_ref is not None:
+        edge = resolve_edge_ref(anchor.alignment_ref, shape)
+        plane = Plane(origin=edge.midpoint, normal=plane.normal, u_axis=_orthogonalize(edge.tangent, plane.normal))
+    if anchor.origin_ref is not None:
+        plane = Plane(origin=resolve_point_ref(anchor.origin_ref, shape), normal=plane.normal, u_axis=plane.u_axis)
     if resolved.ambiguous:
         warnings.append(
             "Two faces on this part match this feature's anchor equally well. "
@@ -359,9 +450,13 @@ __all__ = [
     "faces_of",
     "longest_edge_direction",
     "make_face_ref",
+    "make_edge_ref",
+    "make_hole_ref",
     "plane_from_face",
     "resolve_anchor",
     "resolve_face_ref",
+    "resolve_edge_ref",
+    "resolve_point_ref",
     "surface_kind",
     "surface_parameters",
 ]

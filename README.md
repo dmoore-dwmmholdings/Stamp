@@ -109,6 +109,37 @@ spacing (justify needs a wrap width).
 A text feature stores the text itself in the project file, so there is no artwork
 file to lose.
 
+## QR and Data Matrix
+
+Choose **+ Add code** to create an editable QR or Data Matrix mark directly in
+Stamp.  The code is vector geometry: module size, operation, depth, placement,
+patterns, and modifiers work exactly as they do for imported artwork.  In a batch
+template, code payloads accept `{{column}}` substitutions just like text, making
+serialised jobs reproducible.
+
+Keep the code's module size above your project's manufacturing limit and leave a
+quiet zone around it. Stamp warns about marks that are likely to be too fine to
+read after manufacture.
+
+## Production handoff
+
+Use **Export job package** (or `stamp package --project job.stamp --output job.zip`)
+to create a portable ZIP with the model, self-contained Stamp project, PDF
+production summary, preflight JSON, and thumbnail. Feature metadata — identifier,
+process, material, color, and notes — appears in the summary.
+
+For repeat work, save a selected feature as a **stamp preset** and insert it into
+another project. Presets carry their profile, operation, modifiers, and metadata,
+then prompt you to pick the new host face.
+
+## Reference placement
+
+On solid parts, **Align stamp to edge** uses a selected edge as the stamp's origin
+and horizontal direction. **Create datum from stamp** saves a named standalone
+plane; **Place stamp on datum** reuses it (or the global XY/XZ/YZ planes). These
+references are stored as geometry rather than face or edge numbers, so Stamp can
+resolve them again after a rebuild or revised part import.
+
 ## Fillets and chamfers
 
 A fillet applies to every edge of the selection in one operation, and one edge that

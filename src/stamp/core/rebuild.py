@@ -254,7 +254,7 @@ class RebuildEngine:
         anchor_shape = self._anchor_shape(document, feature, geometry, mode)
         target_face = None
         try:
-            plane, plane_warnings = resolve_anchor(feature.placement.anchor, anchor_shape)
+            plane, plane_warnings = resolve_anchor(feature.placement.anchor, anchor_shape, document.datums)
             if feature.placement.mode is PlacementMode.WRAP:
                 if mode != "solid" or feature.placement.anchor.face_ref is None:
                     raise ToolSolidError("Wrap is available only on cylindrical and conical faces of solid parts.")
