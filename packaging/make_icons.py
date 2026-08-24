@@ -9,6 +9,7 @@ actually is and crops to it before it scales.
 It writes:
 
 * ``packaging/assets/stamp.ico``  - Windows, every size in one file
+* ``packaging/assets/stamp.icns`` - macOS application bundle icon
 * ``packaging/assets/stamp.png``  - 512 px, for Linux and for the documents
 * ``packaging/assets/stamp_256.png`` - for the installer
 """
@@ -27,6 +28,18 @@ RESOURCES = ROOT / "src" / "stamp" / "resources"
 
 #: Sizes Windows asks for.  16 and 32 are the ones a person sees most.
 ICO_SIZES = (16, 24, 32, 48, 64, 128, 256)
+
+# Modern ICNS files are an ``icns`` container of ordinary PNG images.  Keeping
+# this here avoids a macOS-only icon conversion tool in the release build.
+ICNS_SIZES = (
+    (16, b"icp4"),
+    (32, b"icp5"),
+    (64, b"icp6"),
+    (128, b"ic07"),
+    (256, b"ic08"),
+    (512, b"ic09"),
+    (1024, b"ic10"),
+)
 
 #: Space kept around the mark, as a fraction of the mark.
 MARGIN = 0.06
@@ -134,6 +147,16 @@ def _write_ico(image, target: Path, sizes=ICO_SIZES) -> None:
     target.write_bytes(header + directory + blobs)
 
 
+def _write_icns(image, target: Path) -> None:
+    """Write a native macOS icon from PNG representations."""
+    chunks = []
+    for size, kind in ICNS_SIZES:
+        png = _png_bytes(image, size)
+        chunks.append(kind + struct.pack(">I", len(png) + 8) + png)
+    body = b"".join(chunks)
+    target.write_bytes(b"icns" + struct.pack(">I", len(body) + 8) + body)
+
+
 def main() -> int:
     from PySide6.QtGui import QGuiApplication
 
@@ -148,9 +171,10 @@ def main() -> int:
     print(f"mark found at {box}, cropped to {cropped.width()} px")
 
     _write_ico(cropped, ASSETS / "stamp.ico")
+    _write_icns(cropped, ASSETS / "stamp.icns")
     cropped.scaled(512, 512).save(str(ASSETS / "stamp.png"), "PNG")
     (ASSETS / "stamp_256.png").write_bytes(_png_bytes(cropped, 256))
-    for name in ("stamp.ico", "stamp.png", "stamp_256.png"):
+    for name in ("stamp.ico", "stamp.icns", "stamp.png", "stamp_256.png"):
         print(f"  wrote {(ASSETS / name).relative_to(ROOT)}")
 
     RESOURCES.mkdir(parents=True, exist_ok=True)

@@ -35,7 +35,7 @@ jobs:
           $tag = if ("${{ github.event_name }}" -eq "workflow_dispatch") { "${{ inputs.tag }}" } else { "${{ github.event.release.tag_name }}" }
           gh release upload $tag (Get-ChildItem packaging\dist\*-Setup.exe).FullName --clobber
 
-  macos-app:
+  macos-installer:
     strategy:
       fail-fast: false
       matrix:
@@ -56,16 +56,20 @@ jobs:
       - run: uv sync
       - run: uv run python packaging/make_icons.py
       - run: uv run pyinstaller packaging/stamp.spec --noconfirm --distpath build/dist --workpath build/work
-      - name: Package the app
+      - name: Create macOS installers
         shell: bash
         run: |
           tag="${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.event.release.tag_name }}"
           version="${tag#v}"
-          ditto -c -k --sequesterRsrc --keepParent build/dist/Stamp.app "build/Stamp-${version}-macos-${{ matrix.arch }}.zip"
-      - name: Attach the macOS app to the release
+          mkdir -p build/dmg
+          ditto build/dist/Stamp.app build/dmg/Stamp.app
+          ln -s /Applications build/dmg/Applications
+          hdiutil create -volname "Stamp" -srcfolder build/dmg -ov -format UDZO "build/Stamp-${version}-macos-${{ matrix.arch }}.dmg"
+          pkgbuild --identifier com.stamp.app --version "$version" --component build/dist/Stamp.app --install-location /Applications "build/Stamp-${version}-macos-${{ matrix.arch }}.pkg"
+      - name: Attach the macOS installers to the release
         env:
           GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
           tag="${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.event.release.tag_name }}"
-          gh release upload "$tag" build/*-macos-${{ matrix.arch }}.zip --clobber
+          gh release upload "$tag" build/*-macos-${{ matrix.arch }}.dmg build/*-macos-${{ matrix.arch }}.pkg --clobber

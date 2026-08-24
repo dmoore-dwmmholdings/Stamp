@@ -41,7 +41,7 @@ datas += collect_data_files("trimesh")
 datas += [(str(ROOT / "src" / "stamp" / "resources" / name), "stamp/resources")
           for name in ("stamp.ico", "stamp.png")]
 
-ICON = ROOT / "packaging" / "assets" / "stamp.ico"
+ICON = ROOT / "packaging" / "assets" / ("stamp.icns" if sys.platform == "darwin" else "stamp.ico")
 
 hiddenimports += [
     "ocpsvg",
@@ -133,10 +133,7 @@ if sys.platform == "darwin":
     app = BUNDLE(
         coll,
         name="Stamp.app",
-        # PyInstaller's macOS bootloader needs an ICNS icon. The in-app icon is
-        # still bundled in ``stamp/resources``; omit the Finder icon until a
-        # native ICNS source is added.
-        icon=None,
+        icon=str(ICON) if ICON.exists() else None,
         bundle_identifier="com.stamp.app",
         info_plist={
             "NSHighResolutionCapable": True,

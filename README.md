@@ -29,10 +29,11 @@ Download the latest build for your platform from the
 [releases page](https://github.com/dmoore-dwmmholdings/Stamp/releases). On Windows,
 run `Stamp-x.y.z-Setup.exe`; it installs for the current user only, so no
 administrator password is needed, adds a Start menu shortcut, and registers the
-`.stamp` file type. On macOS, download the ZIP matching your Mac (`arm64` for Apple
-silicon, `x86_64` for Intel), unzip it, then drag `Stamp.app` to Applications. The
-app is not notarized, so macOS may require Control-clicking it and choosing Open on
-the first launch.
+`.stamp` file type. On macOS, open the DMG matching your Mac (`arm64` for Apple
+silicon, `x86_64` for Intel) and drag `Stamp.app` onto the Applications folder.
+The matching PKG is also available if you prefer macOS Installer to perform the
+copy. The app is not notarized, so macOS may require Control-clicking it and
+choosing Open on the first launch.
 
 On other platforms, or if you'd rather run from source:
 
@@ -199,16 +200,22 @@ python -m uv run pyinstaller packaging/stamp.spec --noconfirm --distpath build/d
 ISCC.exe packaging/stamp.iss
 ```
 
-On macOS, build the application bundle and zip it for distribution:
+On macOS, build the application bundle plus a drag-to-Applications DMG and a
+standard Installer package:
 
 ```
 uv run python packaging/make_icons.py
 uv run pyinstaller packaging/stamp.spec --noconfirm --distpath build/dist --workpath build/work
-ditto -c -k --sequesterRsrc --keepParent build/dist/Stamp.app Stamp-x.y.z-macos-arm64.zip
+mkdir -p build/dmg
+ditto build/dist/Stamp.app build/dmg/Stamp.app
+ln -s /Applications build/dmg/Applications
+hdiutil create -volname Stamp -srcfolder build/dmg -ov -format UDZO Stamp-x.y.z-macos-arm64.dmg
+pkgbuild --component build/dist/Stamp.app --install-location /Applications Stamp-x.y.z-macos-arm64.pkg
 ```
 
 Use `macos-x86_64` in the filename when building on an Intel Mac. Tagged releases
-build and attach the Windows installer plus macOS ZIPs for Intel and Apple silicon.
+build and attach the Windows installer plus macOS DMG and PKG installers for Intel
+and Apple silicon.
 
 ## Development
 
