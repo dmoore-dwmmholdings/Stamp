@@ -12,12 +12,13 @@ geometry in the project file".
 
 from __future__ import annotations
 
+import math
 import uuid
 from dataclasses import dataclass, field, replace
 from enum import StrEnum
 from typing import Any, Literal
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 Units = Literal["mm", "in"]
 Mode = Literal["solid", "mesh"]
@@ -65,6 +66,17 @@ class AnchorKind(StrEnum):
     DATUM = "datum"
     #: A plane fitted to a region of triangles on a mesh part (§6.1, mesh mode).
     MESH_REGION = "mesh_region"
+
+
+class PlacementMode(StrEnum):
+    PLANAR = "planar"
+    WRAP = "wrap"
+
+
+class PatternKind(StrEnum):
+    LINEAR = "linear"
+    CIRCULAR = "circular"
+    MIRROR = "mirror"
 
 
 # --------------------------------------------------------------------------- refs
@@ -282,6 +294,7 @@ class Placement:
     mirror_u: bool = False
     mirror_v: bool = False
     lift: float = 0.0
+    mode: PlacementMode = PlacementMode.PLANAR
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -293,6 +306,7 @@ class Placement:
             "mirror_u": self.mirror_u,
             "mirror_v": self.mirror_v,
             "lift": self.lift,
+            "mode": str(self.mode),
         }
 
     @classmethod
@@ -306,7 +320,30 @@ class Placement:
             mirror_u=bool(d.get("mirror_u", False)),
             mirror_v=bool(d.get("mirror_v", False)),
             lift=float(d.get("lift", 0.0)),
+            mode=PlacementMode(d.get("mode", "planar")),
         )
+
+
+@dataclass
+class PatternSpec:
+    """Repeat a seed feature without storing destructive duplicate features."""
+
+    kind: PatternKind = PatternKind.LINEAR
+    count: int = 2
+    spacing: float = 10.0
+    angle: float = 360.0
+    center: tuple[float, float] = (0.0, 0.0)
+    axis_angle: float = 0.0
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"kind": str(self.kind), "count": self.count, "spacing": self.spacing,
+                "angle": self.angle, "center": list(self.center), "axis_angle": self.axis_angle}
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> PatternSpec:
+        return cls(kind=PatternKind(d.get("kind", "linear")), count=max(2, int(d.get("count", 2))),
+                   spacing=float(d.get("spacing", 10.0)), angle=float(d.get("angle", 360.0)),
+                   center=tuple(d.get("center", (0.0, 0.0))), axis_angle=float(d.get("axis_angle", 0.0)))
 
 
 @dataclass
@@ -450,6 +487,7 @@ class Feature:
     placement: Placement = field(default_factory=Placement)
     operation: Operation = field(default_factory=Operation)
     modifiers: list[Modifier] = field(default_factory=list)
+    pattern: PatternSpec | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -460,6 +498,7 @@ class Feature:
             "placement": self.placement.to_dict(),
             "operation": self.operation.to_dict(),
             "modifiers": [m.to_dict() for m in self.modifiers],
+            "pattern": self.pattern.to_dict() if self.pattern else None,
         }
 
     @classmethod
@@ -472,6 +511,7 @@ class Feature:
             placement=Placement.from_dict(d.get("placement", {})),
             operation=Operation.from_dict(d.get("operation", {})),
             modifiers=[Modifier.from_dict(m) for m in d.get("modifiers", [])],
+            pattern=PatternSpec.from_dict(d["pattern"]) if d.get("pattern") else None,
         )
 
     def copy_with_new_id(self, name: str | None = None) -> Feature:
@@ -481,6 +521,43 @@ class Feature:
             m.id = new_id()
         clone.name = name or f"{self.name} copy"
         return clone
+
+    def pattern_instances(self) -> list[Feature]:
+        """Return ephemeral copies used by rebuild; the seed remains one UI item."""
+        if self.pattern is None:
+            return [self]
+        spec = self.pattern
+        copies: list[Feature] = []
+        count = 2 if spec.kind is PatternKind.MIRROR else spec.count
+        for index in range(count):
+            copy = self.copy_with_new_id(f"{self.name} {index + 1}")
+            copy.pattern = None
+            u, v = copy.placement.offset_2d
+            if spec.kind is PatternKind.LINEAR:
+                radians = math.radians(spec.axis_angle)
+                copy.placement.offset_2d = (
+                    u + index * spec.spacing * math.cos(radians),
+                    v + index * spec.spacing * math.sin(radians),
+                )
+            elif spec.kind is PatternKind.CIRCULAR:
+                cx, cy = spec.center
+                radians = math.radians(index * spec.angle / spec.count)
+                dx, dy = u - cx, v - cy
+                copy.placement.offset_2d = (cx + dx * math.cos(radians) - dy * math.sin(radians),
+                                            cy + dx * math.sin(radians) + dy * math.cos(radians))
+                copy.placement.rotation += math.degrees(radians)
+            else:  # mirror keeps the seed plus its reflection about the configured axis.
+                if index:
+                    radians = math.radians(spec.axis_angle)
+                    cx, cy = spec.center
+                    dx, dy = u - cx, v - cy
+                    along = dx * math.cos(radians) + dy * math.sin(radians)
+                    across = -dx * math.sin(radians) + dy * math.cos(radians)
+                    copy.placement.offset_2d = (cx + along * math.cos(radians) + across * math.sin(radians),
+                                                cy + along * math.sin(radians) - across * math.cos(radians))
+                    copy.placement.mirror_v = not copy.placement.mirror_v
+            copies.append(copy)
+        return copies
 
 
 # -------------------------------------------------------------------- base part

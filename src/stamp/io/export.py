@@ -9,10 +9,15 @@ from __future__ import annotations
 import datetime as _dt
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from OCP.TopoDS import TopoDS_Shape
 
 from stamp.geom import mesh_ops, solid_ops
+
+if TYPE_CHECKING:
+    from stamp.core.document import Document
+    from stamp.core.rebuild import RebuildResult
 
 STEP_SCHEMAS = {"AP242": "AP242DIS", "AP214": "AP214IS"}
 
@@ -28,6 +33,65 @@ MESH_MODE_NO_STEP = (
 
 class ExportError(RuntimeError):
     """Export was refused.  The message says exactly why."""
+
+
+@dataclass
+class PreflightReport:
+    """A format-neutral export decision shared by the UI and batch runner."""
+
+    errors: list[str] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
+
+    @property
+    def ok(self) -> bool:
+        return not self.errors
+
+    def require_ok(self) -> None:
+        if self.errors:
+            raise ExportError("\n".join(self.errors))
+
+
+def preflight_export(
+    document: Document, rebuild: RebuildResult | None, fmt: str, path: str | Path | None = None
+) -> PreflightReport:
+    """Check conditions that must be known before any exporter writes a file."""
+    report = PreflightReport()
+    fmt = fmt.lower().lstrip(".")
+    if document.base is None or document.base.runtime is None:
+        report.errors.append("There is no part to export.")
+        return report
+    if rebuild is None or rebuild.geometry is None:
+        report.errors.append("Rebuild the part before exporting.")
+        return report
+    if not rebuild.ok:
+        report.errors.extend(rebuild.errors or ["One or more features could not be rebuilt."])
+    if fmt == "step" and document.base.mode != "solid":
+        report.errors.append(MESH_MODE_NO_STEP)
+    if fmt not in {"step", "stl", "3mf"}:
+        report.errors.append(f"Stamp cannot export the {fmt!r} format.")
+    if path is not None:
+        target = Path(path)
+        if not target.name:
+            report.errors.append("Choose a file name for the export.")
+        elif not target.parent.exists():
+            report.errors.append("The export folder does not exist.")
+        elif not target.parent.is_dir():
+            report.errors.append("The export location is not a folder.")
+    if document.base.warnings:
+        report.warnings.extend(document.base.warnings)
+    for feature in document.features:
+        for modifier in feature.modifiers:
+            if modifier.enabled and modifier.value < 0.05:
+                report.warnings.append(
+                    f"{feature.name}: {modifier.label} is very small and may not survive manufacturing."
+                )
+    for row in (rebuild.features if rebuild else []):
+        report.warnings.extend(row.warnings)
+        if row.suggested_values:
+            report.warnings.append("One or more modifier values were reduced to rebuild safely.")
+    if fmt == "3mf":
+        report.warnings.append("3MF exports separate bodies; verify material assignment in your slicer.")
+    return report
 
 
 @dataclass
@@ -226,6 +290,7 @@ def export_for_quote(
 __all__ = [
     "ExportError",
     "ExportResult",
+    "PreflightReport",
     "MESH_MODE_NO_STEP",
     "STEP_SCHEMAS",
     "STL_QUALITY",
@@ -233,6 +298,7 @@ __all__ = [
     "export_for_quote",
     "export_step",
     "export_stl",
+    "preflight_export",
     "triangle_count_for",
 ]
 

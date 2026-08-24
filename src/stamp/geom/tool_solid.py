@@ -9,14 +9,18 @@ boolean (§2, §6.5).
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from OCP.BRepBuilderAPI import BRepBuilderAPI_Transform
-from OCP.BRepPrimAPI import BRepPrimAPI_MakePrism
-from OCP.gp import gp_Ax1, gp_Ax3, gp_Dir, gp_Pnt, gp_Trsf, gp_Vec
-from OCP.TopoDS import TopoDS_Shape
+from OCP.BRepPrimAPI import (
+    BRepPrimAPI_MakeCone,
+    BRepPrimAPI_MakeCylinder,
+    BRepPrimAPI_MakePrism,
+)
+from OCP.gp import gp_Ax1, gp_Ax2, gp_Ax3, gp_Dir, gp_Pnt, gp_Trsf, gp_Vec
+from OCP.TopoDS import TopoDS_Face, TopoDS_Shape
 
-from stamp.core.document import DepthMode, Direction, Operation, Placement, Plane
+from stamp.core.document import DepthMode, Direction, Operation, Placement, PlacementMode, Plane
 from stamp.io.normalize import Profile
 
 
@@ -162,10 +166,18 @@ def build_tool_solid(
     part_diagonal: float,
     to_face_distance: float | None = None,
     contact_overlap: float | None = None,
+    target_face: TopoDS_Face | None = None,
 ) -> ToolSolid:
     """Place the profile on the sketch plane and sweep it into a solid."""
     if not profile.faces:
         raise ToolSolidError("This profile has no closed area to extrude.")
+
+    if placement.mode is PlacementMode.WRAP:
+        if target_face is None:
+            raise ToolSolidError("Wrapped artwork needs a cylindrical or conical face. Pick the face again.")
+        return _build_wrapped_tool(
+            profile, placement, operation, plane, target_face, part_diagonal=part_diagonal
+        )
 
     sx, sy = placement.scale
     if placement.mirror_u:
@@ -213,6 +225,210 @@ def build_tool_solid(
         footprint=footprint,
         contact_overlap=overlap,
     )
+
+
+def _placed_footprint(profile: Profile, placement: Placement, plane: Plane) -> TopoDS_Shape:
+    """Apply the shared 2D placement transform without constructing an extrusion."""
+    sx, sy = placement.scale
+    if placement.mirror_u:
+        sx = -sx
+    if placement.mirror_v:
+        sy = -sy
+    footprint = _scale_shape(profile.compound(), sx, sy)
+    return BRepBuilderAPI_Transform(footprint, placement_transform(placement, plane), True).Shape()
+
+
+def _build_wrapped_tool(
+    profile: Profile,
+    placement: Placement,
+    operation: Operation,
+    plane: Plane,
+    target_face: TopoDS_Face,
+    *,
+    part_diagonal: float,
+) -> ToolSolid:
+    """Create a normal-thickness tool bounded by a cylinder or cone."""
+    from stamp.core.refs import surface_kind
+
+    kind = surface_kind(target_face)
+    if kind not in {"cylinder", "cone"}:
+        raise ToolSolidError("Wrap is available only on cylindrical and conical faces.")
+    if placement.lift:
+        raise ToolSolidError("Wrapped artwork cannot be lifted off its face.")
+    if operation.depth_mode is DepthMode.TO_FACE:
+        raise ToolSolidError("To-face depth is not available for wrapped artwork.")
+    if operation.depth_mode is DepthMode.SYMMETRIC:
+        raise ToolSolidError("Symmetric depth is not available for wrapped artwork.")
+    depth = operation.depth if operation.depth_mode is DepthMode.BLIND else max(part_diagonal * 1.5, 1.0)
+    if depth <= 0:
+        raise ToolSolidError("The depth must be greater than zero.")
+    sign = -1.0 if operation.direction is Direction.INTO else 1.0
+    if kind == "cylinder":
+        shape, footprint = _cylindrical_wrap_shape(
+            profile, placement, operation, plane, target_face, depth, part_diagonal
+        )
+        return ToolSolid(
+            shape=shape, transform=placement_transform(placement, plane),
+            direction=(plane.normal[0] * sign, plane.normal[1] * sign, plane.normal[2] * sign),
+            length=depth, footprint=footprint,
+        )
+
+    shape, footprint = _conical_wrap_shape(
+        profile, placement, operation, plane, target_face, depth, part_diagonal
+    )
+    return ToolSolid(
+        shape=shape, transform=placement_transform(placement, plane),
+        direction=(plane.normal[0] * sign, plane.normal[1] * sign, plane.normal[2] * sign),
+        length=depth, footprint=footprint,
+    )
+
+
+def _cylindrical_wrap_shape(
+    profile: Profile,
+    placement: Placement,
+    operation: Operation,
+    plane: Plane,
+    target_face: TopoDS_Face,
+    depth: float,
+    part_diagonal: float,
+) -> tuple[TopoDS_Shape, TopoDS_Shape]:
+    """Intersect a profile selector with an exact cylindrical annular band."""
+    from OCP.BRepAdaptor import BRepAdaptor_Surface
+    from OCP.BRepAlgoAPI import BRepAlgoAPI_Common, BRepAlgoAPI_Cut
+    from OCP.BRepTools import BRepTools
+
+    cylinder = BRepAdaptor_Surface(target_face).Cylinder()
+    axis = cylinder.Axis()
+    direction = axis.Direction()
+    _u0, _u1, v0, v1 = BRepTools.UVBounds_s(target_face)
+    margin = max(1e-3, part_diagonal * 1e-5)
+    start = min(v0, v1) - margin
+    height = abs(v1 - v0) + 2 * margin
+    location = axis.Location()
+    origin = gp_Pnt(
+        location.X() + direction.X() * start,
+        location.Y() + direction.Y() * start,
+        location.Z() + direction.Z() * start,
+    )
+    radius = cylinder.Radius()
+    inward = operation.direction is Direction.INTO
+    inner = max(1e-6, radius - (depth + margin if inward else margin))
+    outer = radius + (margin if inward else depth + margin)
+    axes = gp_Ax2(origin, direction)
+    outer_solid = BRepPrimAPI_MakeCylinder(axes, outer, height).Shape()
+    inner_solid = BRepPrimAPI_MakeCylinder(axes, inner, height).Shape()
+    ring_op = BRepAlgoAPI_Cut(outer_solid, inner_solid)
+    ring_op.Build()
+    if not ring_op.IsDone() or ring_op.Shape().IsNull():
+        raise ToolSolidError("Stamp could not form the cylindrical wrap band.")
+
+    selector_placement = replace(placement, mode=PlacementMode.PLANAR)
+    selector_operation = replace(operation, depth_mode=DepthMode.THROUGH_ALL)
+    selector = build_tool_solid(
+        profile, selector_placement, selector_operation, plane,
+        part_diagonal=part_diagonal, contact_overlap=0.0,
+    )
+    _validate_wrap_seam(selector.footprint, target_face, cylinder.Position())
+    common = BRepAlgoAPI_Common(ring_op.Shape(), selector.shape)
+    common.Build()
+    if not common.IsDone() or common.Shape().IsNull():
+        raise ToolSolidError("The artwork does not intersect this cylindrical face. Move it onto the face.")
+    return common.Shape(), selector.footprint
+
+
+def _conical_wrap_shape(
+    profile: Profile,
+    placement: Placement,
+    operation: Operation,
+    plane: Plane,
+    target_face: TopoDS_Face,
+    depth: float,
+    part_diagonal: float,
+) -> tuple[TopoDS_Shape, TopoDS_Shape]:
+    """Intersect a profile selector with a conical annular band."""
+    from OCP.BRepAdaptor import BRepAdaptor_Surface
+    from OCP.BRepAlgoAPI import BRepAlgoAPI_Common, BRepAlgoAPI_Cut
+    from OCP.BRepTools import BRepTools
+
+    cone = BRepAdaptor_Surface(target_face).Cone()
+    axis = cone.Axis()
+    direction = axis.Direction()
+    _u0, _u1, v0, v1 = BRepTools.UVBounds_s(target_face)
+    start, end = min(v0, v1), max(v0, v1)
+    angle = cone.SemiAngle()
+    axial_scale = abs(math.cos(angle))
+    radial_scale = math.sin(angle)
+    margin = max(1e-3, part_diagonal * 1e-5)
+    start -= margin
+    end += margin
+    radius_start = cone.RefRadius() + start * radial_scale
+    radius_end = cone.RefRadius() + end * radial_scale
+    if min(radius_start, radius_end) <= margin:
+        raise ToolSolidError("This cone is too close to its tip for wrapped artwork.")
+    location = axis.Location()
+    origin = gp_Pnt(
+        location.X() + direction.X() * start * axial_scale,
+        location.Y() + direction.Y() * start * axial_scale,
+        location.Z() + direction.Z() * start * axial_scale,
+    )
+    inward = operation.direction is Direction.INTO
+    inner_start = max(1e-6, radius_start - (depth + margin if inward else margin))
+    inner_end = max(1e-6, radius_end - (depth + margin if inward else margin))
+    outer_start = radius_start + (margin if inward else depth + margin)
+    outer_end = radius_end + (margin if inward else depth + margin)
+    height = (end - start) * axial_scale
+    axes = gp_Ax2(origin, direction)
+    outer_solid = BRepPrimAPI_MakeCone(axes, outer_start, outer_end, height).Shape()
+    inner_solid = BRepPrimAPI_MakeCone(axes, inner_start, inner_end, height).Shape()
+    ring_op = BRepAlgoAPI_Cut(outer_solid, inner_solid)
+    ring_op.Build()
+    if not ring_op.IsDone() or ring_op.Shape().IsNull():
+        raise ToolSolidError("Stamp could not form the conical wrap band.")
+
+    selector_placement = replace(placement, mode=PlacementMode.PLANAR)
+    selector_operation = replace(operation, depth_mode=DepthMode.THROUGH_ALL)
+    selector = build_tool_solid(
+        profile, selector_placement, selector_operation, plane,
+        part_diagonal=part_diagonal, contact_overlap=0.0,
+    )
+    _validate_wrap_seam(selector.footprint, target_face, cone.Position())
+    common = BRepAlgoAPI_Common(ring_op.Shape(), selector.shape)
+    common.Build()
+    if not common.IsDone() or common.Shape().IsNull():
+        raise ToolSolidError("The artwork does not intersect this conical face. Move it onto the face.")
+    return common.Shape(), selector.footprint
+
+
+def _validate_wrap_seam(footprint: TopoDS_Shape, target_face: TopoDS_Face, position) -> None:
+    """Refuse artwork that crosses a trimmed cylinder/cone face's unwrap seam."""
+    from OCP.BRep import BRep_Tool
+    from OCP.BRepTools import BRepTools
+    from OCP.TopAbs import TopAbs_ShapeEnum
+    from OCP.TopExp import TopExp_Explorer
+    from OCP.TopoDS import TopoDS
+
+    u0, u1, _v0, _v1 = BRepTools.UVBounds_s(target_face)
+    if abs(u1 - u0) >= 2 * math.pi - 1e-6:
+        return  # A complete revolution has no boundary seam to cross.
+    origin = position.Location()
+    axis = position.Direction()
+    x_axis = position.XDirection()
+    y_axis = position.YDirection()
+    explorer = TopExp_Explorer(footprint, TopAbs_ShapeEnum.TopAbs_VERTEX)
+    while explorer.More():
+        point = BRep_Tool.Pnt_s(TopoDS.Vertex_s(explorer.Current()))
+        dx, dy, dz = point.X() - origin.X(), point.Y() - origin.Y(), point.Z() - origin.Z()
+        axial = dx * axis.X() + dy * axis.Y() + dz * axis.Z()
+        rx, ry, rz = dx - axial * axis.X(), dy - axial * axis.Y(), dz - axial * axis.Z()
+        angle = math.atan2(
+            rx * y_axis.X() + ry * y_axis.Y() + rz * y_axis.Z(),
+            rx * x_axis.X() + ry * x_axis.Y() + rz * x_axis.Z(),
+        )
+        if not any(u0 - 1e-6 <= angle + 2 * math.pi * turns <= u1 + 1e-6 for turns in (-1, 0, 1)):
+            raise ToolSolidError(
+                "The artwork crosses this face's unwrap seam. Move it away from the seam or split it."
+            )
+        explorer.Next()
 
 
 def fuse_overlapping(shape: TopoDS_Shape) -> TopoDS_Shape:

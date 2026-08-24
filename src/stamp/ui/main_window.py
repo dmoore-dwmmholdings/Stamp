@@ -18,6 +18,7 @@ from PySide6.QtWidgets import (
     QDoubleSpinBox,
     QFileDialog,
     QHBoxLayout,
+    QInputDialog,
     QLabel,
     QMainWindow,
     QProgressBar,
@@ -32,6 +33,7 @@ from PySide6.QtWidgets import (
 )
 
 from stamp import __version__, diagnostics, reporting
+from stamp.batch import BatchError, run_batch
 from stamp.core import replace_part as replace_part_io
 from stamp.core import snapping
 from stamp.core.document import (
@@ -309,6 +311,7 @@ class MainWindow(QMainWindow):
         self.action_export_stl = add("Export STL", self.export_stl)
         self.action_export_3mf = add("Export 3MF", self.export_3mf)
         self.action_export_quote = add("Export for quote", self.export_for_quote)
+        self.action_batch = add("Batch stamp", self.batch_stamp)
         bar.addSeparator()
 
         self.units_box = QComboBox()
@@ -1869,6 +1872,14 @@ class MainWindow(QMainWindow):
         )
         if not path:
             return
+        preflight = export_io.preflight_export(self.document, self._last_result, "step", path)
+        if not preflight.ok:
+            self._notify("STEP export needs attention", "\n".join(preflight.errors))
+            return
+        if preflight.warnings and not self._confirm(
+            "Export warnings", "\n\n".join(preflight.warnings) + "\n\nContinue?"
+        ):
+            return
         try:
             result = export_io.export_step(
                 self._geometry(), path, schema=schema, simplify=merge
@@ -1880,6 +1891,7 @@ class MainWindow(QMainWindow):
                 self._geometry(), path, schema=schema, simplify=merge, allow_invalid=True
             )
         self._remember_dir("export", Path(path))
+        result.warnings.extend(preflight.warnings)
         self._report_export(result)
 
     def export_stl(self) -> None:
@@ -1902,6 +1914,14 @@ class MainWindow(QMainWindow):
         )
         if not path:
             return
+        preflight = export_io.preflight_export(self.document, self._last_result, "stl", path)
+        if not preflight.ok:
+            self._notify("STL export needs attention", "\n".join(preflight.errors))
+            return
+        if preflight.warnings and not self._confirm(
+            "Export warnings", "\n\n".join(preflight.warnings) + "\n\nContinue?"
+        ):
+            return
         try:
             result = export_io.export_stl(
                 geometry, path, mode=mode, deflection=dialog.deflection_mm(),
@@ -1911,6 +1931,7 @@ class MainWindow(QMainWindow):
             self._notify("Stamp could not write the STL", str(exc))
             return
         self._remember_dir("export", Path(path))
+        result.warnings.extend(preflight.warnings)
         self._report_export(result)
 
     def export_3mf(self) -> None:
@@ -1948,6 +1969,14 @@ class MainWindow(QMainWindow):
         )
         if not path:
             return
+        preflight = export_io.preflight_export(self.document, self._last_result, "3mf", path)
+        if not preflight.ok:
+            self._notify("3MF export needs attention", "\n".join(preflight.errors))
+            return
+        if preflight.warnings and not self._confirm(
+            "Export warnings", "\n\n".join(preflight.warnings) + "\n\nContinue?"
+        ):
+            return
         try:
             split = color_split.split_for_color(
                 self.document, self._last_result, deflection=dialog.deflection_mm()
@@ -1962,11 +1991,21 @@ class MainWindow(QMainWindow):
             self._notify("Stamp could not write the 3MF", str(exc))
             return
         result.warnings.extend(split.warnings)
+        result.warnings.extend(preflight.warnings)
         self._remember_dir("export", Path(path))
         self._report_export(result)
 
     def export_for_quote(self) -> None:
         if self.document.base is None:
+            return
+        fmt = "step" if self.document.base.mode == "solid" else "stl"
+        preflight = export_io.preflight_export(self.document, self._last_result, fmt)
+        if not preflight.ok:
+            self._notify("Quote export needs attention", "\n".join(preflight.errors))
+            return
+        if preflight.warnings and not self._confirm(
+            "Export warnings", "\n\n".join(preflight.warnings) + "\n\nContinue?"
+        ):
             return
         folder = QFileDialog.getExistingDirectory(
             self, "Choose a folder for the quote files", self._last_dir("export")
@@ -1986,9 +2025,43 @@ class MainWindow(QMainWindow):
             self._notify("Stamp could not write the quote files", str(exc))
             return
         self._remember_dir("export", Path(folder))
+        if preflight.warnings:
+            self._notify("Note about this export", "\n\n".join(preflight.warnings))
         names = "\n".join(f"  {r.path.name}  ({r.size_text})" for r in written)
         if self.interactive:
             dialogs.inform(self, "Quote files written", f"Written to {folder}:\n\n{names}")
+
+    def batch_stamp(self) -> None:
+        """Small guided front end for the same runner exposed as ``stamp batch``."""
+        template, _ = QFileDialog.getOpenFileName(
+            self, "Choose Stamp template", self._last_dir("project"), "Stamp projects (*.stamp)"
+        )
+        if not template:
+            return
+        csv_path, _ = QFileDialog.getOpenFileName(
+            self, "Choose batch CSV", self._last_dir("part"), "CSV files (*.csv)"
+        )
+        if not csv_path:
+            return
+        folder = QFileDialog.getExistingDirectory(
+            self, "Choose batch output folder", self._last_dir("export")
+        )
+        if not folder:
+            return
+        fmt, accepted = QInputDialog.getItem(self, "Batch format", "Export format", ["step", "stl", "3mf"], 0, False)
+        if not accepted:
+            return
+        try:
+            report = run_batch(template, csv_path, folder, fmt)
+        except BatchError as exc:
+            self._notify("Batch could not start", str(exc))
+            return
+        self._remember_dir("export", Path(folder))
+        if report.stopped:
+            failed = report.rows[-1]
+            self._notify("Batch stopped", f"Row {failed.index}: {failed.detail}\n\nA report was written to {folder}.")
+        else:
+            self._notify("Batch complete", f"Exported {len(report.rows)} part(s).\n\nA report was written to {folder}.")
 
     def _report_export(self, result: export_io.ExportResult) -> None:
         parts = [f"{result.path.name} · {result.size_text}"]

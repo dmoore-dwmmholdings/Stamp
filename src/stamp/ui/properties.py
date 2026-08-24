@@ -41,6 +41,9 @@ from stamp.core.document import (
     Modifier,
     ModifierKind,
     OperationKind,
+    PatternKind,
+    PatternSpec,
+    PlacementMode,
     TextAlign,
     TextSpec,
 )
@@ -101,10 +104,11 @@ class PropertiesPanel(QScrollArea):
         self._text = self._build_text()
         self._placement = self._build_placement()
         self._operation = self._build_operation()
+        self._pattern = self._build_pattern()
         self._modifiers = self._build_modifiers()
 
         for widget in (
-            self._empty, self._text, self._placement, self._operation, self._modifiers
+            self._empty, self._text, self._placement, self._operation, self._pattern, self._modifiers
         ):
             self._layout.addWidget(widget)
         self._layout.addStretch(1)
@@ -291,6 +295,9 @@ class PropertiesPanel(QScrollArea):
         self.height_field = NumberField(minimum=0.001, step=0.5)
         self.scale_field = NumberField(suffix=" %", decimals=2, minimum=0.01, maximum=100000, step=1)
         self.lift_field = NumberField()
+        self.placement_mode = QComboBox()
+        self.placement_mode.addItem("Flat placement", PlacementMode.PLANAR)
+        self.placement_mode.addItem("Wrap cylinder/cone", PlacementMode.WRAP)
 
         self.lock_button = QToolButton()
         self.lock_button.setCheckable(True)
@@ -336,6 +343,9 @@ class PropertiesPanel(QScrollArea):
         grid.addWidget(QLabel("Lift"), row, 0)
         grid.addWidget(self.lift_field, row, 1)
         row += 1
+        grid.addWidget(QLabel("Surface"), row, 0)
+        grid.addWidget(self.placement_mode, row, 1, 1, 3)
+        row += 1
         self.mirror_u = QCheckBox("Mirror horizontal")
         self.mirror_v = QCheckBox("Mirror vertical")
         grid.addWidget(self.mirror_u, row, 0, 1, 2)
@@ -352,6 +362,7 @@ class PropertiesPanel(QScrollArea):
         self.height_field.valueChanged.connect(lambda v: self._set_size(1, v))
         self.scale_field.valueChanged.connect(self._set_scale_percent)
         self.lift_field.valueChanged.connect(self._set_lift)
+        self.placement_mode.currentIndexChanged.connect(self._set_placement_mode)
         self.mirror_u.toggled.connect(lambda on: self._set_mirror("u", on))
         self.mirror_v.toggled.connect(lambda on: self._set_mirror("v", on))
         self.lock_button.toggled.connect(self._set_lock)
@@ -432,12 +443,50 @@ class PropertiesPanel(QScrollArea):
         layout.addWidget(self.blend_note)
         return box
 
+    def _build_pattern(self) -> QWidget:
+        box = QGroupBox("Pattern")
+        form = QFormLayout(box)
+        self.pattern_enabled = QCheckBox("Repeat this feature")
+        self.pattern_kind = QComboBox()
+        self.pattern_kind.addItem("Linear", PatternKind.LINEAR)
+        self.pattern_kind.addItem("Circular", PatternKind.CIRCULAR)
+        self.pattern_kind.addItem("Mirror", PatternKind.MIRROR)
+        self.pattern_count = QDoubleSpinBox()
+        self.pattern_count.setRange(2, 1000)
+        self.pattern_count.setDecimals(0)
+        self.pattern_count.setValue(2)
+        self.pattern_spacing = NumberField(minimum=0.001, step=1.0)
+        self.pattern_center_u = NumberField()
+        self.pattern_center_v = NumberField()
+        self.pattern_axis = NumberField(suffix="°", minimum=-360, maximum=360, step=1.0)
+        center = QWidget()
+        center_layout = QHBoxLayout(center)
+        center_layout.setContentsMargins(0, 0, 0, 0)
+        center_layout.addWidget(QLabel("U"))
+        center_layout.addWidget(self.pattern_center_u)
+        center_layout.addWidget(QLabel("V"))
+        center_layout.addWidget(self.pattern_center_v)
+        form.addRow(self.pattern_enabled)
+        form.addRow("Kind:", self.pattern_kind)
+        form.addRow("Count:", self.pattern_count)
+        form.addRow("Spacing / sweep:", self.pattern_spacing)
+        form.addRow("Center:", center)
+        form.addRow("Axis:", self.pattern_axis)
+        self.pattern_enabled.toggled.connect(self._set_pattern_enabled)
+        self.pattern_kind.currentIndexChanged.connect(self._set_pattern_kind)
+        self.pattern_count.valueChanged.connect(self._set_pattern_count)
+        self.pattern_spacing.valueChanged.connect(self._set_pattern_spacing)
+        self.pattern_center_u.valueChanged.connect(lambda value: self._set_pattern_center(0, value))
+        self.pattern_center_v.valueChanged.connect(lambda value: self._set_pattern_center(1, value))
+        self.pattern_axis.valueChanged.connect(self._set_pattern_axis)
+        return box
+
     # ------------------------------------------------------------------- state
 
     def show_base(self, part: BasePart | None, units: str = "mm") -> None:
         self._feature = None
         self._empty.setVisible(True)
-        for widget in (self._text, self._placement, self._operation, self._modifiers):
+        for widget in (self._text, self._placement, self._operation, self._pattern, self._modifiers):
             widget.setVisible(False)
 
         if part is None:
@@ -479,7 +528,7 @@ class PropertiesPanel(QScrollArea):
         self._native_size = (max(native_size[0], 1e-9), max(native_size[1], 1e-9))
 
         self._empty.setVisible(False)
-        for widget in (self._placement, self._operation, self._modifiers):
+        for widget in (self._placement, self._operation, self._pattern, self._modifiers):
             widget.setVisible(True)
         self._text.setVisible(feature.profile.is_text)
         if feature.profile.is_text:
@@ -494,6 +543,7 @@ class PropertiesPanel(QScrollArea):
         self.height_field.set_silently(self._native_size[1] * abs(placement.scale[1]))
         self.scale_field.set_silently(abs(placement.scale[0]) * 100.0)
         self.lift_field.set_silently(placement.lift)
+        self.placement_mode.setCurrentIndex(self.placement_mode.findData(placement.mode))
         self.mirror_u.setChecked(placement.mirror_u)
         self.mirror_v.setChecked(placement.mirror_v)
         self.lock_button.setChecked(placement.uniform_scale)
@@ -508,6 +558,21 @@ class PropertiesPanel(QScrollArea):
         self._updating = False
 
         self._sync_depth_widgets()
+        self.lift_field.setEnabled(placement.mode is PlacementMode.PLANAR)
+        pattern = feature.pattern
+        self.pattern_enabled.setChecked(pattern is not None)
+        if pattern:
+            self.pattern_kind.setCurrentIndex(self.pattern_kind.findData(pattern.kind))
+            self.pattern_count.setValue(pattern.count)
+            self.pattern_spacing.set_silently(pattern.angle if pattern.kind is PatternKind.CIRCULAR else pattern.spacing)
+            self.pattern_center_u.set_silently(pattern.center[0])
+            self.pattern_center_v.set_silently(pattern.center[1])
+            self.pattern_axis.set_silently(pattern.axis_angle)
+        for widget in (
+            self.pattern_kind, self.pattern_count, self.pattern_spacing,
+            self.pattern_center_u, self.pattern_center_v, self.pattern_axis,
+        ):
+            widget.setEnabled(pattern is not None)
         self._fill_modifiers(feature, mesh_mode=mesh_mode)
 
     def _sync_depth_widgets(self) -> None:
@@ -609,6 +674,66 @@ class PropertiesPanel(QScrollArea):
             return
         self._feature.placement.rotation = value
         self._emit("rotate")
+
+    def _set_placement_mode(self) -> None:
+        if self._feature is None or self._updating:
+            return
+        mode = PlacementMode(self.placement_mode.currentData())
+        self._feature.placement.mode = mode
+        if mode is PlacementMode.WRAP:
+            self._feature.placement.lift = 0.0
+            self.lift_field.set_silently(0.0)
+        self.lift_field.setEnabled(mode is PlacementMode.PLANAR)
+        self._emit("surface mode")
+
+    def _set_pattern_enabled(self, enabled: bool) -> None:
+        if self._feature is None or self._updating:
+            return
+        self._feature.pattern = PatternSpec() if enabled else None
+        for widget in (
+            self.pattern_kind, self.pattern_count, self.pattern_spacing,
+            self.pattern_center_u, self.pattern_center_v, self.pattern_axis,
+        ):
+            widget.setEnabled(enabled)
+        self._emit("pattern")
+
+    def _set_pattern_kind(self) -> None:
+        if self._feature is None or self._updating or self._feature.pattern is None:
+            return
+        kind = PatternKind(self.pattern_kind.currentData())
+        self._feature.pattern.kind = kind
+        self.pattern_spacing.set_silently(
+            self._feature.pattern.angle if kind is PatternKind.CIRCULAR else self._feature.pattern.spacing
+        )
+        self._emit("pattern kind")
+
+    def _set_pattern_count(self, value: float) -> None:
+        if self._feature is None or self._updating or self._feature.pattern is None:
+            return
+        self._feature.pattern.count = int(value)
+        self._emit("pattern count")
+
+    def _set_pattern_spacing(self, value: float) -> None:
+        if self._feature is None or self._updating or self._feature.pattern is None:
+            return
+        if self._feature.pattern.kind is PatternKind.CIRCULAR:
+            self._feature.pattern.angle = value
+        else:
+            self._feature.pattern.spacing = value
+        self._emit("pattern spacing")
+
+    def _set_pattern_center(self, axis: int, value: float) -> None:
+        if self._feature is None or self._updating or self._feature.pattern is None:
+            return
+        u, v = self._feature.pattern.center
+        self._feature.pattern.center = (value, v) if axis == 0 else (u, value)
+        self._emit("pattern center")
+
+    def _set_pattern_axis(self, value: float) -> None:
+        if self._feature is None or self._updating or self._feature.pattern is None:
+            return
+        self._feature.pattern.axis_angle = value
+        self._emit("pattern axis")
 
     def _turn(self, delta: float) -> None:
         if self._feature is None:

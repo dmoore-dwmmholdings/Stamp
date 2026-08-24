@@ -21,8 +21,9 @@ from stamp.core.document import (
     EdgeRole,
     Feature,
     OperationKind,
+    PlacementMode,
 )
-from stamp.core.refs import ReferenceError, resolve_anchor
+from stamp.core.refs import ReferenceError, resolve_anchor, resolve_face_ref
 from stamp.geom import mesh_ops, solid_ops
 from stamp.geom.tool_solid import ToolSolid, ToolSolidError, build_tool_solid
 from stamp.io.normalize import Profile
@@ -161,9 +162,18 @@ class RebuildEngine:
                     progress(_i + 1, len(enabled), f"{_f.name} - {step}")
 
             report("start")
-            geometry, feature_result = self._apply_feature(
-                document, feature, geometry, mode, report=report
-            )
+            instances = feature.pattern_instances()
+            feature_result = FeatureResult(feature_id=feature.id)
+            for instance in instances:
+                geometry, instance_result = self._apply_feature(
+                    document, instance, geometry, mode, report=report
+                )
+                feature_result.warnings.extend(instance_result.warnings)
+                feature_result.errors.extend(instance_result.errors)
+                feature_result.failed_edges.extend(instance_result.failed_edges)
+                feature_result.suggested_values.update(instance_result.suggested_values)
+                feature_result.tool = instance_result.tool
+            feature_result.ok = not feature_result.errors
             result.features.append(feature_result)
             if feature_result.broken:
                 result.ok = False
@@ -242,8 +252,13 @@ class RebuildEngine:
             return geometry, out
 
         anchor_shape = self._anchor_shape(document, feature, geometry, mode)
+        target_face = None
         try:
             plane, plane_warnings = resolve_anchor(feature.placement.anchor, anchor_shape)
+            if feature.placement.mode is PlacementMode.WRAP:
+                if mode != "solid" or feature.placement.anchor.face_ref is None:
+                    raise ToolSolidError("Wrap is available only on cylindrical and conical faces of solid parts.")
+                target_face = resolve_face_ref(feature.placement.anchor.face_ref, anchor_shape).face
         except ReferenceError as exc:
             out.errors.append(f"{feature.name}: {exc}")
             return geometry, out
@@ -271,6 +286,7 @@ class RebuildEngine:
                 plane,
                 part_diagonal=document.base.diagonal,
                 to_face_distance=self._to_face_distance(feature, plane, anchor_shape),
+                target_face=target_face,
             )
         except ToolSolidError as exc:
             out.errors.append(f"{feature.name}: {exc}")

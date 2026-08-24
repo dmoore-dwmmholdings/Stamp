@@ -49,6 +49,26 @@ uv run stamp tests/fixtures/bracket.step
 uv run stamp my_project.stamp
 ```
 
+## Batch stamping
+
+Save a `.stamp` project as the template, then apply it to a CSV of parts from
+**Batch stamp** or the command line:
+
+```
+uv run stamp batch --template template.stamp --csv jobs.csv --output-dir output --format step
+```
+
+The CSV needs `input` and `output` columns.  Other columns substitute into text
+features using `{{column}}`, which makes serial-number runs reproducible.  Stamp
+stops at the first failed row and writes `stamp-batch-report.json` beside the
+output files.
+
+## Export preflight
+
+Every export is checked before Stamp writes a file. Invalid rebuilds and formats
+that cannot represent the source part are blocked; smaller manufacturing risks
+are presented as warnings so you can make the final call.
+
 ## The workflow
 
 1. Open a part.
@@ -58,6 +78,17 @@ uv run stamp my_project.stamp
 5. Pick the depth and the operation.
 6. Add a fillet or chamfer if you want one.
 7. Export.
+
+## Wrap and patterns
+
+On a solid STEP/BREP part, select a feature and choose **Wrap cylinder/cone** in
+the placement panel to make its profile follow a cylindrical or conical face.
+Stamp refuses mesh parts, other curved surfaces, and artwork that crosses the
+face seam rather than making approximate geometry.
+
+The same panel also turns a seed feature into an editable linear, circular, or
+mirror pattern. The pattern remains one feature-tree item: edit its text,
+profile, or operation once and every generated instance rebuilds.
 
 ## Text
 
