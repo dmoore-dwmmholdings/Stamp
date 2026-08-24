@@ -25,10 +25,14 @@ the printer.
 
 ## Install
 
-Download the latest `Stamp-x.y.z-Setup.exe` from the
-[releases page](https://github.com/dmoore-dwmmholdings/Stamp/releases) and run it.
-It installs for the current user only, so no administrator password is needed, adds
-a Start menu shortcut, and registers the `.stamp` file type.
+Download the latest build for your platform from the
+[releases page](https://github.com/dmoore-dwmmholdings/Stamp/releases). On Windows,
+run `Stamp-x.y.z-Setup.exe`; it installs for the current user only, so no
+administrator password is needed, adds a Start menu shortcut, and registers the
+`.stamp` file type. On macOS, download the ZIP matching your Mac (`arm64` for Apple
+silicon, `x86_64` for Intel), unzip it, then drag `Stamp.app` to Applications. The
+app is not notarized, so macOS may require Control-clicking it and choosing Open on
+the first launch.
 
 On other platforms, or if you'd rather run from source:
 
@@ -187,7 +191,7 @@ machine info, the last lines of the log — so all you do is look it over and se
 Nothing is ever sent automatically. Since a `mailto:` link can't carry an
 attachment, the full report also goes to a file, and the email names it.
 
-## Building the Windows installer
+## Building release applications
 
 ```
 python -m uv run python packaging/make_icons.py
@@ -195,8 +199,16 @@ python -m uv run pyinstaller packaging/stamp.spec --noconfirm --distpath build/d
 ISCC.exe packaging/stamp.iss
 ```
 
-The result is a single `Stamp-x.y.z-Setup.exe` in `packaging/dist/`. A tagged
-release builds this automatically and attaches it to the GitHub release.
+On macOS, build the application bundle and zip it for distribution:
+
+```
+uv run python packaging/make_icons.py
+uv run pyinstaller packaging/stamp.spec --noconfirm --distpath build/dist --workpath build/work
+ditto -c -k --sequesterRsrc --keepParent build/dist/Stamp.app Stamp-x.y.z-macos-arm64.zip
+```
+
+Use `macos-x86_64` in the filename when building on an Intel Mac. Tagged releases
+build and attach the Windows installer plus macOS ZIPs for Intel and Apple silicon.
 
 ## Development
 

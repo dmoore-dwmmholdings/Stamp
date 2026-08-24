@@ -13,7 +13,7 @@ permissions:
   contents: write
 
 jobs:
-  installer:
+  windows-installer:
     runs-on: windows-latest
     timeout-minutes: 60
     steps:
@@ -34,3 +34,38 @@ jobs:
         run: |
           $tag = if ("${{ github.event_name }}" -eq "workflow_dispatch") { "${{ inputs.tag }}" } else { "${{ github.event.release.tag_name }}" }
           gh release upload $tag (Get-ChildItem packaging\dist\*-Setup.exe).FullName --clobber
+
+  macos-app:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-13
+            arch: x86_64
+          - runner: macos-14
+            arch: arm64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - run: uv sync
+      - run: uv run python packaging/make_icons.py
+      - run: uv run pyinstaller packaging/stamp.spec --noconfirm --distpath build/dist --workpath build/work
+      - name: Package the app
+        shell: bash
+        run: |
+          tag="${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.event.release.tag_name }}"
+          version="${tag#v}"
+          ditto -c -k --sequesterRsrc --keepParent build/dist/Stamp.app "build/Stamp-${version}-macos-${{ matrix.arch }}.zip"
+      - name: Attach the macOS app to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          tag="${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.event.release.tag_name }}"
+          gh release upload "$tag" build/*-macos-${{ matrix.arch }}.zip --clobber

@@ -51,11 +51,18 @@ hiddenimports += [
     "lxml._elementpath",
     "lxml.etree",
     "PySide6.QtSvg",
-    "OCP.WNT",
-    "OCP.Xw",
-    "OCP.Cocoa",
     "OCP.OpenGl",
 ]
+
+# OCP exposes only the native window wrapper for the current platform. Asking
+# PyInstaller for the Windows/X11 wrappers on macOS produces misleading missing
+# module errors and can hide a real packaging failure.
+if sys.platform == "win32":
+    hiddenimports.append("OCP.WNT")
+elif sys.platform == "darwin":
+    hiddenimports.append("OCP.Cocoa")
+else:
+    hiddenimports.append("OCP.Xw")
 
 # Things Stamp never imports.  Leaving them in roughly doubles the build.
 excludes = [
@@ -126,7 +133,10 @@ if sys.platform == "darwin":
     app = BUNDLE(
         coll,
         name="Stamp.app",
-        icon=str(ROOT / "packaging" / "assets" / "stamp.png"),
+        # PyInstaller's macOS bootloader needs an ICNS icon. The in-app icon is
+        # still bundled in ``stamp/resources``; omit the Finder icon until a
+        # native ICNS source is added.
+        icon=None,
         bundle_identifier="com.stamp.app",
         info_plist={
             "NSHighResolutionCapable": True,
