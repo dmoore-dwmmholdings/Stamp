@@ -101,6 +101,24 @@ def test_preflight_rejects_a_missing_output_folder(tmp_path):
     assert report.errors == ["The export folder does not exist."]
 
 
+def test_production_proof_writes_a_pdf_with_preflight_context(tmp_path, qapp):
+    from stamp.core.document import BasePart, Document, Feature, Operation, OperationKind
+    from stamp.io.export import export_proof_sheet
+
+    document = Document(
+        name="bracket-job",
+        base=BasePart(mode="solid", runtime=object(), source_path="bracket.step", bbox=(80.0, 40.0, 14.0)),
+        features=[Feature(name="Serial", operation=Operation(kind=OperationKind.CUT, depth=0.4))],
+    )
+    result = RebuildResult(geometry=object(), mode="solid")
+
+    written = export_proof_sheet(document, tmp_path / "proof", rebuild=result)
+
+    assert written.path.suffix == ".pdf"
+    assert written.path.exists()
+    assert written.size_bytes > 100
+
+
 def test_preflight_keeps_manufacturing_risks_as_warnings(tmp_path):
     from stamp.core.document import Document, Modifier, ProfileRef
 
@@ -111,6 +129,56 @@ def test_preflight_keeps_manufacturing_risks_as_warnings(tmp_path):
     report = preflight_export(document, RebuildResult(geometry=object()), "stl", tmp_path / "part.stl")
     assert report.ok
     assert "Fine detail" in report.warnings[0]
+
+
+def test_manufacturing_rulesets_apply_consistent_preflight_limits():
+    from stamp.core.document import InspectionSettings
+    from stamp.core.inspection import MANUFACTURING_RULESETS, apply_ruleset
+
+    settings = InspectionSettings()
+    apply_ruleset(settings, "FDM printing")
+
+    assert (settings.min_detail_mm, settings.min_depth_mm, settings.min_clearance_mm) == MANUFACTURING_RULESETS["FDM printing"]
+
+
+def test_inspection_dimensions_measure_the_actual_tool_envelope():
+    import pytest
+    from OCP.BRepPrimAPI import BRepPrimAPI_MakeBox
+
+    from stamp.core.inspection import feature_dimensions
+
+    dimensions = feature_dimensions(BRepPrimAPI_MakeBox(2.0, 3.0, 4.0).Shape())
+
+    assert dimensions is not None
+    assert (dimensions.width_mm, dimensions.height_mm, dimensions.depth_mm) == pytest.approx((2.0, 3.0, 4.0))
+
+
+def test_clearance_measurement_exposes_both_ends_of_the_warning_line(bracket_step, fixtures):
+    from stamp.core.document import Anchor, AnchorKind, Document, Operation, ProfileRef
+    from stamp.core.inspection import anchor_clearance_measurement
+    from stamp.core.refs import (
+        face_center,
+        faces_of,
+        make_face_ref,
+        plane_from_face,
+        surface_kind,
+    )
+    from stamp.io.profile_import import file_hash
+
+    face = next(face for face in faces_of(bracket_step.runtime) if surface_kind(face) == "plane")
+    point = face_center(face)
+    plane, _warnings = plane_from_face(face, point)
+    feature = Feature(
+        profile=ProfileRef(source_path=str(fixtures / "logo.svg"), source_hash=file_hash(fixtures / "logo.svg")),
+        placement=Placement(anchor=Anchor(kind=AnchorKind.FACE, face_ref=make_face_ref(face, point), plane=plane)),
+        operation=Operation(depth=0.2),
+    )
+
+    measurement = anchor_clearance_measurement(Document(base=bracket_step, features=[feature]), feature)
+
+    assert measurement is not None
+    assert measurement.distance_mm >= 0
+    assert len(measurement.origin) == len(measurement.boundary) == 3
 
 
 def test_batch_substitutes_named_text_fields_and_rejects_missing_values():
@@ -124,6 +192,39 @@ def test_batch_substitutes_named_text_fields_and_rejects_missing_values():
     assert document.features[0].profile.text.text == "SN-0042"
     with pytest.raises(BatchError, match="serial"):
         _substitute(Document(features=[Feature(profile=ProfileRef(text=TextSpec(text="{{serial}}")))]), {})
+
+
+def test_batch_simulation_rejects_invalid_format_before_it_can_queue_outputs(tmp_path):
+    import pytest
+
+    from stamp.batch import BatchError, simulate_batch
+    from stamp.core.document import BasePart, Document
+    from stamp.io.project import save
+
+    template = tmp_path / "template.stamp"
+    save(Document(base=BasePart(mode="solid", runtime=object())), template)
+    csv = tmp_path / "rows.csv"
+    csv.write_text("input,output\npart.step,marked\n", encoding="utf-8")
+
+    with pytest.raises(BatchError, match="format"):
+        simulate_batch(template, csv, "dxf")
+
+
+def test_batch_simulation_catches_empty_and_escaping_rows(tmp_path):
+    from stamp.batch import simulate_batch
+    from stamp.core.document import BasePart, Document
+    from stamp.io.project import save
+
+    template = tmp_path / "template.stamp"
+    save(Document(base=BasePart(mode="solid", runtime=object())), template)
+    csv = tmp_path / "rows.csv"
+    csv.write_text("input,output\n,mark\npart.step,../escape\n", encoding="utf-8")
+
+    report = simulate_batch(template, csv, "stl")
+
+    assert [row.status for row in report.rows] == ["failed", "failed"]
+    assert "input" in report.rows[0].detail
+    assert "inside" in report.rows[1].detail
 
 
 def test_cylindrical_wrap_rebuilds_add_and_cut(bracket_step, fixtures):

@@ -5,6 +5,7 @@ from __future__ import annotations
 import csv
 import json
 import re
+import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -57,6 +58,60 @@ def _substitute(document: Document, values: dict[str, str]) -> None:
             feature.profile.code.payload = _TOKEN.sub(replace, feature.profile.code.payload)
 
 
+def _output_name(value: str | None, fmt: str) -> Path:
+    output = (value or "").strip()
+    if not output:
+        raise BatchError("output is empty")
+    path = Path(output)
+    if not path.suffix:
+        path = path.with_suffix("." + fmt)
+    if path.is_absolute() or ".." in path.parts:
+        raise BatchError("the output path must stay inside the chosen output folder")
+    if path.name.casefold() == "stamp-batch-report.json" and len(path.parts) == 1:
+        raise BatchError("output name is reserved for the batch report")
+    return path
+
+
+def simulate_batch(template: str | Path, csv_path: str | Path, fmt: str) -> BatchReport:
+    """Validate CSV substitutions and output collisions without importing or writing parts."""
+    fmt = fmt.lower().lstrip(".")
+    if fmt not in {"step", "stl", "3mf"}:
+        raise BatchError("Batch format must be step, stl, or 3mf.")
+    # Project sources must be materialized to inspect a portable .stamp archive,
+    # but never beside the user's template during a dry run.
+    with tempfile.TemporaryDirectory(prefix="stamp-batch-sim-") as work:
+        try:
+            opened = open_project(template, work_dir=work)
+        except Exception as exc:
+            raise BatchError(f"Could not open template: {exc}") from exc
+        if opened.missing:
+            raise BatchError("The template has missing sources: " + ", ".join(opened.missing))
+        if opened.document.base is None:
+            raise BatchError("The template has no base part.")
+        report = BatchReport()
+        seen: set[str] = set()
+        with Path(csv_path).open(newline="", encoding="utf-8-sig") as handle:
+            reader = csv.DictReader(handle)
+            if not reader.fieldnames or not {"input", "output"}.issubset(reader.fieldnames):
+                raise BatchError("CSV must have input and output columns.")
+            for index, values in enumerate(reader, start=2):
+                try:
+                    document = Document.from_dict(opened.document.to_dict())
+                    _substitute(document, {key: value or "" for key, value in values.items()})
+                    source = (values["input"] or "").strip()
+                    if not source:
+                        raise BatchError("input is empty")
+                    output = _output_name(values["output"], fmt)
+                    output_text = str(output)
+                    if output_text.casefold() in seen:
+                        raise BatchError(f"duplicate output {output_text!r}")
+                    seen.add(output_text.casefold())
+                    report.rows.append(BatchRow(index, source, output_text, "ready"))
+                except Exception as exc:
+                    report.rows.append(BatchRow(index, values.get("input", ""), values.get("output", ""), "failed", str(exc)))
+        return report
+
+
 def run_batch(template: str | Path, csv_path: str | Path, output_dir: str | Path, fmt: str) -> BatchReport:
     """Run rows in order and stop at the first failed rebuild/preflight/export."""
     template, csv_path, output_dir = Path(template), Path(csv_path), Path(output_dir)
@@ -78,6 +133,7 @@ def run_batch(template: str | Path, csv_path: str | Path, output_dir: str | Path
         raise BatchError(f"Could not import the template part: {exc}") from exc
     output_dir.mkdir(parents=True, exist_ok=True)
     report = BatchReport()
+    seen_outputs: set[str] = set()
     with csv_path.open(newline="", encoding="utf-8-sig") as handle:
         reader = csv.DictReader(handle)
         if not reader.fieldnames or not {"input", "output"}.issubset(reader.fieldnames):
@@ -86,7 +142,15 @@ def run_batch(template: str | Path, csv_path: str | Path, output_dir: str | Path
             try:
                 document = Document.from_dict(opened.document.to_dict())
                 _substitute(document, {k: v or "" for k, v in values.items()})
-                source = Path(values["input"])
+                source_text = (values["input"] or "").strip()
+                if not source_text:
+                    raise BatchError("input is empty")
+                output_name = _output_name(values["output"], fmt)
+                output_key = str(output_name).casefold()
+                if output_key in seen_outputs:
+                    raise BatchError(f"duplicate output {str(output_name)!r}")
+                seen_outputs.add(output_key)
+                source = Path(source_text)
                 if not source.is_absolute():
                     source = csv_path.parent / source
                 part = import_part(source).part
@@ -95,9 +159,7 @@ def run_batch(template: str | Path, csv_path: str | Path, output_dir: str | Path
                     raise BatchError(replaced.summary())
                 engine = RebuildEngine(ProfileCache().get)
                 rebuilt = engine.rebuild(document)
-                output = output_dir / values["output"]
-                if not output.suffix:
-                    output = output.with_suffix("." + fmt)
+                output = output_dir / output_name
                 # A CSV is data, not permission to write outside the selected folder.
                 output = output.resolve()
                 if not output.is_relative_to(output_dir.resolve()):

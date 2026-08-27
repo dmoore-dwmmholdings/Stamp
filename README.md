@@ -119,9 +119,30 @@ serialised jobs reproducible.
 
 Keep the code's module size above your project's manufacturing limit and leave a
 quiet zone around it. Stamp warns about marks that are likely to be too fine to
-read after manufacture.
+read after manufacture, and decodes its generated module grid again before export
+warnings are produced.
 
 ## Production handoff
+
+**Production proof** writes a standalone PDF with the current viewport image, part
+facts, every mark's operation and depth, manufacturing identifiers, and preflight
+warnings. Use it as the review sheet before sending a job to production.
+
+**Manufacturing limits** includes starting rulesets for laser engraving, CNC
+engraving, embossing, resin printing, and FDM printing. They are conservative
+warnings, not CAM instructions; adjust the three limits for your machine.
+
+Select **Inspect** beneath the viewport to see the rebuilt mark's measured
+three-dimensional envelope and a line to its nearest host-face edge or hole. The
+line turns red when it misses the configured clearance. On cylindrical and conical
+faces, the normal colored preview is a curved-face proof: it follows the actual
+wrapped solid, not a flat decal.
+
+Replacing a part produces a per-mark revision comparison: each mark is called out
+as kept, moved by a measured distance, or needing a new host face. Before a batch
+run, Stamp simulates every CSV row to catch substitutions, duplicate names, and
+unsafe output paths. Inspection also flags modifier values that may fall below a
+practical cutter radius; these are toolpath hints, not generated CAM.
 
 Use **Export job package** (or `stamp package --project job.stamp --output job.zip`)
 to create a portable ZIP with the model, self-contained Stamp project, PDF

@@ -6,7 +6,9 @@ reconstruction, so a document that started from an STL cannot produce a STEP.
 
 from __future__ import annotations
 
+import base64
 import datetime as _dt
+import html
 import json
 import tempfile
 import zipfile
@@ -120,6 +122,78 @@ def default_filename(project_name: str, extension: str) -> str:
     stamp = _dt.date.today().strftime("%Y%m%d")
     safe = "".join(c for c in project_name if c.isalnum() or c in "-_") or "stamp"
     return f"{safe}_{stamp}.{extension.lstrip('.')}"
+
+
+def _proof_html(document, warnings: list[str], screenshot: bytes | None) -> str:
+    """The readable handoff record shared by standalone and package PDF exports."""
+    image = ""
+    if screenshot:
+        encoded = base64.b64encode(screenshot).decode("ascii")
+        image = f'<p><img src="data:image/png;base64,{encoded}" width="480"></p>'
+    part = document.base
+    part_lines = []
+    if part is not None:
+        part_lines = [
+            ("Source", Path(part.source_path).name or "embedded project part"),
+            ("Kind", "Solid" if part.mode == "solid" else "Mesh"),
+            ("Bounding box", " × ".join(f"{value:.2f}" for value in part.bbox) + " mm"),
+        ]
+    rows = "".join(
+        "<tr>" + "".join(f"<td>{html.escape(str(value))}</td>" for value in values) + "</tr>"
+        for feature in document.features
+        for values in [
+            (
+                feature.name,
+                str(feature.operation.kind).title(),
+                f"{feature.operation.depth:.2f} mm",
+                feature.metadata.identifier,
+                feature.metadata.process,
+            )
+        ]
+    ) or "<tr><td colspan=\"5\">No marks are defined.</td></tr>"
+    facts = "".join(
+        f"<tr><th>{html.escape(caption)}</th><td>{html.escape(value)}</td></tr>"
+        for caption, value in part_lines
+    )
+    warning_rows = "".join(f"<li>{html.escape(warning)}</li>" for warning in warnings)
+    if not warning_rows:
+        warning_rows = "<li>No preflight warnings.</li>"
+    return f"""
+        <h1>Production proof — {html.escape(document.name)}</h1>
+        <p>Generated {html.escape(_dt.datetime.now().strftime('%Y-%m-%d %H:%M'))}.</p>
+        {image}
+        <h2>Part</h2><table>{facts}</table>
+        <h2>Marks</h2>
+        <table border=\"1\" cellspacing=\"0\" cellpadding=\"5\">
+          <tr><th>Name</th><th>Operation</th><th>Depth</th><th>ID</th><th>Process</th></tr>{rows}
+        </table>
+        <h2>Preflight</h2><ul>{warning_rows}</ul>
+    """
+
+
+def export_proof_sheet(
+    document: Document, path: str | Path, *, screenshot: bytes | None = None,
+    rebuild: RebuildResult | None = None,
+) -> ExportResult:
+    """Write a standalone PDF production proof with the current thumbnail and marks."""
+    if document.base is None:
+        raise ExportError("There is no part to document.")
+    fmt = "step" if document.base.mode == "solid" else "stl"
+    report = preflight_export(document, rebuild, fmt, path)
+    report.require_ok()
+    path = Path(path).with_suffix(".pdf")
+    try:
+        from PySide6.QtCore import QSizeF
+        from PySide6.QtGui import QPageSize, QPdfWriter, QTextDocument
+
+        writer = QPdfWriter(str(path))
+        writer.setPageSize(QPageSize(QSizeF(210, 297), QPageSize.Unit.Millimeter))
+        proof = QTextDocument()
+        proof.setHtml(_proof_html(document, report.warnings, screenshot))
+        proof.print_(writer)
+    except Exception as exc:
+        raise ExportError(f"Stamp could not create the production proof PDF: {exc}") from exc
+    return ExportResult(path=path, size_bytes=path.stat().st_size, warnings=report.warnings)
 
 
 def export_job_package(document, geometry: object, path: str | Path, *, fmt: str | None = None,

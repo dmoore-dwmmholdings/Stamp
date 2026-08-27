@@ -21,6 +21,7 @@ from OCP.gp import gp_Dir
 from OCP.Graphic3d import (
     Graphic3d_MaterialAspect,
     Graphic3d_NameOfMaterial_Aluminum,
+    Graphic3d_NameOfMaterial_Plastered,
     Graphic3d_TypeOfShadingModel,
 )
 from OCP.OpenGl import OpenGl_GraphicDriver
@@ -248,6 +249,7 @@ class Viewport(QWidget):
         color: tuple[float, float, float] | None = None,
         transparency: float = 0.0,
         material: bool = True,
+        matte: bool = False,
         selectable: bool = True,
         update: bool = True,
     ) -> AIS_Shape:
@@ -275,6 +277,12 @@ class Viewport(QWidget):
             # lines sit at the same depth as the surface and the surface wins.
             ais.SetPolygonOffsets(
                 int(Aspect_PolygonOffsetMode.Aspect_POM_Fill), 1.0, 1.0
+            )
+        elif matte:
+            # OCC's implicit material is noticeably glossy.  A plaster finish
+            # gives imported triangulations readable, neutral shading.
+            ais.SetMaterial(
+                Graphic3d_MaterialAspect(Graphic3d_NameOfMaterial_Plastered)
             )
         if transparency:
             ais.SetTransparency(transparency)

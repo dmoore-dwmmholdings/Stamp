@@ -1,6 +1,8 @@
 {
   "version": 1,
   "setup": [
-    "uv sync --locked"
+    "uv sync --locked",
+    "apt-get update",
+    "DEBIAN_FRONTEND=noninteractive apt-get install -y xdotool"
   ]
 }

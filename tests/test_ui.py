@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import os
 import sys
+from pathlib import Path
 
 import pytest
 
@@ -174,6 +175,22 @@ class TestPropertiesPanel:
         )
         panel.show_feature(Document(), feature, (36.0, 16.0), mesh_mode=True)
         assert "STEP file" in panel.blend_note.text()
+
+
+class TestPresetLibraryDialog:
+    def test_search_filters_by_tag_and_returns_selected_path(self, qtbot):
+        from stamp.io.presets import PresetInfo
+        from stamp.ui.dialogs import PresetLibraryDialog
+
+        serial = PresetInfo(Path("serial.stamp-preset"), "Serial plate", ("production", "text"), "add · text")
+        logo = PresetInfo(Path("logo.stamp-preset"), "Brand logo", ("profile", "cut"), "cut · profile")
+        dialog = PresetLibraryDialog([serial, logo])
+        qtbot.addWidget(dialog)
+
+        dialog.search.setText("production")
+
+        assert dialog.list.count() == 1
+        assert dialog.selected_path() == serial.path
 
 
 class TestFeatureTree:

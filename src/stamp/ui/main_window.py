@@ -33,7 +33,7 @@ from PySide6.QtWidgets import (
 )
 
 from stamp import __version__, diagnostics, reporting
-from stamp.batch import BatchError, run_batch
+from stamp.batch import BatchError, run_batch, simulate_batch
 from stamp.core import replace_part as replace_part_io
 from stamp.core import snapping
 from stamp.core.document import (
@@ -54,6 +54,7 @@ from stamp.core.document import (
     TextSpec,
     UndoStack,
 )
+from stamp.core.inspection import anchor_clearance_measurement, feature_dimensions, settings_for
 from stamp.core.profiles import ProfileCache
 from stamp.core.rebuild import RebuildEngine, RebuildResult
 from stamp.core.refs import (
@@ -99,6 +100,8 @@ RESULT_KEY = "result"
 PREVIEW_KEY = "preview"
 FOOTPRINT_KEY = "footprint"
 REGION_KEY = "mesh_region"
+DIMENSIONS_KEY = "inspection_dimensions"
+CLEARANCE_KEY = "inspection_clearance"
 
 #: A rebuild slower than this offers to draw the view more coarsely (§10).
 SLOW_REBUILD_MS = 10_000.0
@@ -107,6 +110,9 @@ ADD_COLOR = (0.36, 0.72, 0.42)
 CUT_COLOR = (0.82, 0.36, 0.32)
 PART_COLOR = (0.62, 0.66, 0.72)
 REGION_COLOR = (0.36, 0.62, 0.92)
+DIMENSIONS_COLOR = (0.25, 0.78, 0.94)
+CLEARANCE_OK_COLOR = (0.94, 0.70, 0.18)
+CLEARANCE_WARN_COLOR = (0.88, 0.28, 0.22)
 
 
 class MainWindow(QMainWindow):
@@ -285,12 +291,19 @@ class MainWindow(QMainWindow):
         )
         self.action_draft.toggled.connect(self.set_draft_display)
 
+        self.action_inspection = QAction("Inspect", self)
+        self.action_inspection.setCheckable(True)
+        self.action_inspection.setToolTip(
+            "Show the selected stamp's measured envelope and its nearest face-edge or hole clearance."
+        )
+        self.action_inspection.toggled.connect(self.set_inspection_visible)
+
         layout.addWidget(self.status_label)
         layout.addSpacing(16)
         layout.addWidget(self.warning_label, 1)
         layout.addWidget(self.progress)
         layout.addWidget(self.cancel_button)
-        for action in (self.action_preview, self.action_draft):
+        for action in (self.action_preview, self.action_inspection, self.action_draft):
             button = QToolButton()
             button.setDefaultAction(action)
             button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextOnly)
@@ -334,6 +347,7 @@ class MainWindow(QMainWindow):
         self.action_export_stl = add("Export STL", self.export_stl)
         self.action_export_3mf = add("Export 3MF", self.export_3mf)
         self.action_export_quote = add("Export for quote", self.export_for_quote)
+        self.action_export_proof = add("Export production proof", self.export_proof_sheet)
         self.action_export_package = add("Export job package", self.export_job_package)
         self.action_batch = add("Batch stamp", self.batch_stamp)
         bar.addSeparator()
@@ -613,6 +627,7 @@ class MainWindow(QMainWindow):
         self.action_export_3mf.setEnabled(has_part)
         self.action_export_package.setEnabled(has_part)
         self.action_export_quote.setEnabled(has_part)
+        self.action_export_proof.setEnabled(has_part)
         self.action_undo.setEnabled(self.undo_stack.can_undo())
         self.action_redo.setEnabled(self.undo_stack.can_redo())
         self.action_export_step.setToolTip(
@@ -984,10 +999,12 @@ class MainWindow(QMainWindow):
         if self.selected_feature is None:
             self._notify("Choose a stamp", "Select a feature in the tree before saving a preset.")
             return
-        from stamp.io.presets import save_preset
+        from stamp.io.presets import library_dir, save_preset
 
-        suggested = Path(self._last_dir("project")) / f"{self.selected_feature.name}.stamp-preset"
-        path, _ = QFileDialog.getSaveFileName(self, "Save stamp preset", str(suggested), "Stamp presets (*.stamp-preset)")
+        suggested = library_dir() / f"{self.selected_feature.name}.stamp-preset"
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save stamp preset", str(suggested), "Stamp presets (*.stamp-preset)"
+        )
         if not path:
             return
         try:
@@ -995,17 +1012,29 @@ class MainWindow(QMainWindow):
         except Exception as exc:
             self._notify("Stamp could not save the preset", str(exc))
             return
-        self._notify("Preset saved", f"Saved {written.name}.")
+        self._notify("Preset saved", f"Saved {written.name} to the preset library.")
 
     def insert_preset(self) -> None:
         if self.document.base is None:
             return
-        from stamp.io.presets import load_preset
+        from stamp.io.presets import list_preset_info, load_preset
 
-        path, _ = QFileDialog.getOpenFileName(
-            self, "Insert stamp preset", self._last_dir("project"), "Stamp presets (*.stamp-preset)"
-        )
-        if not path:
+        catalog = list_preset_info()
+        if catalog:
+            dialog = dialogs.PresetLibraryDialog(catalog, self)
+            if dialog.exec() != dialog.DialogCode.Accepted:
+                if not dialog.browse_external:
+                    return
+                path, _ = QFileDialog.getOpenFileName(
+                    self, "Insert stamp preset", self._last_dir("project"), "Stamp presets (*.stamp-preset)"
+                )
+            else:
+                path = dialog.selected_path()
+        else:
+            path, _ = QFileDialog.getOpenFileName(
+                self, "Insert stamp preset", self._last_dir("project"), "Stamp presets (*.stamp-preset)"
+            )
+        if path is None or not str(path):
             return
         try:
             feature = load_preset(path, Path(self._last_dir("project")) / ".stamp_presets")
@@ -1079,6 +1108,19 @@ class MainWindow(QMainWindow):
 
     def edit_inspection_limits(self) -> None:
         settings = self.document.inspection
+        from stamp.core.inspection import MANUFACTURING_RULESETS, apply_ruleset
+
+        choices = ["Custom", *MANUFACTURING_RULESETS]
+        selected, accepted = QInputDialog.getItem(
+            self, "Manufacturing limits", "Ruleset", choices, 0, False
+        )
+        if not accepted:
+            return
+        if selected != "Custom":
+            self._push_undo(f"{selected.lower()} ruleset")
+            apply_ruleset(settings, selected)
+            self.statusBar().showMessage(f"Applied {selected} ruleset. You can refine it next time.", 5000)
+            return
         detail, accepted = QInputDialog.getDouble(
             self, "Manufacturing limits", "Minimum detail (mm)", settings.min_detail_mm, 0.01, 100.0, 3
         )
@@ -1337,6 +1379,7 @@ class MainWindow(QMainWindow):
             feature.placement.mirror_u = template.placement.mirror_u
             feature.placement.mirror_v = template.placement.mirror_v
             feature.placement.lift = template.placement.lift
+            feature.placement.mode = template.placement.mode
         self._push_undo("add feature")
         self.document.add_feature(feature)
         self._pending_profile = None
@@ -1900,7 +1943,14 @@ class MainWindow(QMainWindow):
                 shape = self._mesh_display_shape(geometry)
             except Exception:
                 return
-            self.viewport.display_shape(RESULT_KEY, shape, color=PART_COLOR)
+            # A mesh is one triangulated face.  The aluminium material and
+            # per-face boundary treatment used for B-rep solids makes every
+            # triangle compete with the surface lighting, producing a washed
+            # out, faceted result.  Keep mesh shading neutral and let region
+            # highlighting provide the interaction feedback.
+            self.viewport.display_shape(
+                RESULT_KEY, shape, color=PART_COLOR, material=False, matte=True
+            )
 
     def _mesh_display_shape(self, manifold):
         """Draw a very large mesh from a reduced copy, keeping the full one (§5.2).
@@ -1939,6 +1989,7 @@ class MainWindow(QMainWindow):
         """The translucent tool solid, green for add and red for cut (§6.3)."""
         self.viewport.erase(PREVIEW_KEY, update=False)
         self.viewport.erase(FOOTPRINT_KEY, update=False)
+        self._show_inspection_overlay(update=False)
 
         feature = self.selected_feature
         if not self._preview_on or feature is None or self._last_result is None:
@@ -1958,6 +2009,70 @@ class MainWindow(QMainWindow):
             FOOTPRINT_KEY, result.tool.footprint, color=color, transparency=0.25,
             material=False, selectable=False, update=True,
         )
+        if feature.placement.mode.value == "wrap":
+            self.statusBar().showMessage(
+                "Curved-face proof: the translucent stamp follows the selected cylindrical or conical face.",
+                5000,
+            )
+
+    def set_inspection_visible(self, on: bool) -> None:
+        """Toggle the selected tool's manufacturing measurement overlay."""
+        self._show_inspection_overlay(update=True)
+        if on:
+            self.statusBar().showMessage(
+                "Inspection overlay shows the rebuilt envelope and nearest face boundary clearance."
+            )
+        else:
+            self._refresh_status()
+
+    def _show_inspection_overlay(self, *, update: bool) -> None:
+        """Draw the real tool envelope and an exact face-boundary clearance line."""
+        self.viewport.erase(DIMENSIONS_KEY, update=False)
+        self.viewport.erase(CLEARANCE_KEY, update=False)
+        feature = self.selected_feature
+        result = self._last_result.result_for(feature.id) if feature and self._last_result else None
+        if not self.action_inspection.isChecked() or feature is None or result is None or result.tool is None:
+            if update and self.viewport.context:
+                self.viewport.context.UpdateCurrentViewer()
+            return
+        try:
+            from OCP.Bnd import Bnd_Box
+            from OCP.BRepBndLib import BRepBndLib
+            from OCP.BRepBuilderAPI import BRepBuilderAPI_MakePolygon
+            from OCP.BRepPrimAPI import BRepPrimAPI_MakeBox
+            from OCP.gp import gp_Pnt
+
+            box = Bnd_Box()
+            BRepBndLib.Add_s(result.tool.shape, box)
+            if not box.IsVoid():
+                x0, y0, z0, x1, y1, z1 = box.Get()
+                envelope = BRepPrimAPI_MakeBox(gp_Pnt(x0, y0, z0), gp_Pnt(x1, y1, z1)).Shape()
+                self.viewport.display_shape(
+                    DIMENSIONS_KEY, envelope, color=DIMENSIONS_COLOR, transparency=0.88,
+                    material=False, selectable=False, update=False,
+                )
+                dimensions = feature_dimensions(result.tool.shape)
+                if dimensions is not None:
+                    self.status_label.setText(
+                        f"Inspect: {dimensions.width_mm:.2f} × {dimensions.height_mm:.2f} × {dimensions.depth_mm:.2f} mm"
+                    )
+            measurement = anchor_clearance_measurement(self.document, feature)
+            if measurement is not None:
+                line = BRepBuilderAPI_MakePolygon()
+                line.Add(gp_Pnt(*measurement.origin))
+                line.Add(gp_Pnt(*measurement.boundary))
+                if line.IsDone():
+                    color = (CLEARANCE_WARN_COLOR if measurement.distance_mm < settings_for(self.document, feature).min_clearance_mm
+                             else CLEARANCE_OK_COLOR)
+                    self.viewport.display_shape(
+                        CLEARANCE_KEY, line.Wire(), color=color, material=False,
+                        selectable=False, update=False,
+                    )
+        except Exception:
+            # Measurements are guidance; a display failure must never block a rebuild.
+            pass
+        if update and self.viewport.context:
+            self.viewport.context.UpdateCurrentViewer()
 
     # -------------------------------------------------------------- undo, redo
 
@@ -2264,6 +2379,28 @@ class MainWindow(QMainWindow):
         if self.interactive:
             dialogs.inform(self, "Quote files written", f"Written to {folder}:\n\n{names}")
 
+    def export_proof_sheet(self) -> None:
+        """Write the compact, reviewable production sheet without exporting geometry."""
+        if self.document.base is None:
+            return
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Export production proof",
+            str(Path(self._last_dir("export")) / f"{self.document.name}-proof.pdf"),
+            "PDF files (*.pdf)",
+        )
+        if not path:
+            return
+        try:
+            result = export_io.export_proof_sheet(
+                self.document, path, screenshot=self._thumbnail(), rebuild=self._last_result
+            )
+        except export_io.ExportError as exc:
+            self._notify("Stamp could not write the production proof", str(exc))
+            return
+        self._remember_dir("export", Path(path))
+        self._report_export(result)
+
     def export_job_package(self) -> None:
         if self.document.base is None:
             return
@@ -2305,13 +2442,27 @@ class MainWindow(QMainWindow):
         )
         if not csv_path:
             return
+        fmt, accepted = QInputDialog.getItem(self, "Batch format", "Export format", ["step", "stl", "3mf"], 0, False)
+        if not accepted:
+            return
+        try:
+            simulation = simulate_batch(template, csv_path, fmt)
+        except BatchError as exc:
+            self._notify("Batch simulation could not start", str(exc))
+            return
+        failed = [row for row in simulation.rows if row.status == "failed"]
+        if failed:
+            first = failed[0]
+            self._notify("Batch simulation found a problem", f"Row {first.index}: {first.detail}")
+            return
         folder = QFileDialog.getExistingDirectory(
             self, "Choose batch output folder", self._last_dir("export")
         )
         if not folder:
             return
-        fmt, accepted = QInputDialog.getItem(self, "Batch format", "Export format", ["step", "stl", "3mf"], 0, False)
-        if not accepted:
+        if not self._confirm(
+            "Batch simulation", f"{len(simulation.rows)} row(s) are ready. Start the batch?"
+        ):
             return
         try:
             report = run_batch(template, csv_path, folder, fmt)

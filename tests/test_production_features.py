@@ -43,6 +43,14 @@ def test_qr_and_data_matrix_become_vector_profiles():
         assert not profile.blocked
 
 
+def test_generated_codes_are_decoded_again_before_manufacturing():
+    from stamp.io.code_profile import verify_code
+
+    for kind in (CodeKind.QR, CodeKind.DATA_MATRIX):
+        verification = verify_code(CodeSpec(kind=kind, payload="STAMP-0042", quiet_zone=4))
+        assert verification.readable, verification.detail
+
+
 def test_inspection_warns_for_small_code_and_depth():
     feature = Feature(profile=ProfileRef(code=CodeSpec(module_mm=0.1)), name="Code")
     feature.operation.depth = 0.1

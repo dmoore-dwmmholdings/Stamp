@@ -8,7 +8,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import QSize, Qt
+from PySide6.QtGui import QColor, QIcon, QPainter, QPixmap
 from PySide6.QtWidgets import (
     QCheckBox,
     QColorDialog,
@@ -31,10 +32,103 @@ from PySide6.QtWidgets import (
 )
 
 from stamp.io.normalize import Issue, IssueKind
+from stamp.io.presets import PresetInfo
 from stamp.units import TO_MM
 
 UNIT_CHOICES = [("Millimetres", "mm"), ("Centimetres", "cm"), ("Inches", "in"),
                 ("Metres", "m"), ("Feet", "ft")]
+
+
+class PresetLibraryDialog(QDialog):
+    """Search the local single-feature library before placing a preset."""
+
+    def __init__(self, presets: list[PresetInfo], parent=None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Stamp preset library")
+        self.setMinimumWidth(500)
+        self._presets = presets
+        self.browse_external = False
+
+        layout = QVBoxLayout(self)
+        note = QLabel("Search by name or tag, then choose a preset to place on a face.")
+        note.setWordWrap(True)
+        layout.addWidget(note)
+
+        self.search = QLineEdit()
+        self.search.setPlaceholderText("Search presets and tags")
+        self.search.textChanged.connect(self._filter)
+        layout.addWidget(self.search)
+
+        self.list = QListWidget()
+        self.list.itemDoubleClicked.connect(lambda _item: self.accept())
+        layout.addWidget(self.list)
+
+        self.empty = QLabel("No saved presets match this search.")
+        self.empty.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.empty.setStyleSheet("color: #8a8f98;")
+        layout.addWidget(self.empty)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Open | QDialogButtonBox.StandardButton.Cancel
+        )
+        browse = buttons.addButton("Browse file…", QDialogButtonBox.ButtonRole.ActionRole)
+        browse.clicked.connect(self._browse)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+        self._filter()
+
+    def _browse(self) -> None:
+        self.browse_external = True
+        self.reject()
+
+    @staticmethod
+    def _preview(info: PresetInfo) -> QIcon:
+        """A compact, stable preview that also works for missing external artwork."""
+        tags = {tag.lower() for tag in info.tags}
+        if "text" in tags:
+            letter, color = "T", "#4f86c6"
+        elif "code" in tags:
+            letter, color = "#7a5db4"
+        elif "add" in tags:
+            letter, color = "+", "#4f9a62"
+        else:
+            letter, color = "−", "#c56a5e"
+        pixmap = QPixmap(QSize(44, 44))
+        pixmap.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(pixmap)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setBrush(QColor(color))
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.drawRoundedRect(2, 2, 40, 40, 7, 7)
+        painter.setPen(QColor("white"))
+        font = painter.font()
+        font.setBold(True)
+        font.setPointSize(17)
+        painter.setFont(font)
+        painter.drawText(pixmap.rect(), Qt.AlignmentFlag.AlignCenter, letter)
+        painter.end()
+        return QIcon(pixmap)
+
+    def _filter(self) -> None:
+        needle = self.search.text().casefold().strip()
+        self.list.clear()
+        for info in self._presets:
+            haystack = " ".join((info.name, info.summary, *info.tags)).casefold()
+            if needle and needle not in haystack:
+                continue
+            item = QListWidgetItem(self._preview(info), info.name)
+            item.setData(Qt.ItemDataRole.UserRole, str(info.path))
+            item.setToolTip(info.summary)
+            item.setSizeHint(QSize(0, 54))
+            self.list.addItem(item)
+        self.empty.setVisible(self.list.count() == 0)
+        if self.list.count():
+            self.list.setCurrentRow(0)
+
+    def selected_path(self) -> Path | None:
+        item = self.list.currentItem()
+        return Path(item.data(Qt.ItemDataRole.UserRole)) if item is not None else None
 
 
 class UnitPromptDialog(QDialog):

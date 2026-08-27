@@ -8,6 +8,7 @@ other Stamp profile rather than becoming a bitmap or texture.
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass
 
 from OCP.BRepBuilderAPI import BRepBuilderAPI_MakeEdge
 from OCP.gp import gp_Pnt
@@ -18,6 +19,14 @@ from stamp.io.normalize import Issue, IssueKind, Profile, normalize_groups, unio
 
 class CodeProfileError(RuntimeError):
     pass
+
+
+@dataclass(frozen=True)
+class CodeVerification:
+    """Result of rasterizing a generated mark and decoding it again."""
+
+    readable: bool
+    detail: str = ""
 
 
 def _matrix(spec: CodeSpec):
@@ -84,4 +93,39 @@ def build_code_profile(spec: CodeSpec) -> Profile:
     return profile
 
 
-__all__ = ["CodeProfileError", "build_code_profile"]
+def verify_code(spec: CodeSpec) -> CodeVerification:
+    """Prove the generated module grid decodes to the intended payload.
+
+    The test image includes the requested quiet zone and square modules. It is a
+    digital verifier, not a substitute for physical-process qualification.
+    """
+    if spec.quiet_zone < 1:
+        return CodeVerification(False, "the requested mark has no quiet zone")
+    try:
+        import numpy as np
+        import zxingcpp
+
+        matrix = _matrix(spec)
+        if not matrix or not matrix[0]:
+            return CodeVerification(False, "the generated code has no modules")
+        scale = 12
+        quiet = spec.quiet_zone * scale
+        rows, columns = len(matrix), len(matrix[0])
+        image = np.full((rows * scale + quiet * 2, columns * scale + quiet * 2), 255, dtype=np.uint8)
+        for row, values in enumerate(matrix):
+            for column, dark in enumerate(values):
+                if dark:
+                    image[quiet + row * scale:quiet + (row + 1) * scale,
+                          quiet + column * scale:quiet + (column + 1) * scale] = 0
+        fmt = zxingcpp.BarcodeFormat.QRCode if spec.kind is CodeKind.QR else zxingcpp.BarcodeFormat.DataMatrix
+        decoded = zxingcpp.read_barcode(image, formats=fmt, is_pure=True)
+        if decoded is None:
+            return CodeVerification(False, "ZXing could not decode the generated module grid")
+        if decoded.text != spec.payload:
+            return CodeVerification(False, "decoded payload did not match the requested payload")
+        return CodeVerification(True)
+    except Exception as exc:
+        return CodeVerification(False, str(exc))
+
+
+__all__ = ["CodeProfileError", "CodeVerification", "build_code_profile", "verify_code"]
