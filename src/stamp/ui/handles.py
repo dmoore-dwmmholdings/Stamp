@@ -182,12 +182,17 @@ class HandleOverlay(QObject):
         return corners, edges, rotation_point
 
     def _pixels_to_mm(self, pixels: float) -> float:
-        """Convert a pixel distance to millimetres at the current zoom."""
+        """Convert a screen distance to millimetres at the current zoom.
+
+        The constants here are screen pixels, so they go through the viewport on
+        the way in: on a scaled display a handle drawn at its raw number would come
+        out two thirds the size it is meant to be.
+        """
         view = self.viewport.view
         if view is None:
             return pixels * 0.1
         try:
-            return abs(view.Convert(int(pixels)))
+            return abs(view.Convert(self.viewport.device_px(pixels)))
         except Exception:
             return pixels * 0.1
 
@@ -217,6 +222,8 @@ class HandleOverlay(QObject):
             FRAME_KEY, compound, color=FRAME_COLOR, material=False,
             selectable=False, update=False,
         )
+        if ais is None:
+            return
         from OCP.Aspect import Aspect_TypeOfLine
 
         aspect = Prs3d_LineAspect(
@@ -238,6 +245,8 @@ class HandleOverlay(QObject):
             HANDLE_KEY, compound, color=HANDLE_COLOR, material=False,
             selectable=False, update=True,
         )
+        if ais is None:
+            return
         aspect = Prs3d_PointAspect(
             Aspect_TypeOfMarker.Aspect_TOM_O_POINT,
             Quantity_Color(*HANDLE_COLOR, Quantity_TOC_RGB),
@@ -256,6 +265,8 @@ class HandleOverlay(QObject):
             SNAP_KEY, vertex, color=SNAP_COLOR, material=False,
             selectable=False, update=True,
         )
+        if ais is None:
+            return
         aspect = Prs3d_PointAspect(
             Aspect_TypeOfMarker.Aspect_TOM_STAR,
             Quantity_Color(*SNAP_COLOR, Quantity_TOC_RGB),
@@ -294,18 +305,21 @@ class HandleOverlay(QObject):
             px, py = view.Convert(vx, vy)
         except Exception:
             return None
-        return QPoint(int(px), int(py))
+        # Convert() answers in device pixels; callers compare this with Qt event
+        # positions, which are logical.
+        return QPoint(
+            int(self.viewport.logical_px(px)), int(self.viewport.logical_px(py))
+        )
 
     def _uv_at(self, position: QPoint) -> tuple[float, float] | None:
         """Intersect the cursor ray with the sketch plane."""
-        view = self.viewport.view
         plane = self._plane()
-        if view is None or plane is None:
+        if plane is None:
             return None
-        try:
-            px, py, pz, dx, dy, dz = view.ConvertWithProj(position.x(), position.y())
-        except Exception:
+        ray = self.viewport.ray_at(position.x(), position.y())
+        if ray is None:
             return None
+        (px, py, pz), (dx, dy, dz) = ray
 
         nx, ny, nz = plane.normal
         denominator = dx * nx + dy * ny + dz * nz

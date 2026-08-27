@@ -152,6 +152,8 @@ class MainWindow(QMainWindow):
         self._auto_value_attempts: dict[str, int] = {}
         self._auto_value_note = ""
         self._mesh_region = None
+        #: Why the 3D view could not start, or None while it is fine.
+        self._viewport_error: str | None = None
         self._undo_baseline = self.document.snapshot()
 
         #: When False, every dialog answers itself with its default and every
@@ -165,6 +167,7 @@ class MainWindow(QMainWindow):
 
         self._build_ui()
         self._build_actions()
+        self._build_menus()
         self._wire()
         self._update_enabled_state()
 
@@ -195,7 +198,7 @@ class MainWindow(QMainWindow):
         splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 1)
         splitter.setStretchFactor(2, 0)
-        splitter.setSizes([230, 810, 400])
+        splitter.setSizes([230, 760, 450])
         self.setCentralWidget(splitter)
 
         self.setStatusBar(QStatusBar())
@@ -257,7 +260,30 @@ class MainWindow(QMainWindow):
         return page
 
     def _show_viewport(self) -> None:
+        if self._viewport_error is not None:
+            return
         self._center.setCurrentWidget(self._viewport_page)
+
+    def _on_viewport_failed(self, reason: str) -> None:
+        """Say the 3D view is gone, once, and stop switching to it.
+
+        The rest of Stamp still works without a viewer - a file opens, a feature
+        builds, an export writes - so the app stays up and says what is missing
+        instead of stopping at launch.
+        """
+        if self._viewport_error is not None:
+            return
+        self._viewport_error = reason
+        self.viewport.hide()
+        self._center.setCurrentIndex(0)
+        where = diagnostics.log_path()
+        tail = f" The log is at {where}." if where else ""
+        self.statusBar().showMessage(f"The 3D view could not start: {reason}.{tail}")
+        self._notify(
+            "The 3D view could not start",
+            "Stamp cannot open a 3D window on this machine, so the part cannot be "
+            f"shown. Everything else still works.\n\n{reason}{tail}",
+        )
 
     def _build_status_strip(self) -> QWidget:
         strip = QWidget()
@@ -453,6 +479,67 @@ class MainWindow(QMainWindow):
             )
         self._hidden_action("Cancel", self._cancel_pending, "Esc")
 
+    def _build_menus(self) -> None:
+        """Put every command somewhere it can be found and clicked.
+
+        The toolbar holds more than fits: at an ordinary 1400 px window Qt moves
+        seventeen commands into the overflow chevron, and that menu shuts again at
+        each layout pass - so Export STEP, which has no shortcut either, had no
+        working path at all.  These are the same QAction objects the toolbar uses,
+        so nothing here duplicates state; a menu is just a second way in.
+        """
+        bar = self.menuBar()
+
+        file_menu = bar.addMenu("&File")
+        file_menu.addAction(self.action_open_part)
+        file_menu.addAction(self.action_open_project)
+        file_menu.addAction(self.action_save)
+        file_menu.addSeparator()
+        file_menu.addAction(self.action_replace_part)
+        file_menu.addAction(self.action_relink)
+        file_menu.addSeparator()
+        file_menu.addAction(self.action_batch)
+
+        edit_menu = bar.addMenu("&Edit")
+        edit_menu.addAction(self.action_undo)
+        edit_menu.addAction(self.action_redo)
+
+        insert_menu = bar.addMenu("&Insert")
+        insert_menu.addAction(self.action_add_profile)
+        insert_menu.addAction(self.action_add_text)
+        insert_menu.addAction(self.action_add_code)
+        insert_menu.addSeparator()
+        insert_menu.addAction(self.action_save_preset)
+        insert_menu.addAction(self.action_insert_preset)
+        insert_menu.addSeparator()
+        insert_menu.addAction(self.action_align_edge)
+        insert_menu.addAction(self.action_origin_vertex)
+        insert_menu.addAction(self.action_origin_hole)
+        insert_menu.addAction(self.action_create_datum)
+        insert_menu.addAction(self.action_place_datum)
+
+        export_menu = bar.addMenu("E&xport")
+        for action in (
+            self.action_export_step,
+            self.action_export_stl,
+            self.action_export_3mf,
+            self.action_export_quote,
+            self.action_export_proof,
+            self.action_export_package,
+        ):
+            export_menu.addAction(action)
+
+        view_menu = bar.addMenu("&View")
+        view_menu.addAction(self.action_preview)
+        view_menu.addAction(self.action_inspection)
+        view_menu.addAction(self.action_draft)
+        view_menu.addSeparator()
+        view_menu.addAction(self.action_inspection_limits)
+
+        help_menu = bar.addMenu("&Help")
+        help_menu.addAction(self.action_report_bug)
+        help_menu.addAction(self.action_report_crash)
+
     def _hidden_action(self, text: str, slot, shortcut: str) -> QAction:
         action = QAction(text, self)
         action.setShortcut(QKeySequence(shortcut))
@@ -478,6 +565,7 @@ class MainWindow(QMainWindow):
         self.viewport.picked.connect(self._on_picked)
         self.viewport.nothing_picked.connect(self._on_nothing_picked)
         self.viewport.view_changed.connect(self.handles.refresh)
+        self.viewport.init_failed.connect(self._on_viewport_failed)
 
         self.tree.feature_selected.connect(self._on_feature_selected)
         self.tree.modifier_selected.connect(lambda fid, _mid: self._on_feature_selected(fid))
@@ -1384,6 +1472,9 @@ class MainWindow(QMainWindow):
         self.document.add_feature(feature)
         self._pending_profile = None
         self._pending_feature_template = None
+        # The prompt that asked for this click has been answered.  Left up, it goes
+        # on telling the user to click a face to place something already placed.
+        self.statusBar().showMessage(f"Placed {feature.name}.")
 
         if warnings:
             self._notify("Note about this face", "\n\n".join(warnings))
