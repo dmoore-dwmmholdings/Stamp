@@ -8,6 +8,7 @@ display is available.
 from __future__ import annotations
 
 import os
+import sys
 
 import pytest
 
@@ -52,6 +53,7 @@ def a_feature(name: str = "Logo") -> Feature:
 
 
 class TestViewportWindowBinding:
+    @pytest.mark.skipif(sys.platform != "linux", reason="covers the Linux X11 binding")
     def test_linux_window_binding_receives_an_integer_handle(self, monkeypatch, qtbot):
         """OCP 7.9's X11 wrapper rejects the PyCapsule used by older bindings."""
         import OCP.Xw as xw
