@@ -65,7 +65,27 @@ class NumberField(QDoubleSpinBox):
         self.setKeyboardTracking(False)
         self.setButtonSymbols(QDoubleSpinBox.ButtonSymbols.UpDownArrows)
         self.setAlignment(Qt.AlignmentFlag.AlignRight)
-        self.setMinimumWidth(88)
+        self.setMinimumWidth(self._room_for_a_value())
+
+    def _room_for_a_value(self) -> int:
+        """The width a signed three-digit value and its unit need, measured.
+
+        QAbstractSpinBox works out its own minimum from the value text alone and
+        leaves the suffix out of it, so a fixed 88 px let the grid squeeze these
+        fields until every "mm" was cut down to "m" and "%" disappeared.  Take the
+        chrome - arrows and frame - out of the preferred width, which does count
+        the suffix, and put a realistic widest value in front of it.  The whole
+        +-1e6 range is not that value: it is far wider than the panel can give.
+        """
+        metrics = self.fontMetrics()
+        whole_range = max(
+            self.textFromValue(self.minimum()), self.textFromValue(self.maximum()), key=len
+        )
+        chrome = self.sizeHint().width() - metrics.horizontalAdvance(
+            f"{self.prefix()}{whole_range}{self.suffix()} "
+        )
+        widest = f"{self.prefix()}-888.{'8' * self.decimals()}{self.suffix()}"
+        return metrics.horizontalAdvance(widest) + max(chrome, 0)
 
     def set_silently(self, value: float) -> None:
         blocked = self.blockSignals(True)
@@ -88,8 +108,9 @@ class PropertiesPanel(QScrollArea):
         super().__init__(parent)
         self.setWidgetResizable(True)
         self.setFrameShape(QFrame.Shape.NoFrame)
-        # Wide enough for the font list and a value beside its caption.
-        self.setMinimumWidth(330)
+        # Wide enough for the font list, and for a value with its unit beside its
+        # caption - two of those side by side is what sets the number.
+        self.setMinimumWidth(450)
 
         self._document: Document | None = None
         self._feature: Feature | None = None

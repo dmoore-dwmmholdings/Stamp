@@ -82,6 +82,100 @@ class TestViewportWindowBinding:
         assert captured["handle"] == 12345
         assert type(captured["handle"]) is int
 
+    @pytest.mark.skipif(sys.platform != "win32", reason="covers the Windows HWND binding")
+    def test_windows_window_binding_receives_a_pointer_capsule(self, monkeypatch, qtbot):
+        """OCP 7.9 binds the HWND as a pointer, so an int is refused."""
+        import ctypes
+
+        import OCP.WNT as wnt
+
+        from stamp.ui import viewport as viewport_module
+        from stamp.ui.viewport import Viewport
+
+        captured: dict[str, object] = {}
+        sentinel = object()
+
+        def fake_window(handle):
+            captured["handle"] = handle
+            return sentinel
+
+        monkeypatch.setattr(viewport_module.platform, "system", lambda: "Windows")
+        monkeypatch.setattr(Viewport, "winId", lambda _self: 12345)
+        monkeypatch.setattr(wnt, "WNT_Window", fake_window)
+
+        widget = Viewport()
+        qtbot.addWidget(widget)
+
+        assert widget._make_window() is sentinel
+        handle = captured["handle"]
+        assert type(handle).__name__ == "PyCapsule"
+        get = ctypes.pythonapi.PyCapsule_GetPointer
+        get.restype = ctypes.c_void_p
+        get.argtypes = [ctypes.py_object, ctypes.c_char_p]
+        assert get(handle, None) == 12345
+
+    def test_a_viewer_that_cannot_start_reports_once_and_stops_trying(self, qtbot):
+        """The failure used to repaint, raise, and open another error box forever."""
+        from stamp.ui.viewport import Viewport
+
+        widget = Viewport()
+        qtbot.addWidget(widget)
+
+        attempts: list[int] = []
+
+        def explode() -> None:
+            attempts.append(1)
+            raise RuntimeError("no GL here")
+
+        widget._start_viewer = explode
+        reasons: list[str] = []
+        widget.init_failed.connect(reasons.append)
+
+        widget._init_viewer()
+        widget._init_viewer()
+        widget.paintEvent(None)
+
+        assert len(attempts) == 1
+        assert reasons == ["RuntimeError: no GL here"]
+        assert widget.context is None
+        # A dead viewport shows nothing rather than raising on every later call.
+        from OCP.BRepPrimAPI import BRepPrimAPI_MakeBox
+
+        box = BRepPrimAPI_MakeBox(1.0, 1.0, 1.0).Shape()
+        assert widget.display_shape("part", box) is None
+    def test_a_scaled_display_picks_where_the_user_clicked(self, qtbot, monkeypatch):
+        """OCC's view is sized in device pixels; a Qt click arrives in logical ones.
+
+        At 150% - the ordinary Windows laptop setting - handing one to the other put
+        every click a third of the way up and left of the cursor.
+        """
+        from PySide6.QtCore import QPoint
+
+        from stamp.ui.viewport import Viewport
+
+        widget = Viewport()
+        qtbot.addWidget(widget)
+        monkeypatch.setattr(Viewport, "devicePixelRatioF", lambda _self: 1.5)
+
+        moves: list[tuple[int, int]] = []
+
+        class FakeContext:
+            def MoveTo(self, x, y, view, update):  # noqa: N802 - OCC naming
+                moves.append((x, y))
+
+            def Select(self, _update):  # noqa: N802
+                pass
+
+            def HasDetected(self):  # noqa: N802
+                return False
+
+        widget.context = FakeContext()
+        widget.view = object()
+        widget._do_pick(QPoint(100, 200), additive=False)
+
+        assert moves == [(150, 300)]
+        assert widget.logical_px(150) == pytest.approx(100)
+
 
 class TestPropertiesPanel:
     @pytest.fixture
@@ -91,6 +185,60 @@ class TestPropertiesPanel:
         widget = PropertiesPanel()
         qtbot.addWidget(widget)
         return widget
+
+    def test_a_field_squeezed_to_its_minimum_still_shows_its_unit(self, qtbot):
+        """A fixed 88 px minimum left no room for the suffix Qt does not measure."""
+        from PySide6.QtWidgets import QHBoxLayout, QWidget
+
+        from stamp.ui.properties import NumberField
+
+        field = NumberField()
+        field.setValue(888.88)
+
+        # Hold the field in a child pinned to its own minimum, which is what the
+        # panel's grid does to it.  The squeeze has to happen inside a window, not
+        # to one: Windows will not let a top-level window go this narrow.
+        window = QWidget()
+        qtbot.addWidget(window)
+        outer = QHBoxLayout(window)
+        pinned = QWidget(window)
+        pinned.setFixedWidth(field.minimumWidth())
+        row = QHBoxLayout(pinned)
+        row.setContentsMargins(0, 0, 0, 0)
+        row.addWidget(field)
+        outer.addWidget(pinned)
+        outer.addStretch(1)
+        window.resize(400, 80)
+        window.show()
+        qtbot.waitExposed(window)
+
+        text = field.lineEdit().text()
+        assert text.endswith("mm")
+        assert field.fontMetrics().horizontalAdvance(text) <= (
+            field.lineEdit().contentsRect().width()
+        )
+
+    def test_unit_suffixes_survive_a_panel_at_its_minimum_width(self, panel, qtbot):
+        """A fixed 88 px minimum let the grid cut every "mm" down to "m"."""
+        from stamp.ui.properties import NumberField
+
+        feature = a_feature()
+        panel.show_feature(Document(), feature, (36.0, 16.0))
+        panel.resize(panel.minimumWidth(), 900)
+        panel.show()
+        qtbot.waitExposed(panel)
+
+        assert not panel.horizontalScrollBar().isVisible()
+        clipped = []
+        for field in panel.findChildren(NumberField):
+            if not field.isVisible():
+                continue
+            text = field.lineEdit().text()
+            if field.fontMetrics().horizontalAdvance(text) > (
+                field.lineEdit().contentsRect().width()
+            ):
+                clipped.append(text)
+        assert clipped == []
 
     def test_width_and_height_stay_in_proportion(self, panel, qtbot):
         """Editing W with the lock on updates H and the scale (§6.2)."""

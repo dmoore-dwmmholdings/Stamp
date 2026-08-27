@@ -7,6 +7,7 @@ platform window object (WNT_Window / Xw_Window / Cocoa_Window).
 
 from __future__ import annotations
 
+import ctypes
 import platform
 
 from OCP.AIS import AIS_DisplayMode, AIS_InteractiveContext, AIS_Shaded, AIS_Shape
@@ -38,6 +39,8 @@ from PySide6.QtCore import QPoint, Qt, QTimer, Signal
 from PySide6.QtGui import QMouseEvent, QResizeEvent, QWheelEvent
 from PySide6.QtWidgets import QWidget
 
+from stamp import diagnostics
+
 #: Face boundary edges.  They are what makes a contour readable on a shaded solid.
 #: This one is sRGB, not the linear RGB the other colors here use: Quantity_TOC_RGB
 #: takes linear values, so a "dark" triple given that way comes out mid-gray.
@@ -54,6 +57,22 @@ PRESET_VIEWS: dict[str, V3d_TypeOfOrientation] = {
     "bottom": V3d_TypeOfOrientation.V3d_TypeOfOrientation_Zup_Bottom,
     "iso": V3d_TypeOfOrientation.V3d_TypeOfOrientation_Zup_AxoRight,
 }
+
+
+def _pointer_handle(handle: int):
+    """Wrap a native window handle in a PyCapsule.
+
+    OCP 7.9 binds OCCT's window handle as a raw pointer on Windows (an ``HWND``)
+    and on macOS (an ``NSView*``), and pybind11 accepts only a PyCapsule for a
+    pointer argument - an int raises ``TypeError``.  X11 is the exception: an
+    ``XID`` really is an integer there, so the Linux path passes the int through
+    unchanged (see :meth:`Viewport._make_window`).
+    """
+    new_capsule = ctypes.pythonapi.PyCapsule_New
+    new_capsule.restype = ctypes.py_object
+    new_capsule.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_void_p]
+    return new_capsule(ctypes.c_void_p(handle), None, None)
+
 
 SELECTION_MODES: dict[str, TopAbs_ShapeEnum] = {
     "shape": TopAbs_ShapeEnum.TopAbs_SHAPE,
@@ -75,9 +94,13 @@ class Viewport(QWidget):
         the cursor.  The sub-shape kind follows :meth:`set_selection_mode`.
     nothing_picked
         The user clicked empty space, which clears the selection.
+    init_failed
+        The viewer could not start.  Sent once, with the reason.
     """
 
     ready = Signal()
+    #: The viewer could not start; the argument says why.  Emitted at most once.
+    init_failed = Signal(str)
     picked = Signal(object, object)
     nothing_picked = Signal()
     view_changed = Signal()
@@ -96,6 +119,7 @@ class Viewport(QWidget):
         self.setMinimumSize(320, 240)
 
         self._initialised = False
+        self._init_failed = False
         self._selection_mode = "face"
         self._drag_start: QPoint | None = None
         self._drag_kind: str | None = None
@@ -150,9 +174,35 @@ class Viewport(QWidget):
     # -------------------------------------------------------------- viewer setup
 
     def _init_viewer(self) -> None:
-        if self._initialised:
+        """Start the viewer once, and never retry a start that has failed.
+
+        Every repaint calls this until the viewer exists, so a viewer that cannot
+        start raises again on every frame - and the error dialog Stamp shows in
+        answer repaints the widget under it, which raises again.  That is how one
+        bad window handle became an endless stack of error boxes at launch.  A
+        failure now disables the viewport and reports itself exactly once.
+        """
+        if self._initialised or self._init_failed:
+            return
+        try:
+            self._start_viewer()
+        except Exception as exc:  # noqa: BLE001 - no OCC failure may loop
+            self._init_failed = True
+            self.viewer = None
+            self.view = None
+            self.context = None
+            self._window = None
+            diagnostics.note_exception("viewport startup", exc)
+            self.init_failed.emit(f"{type(exc).__name__}: {exc}")
             return
 
+        self._initialised = True
+        self._sync_window_size()
+        QTimer.singleShot(0, lambda: self._sync_window_size(refit=True))
+        QTimer.singleShot(60, lambda: self._sync_window_size(refit=True))
+        self.ready.emit()
+
+    def _start_viewer(self) -> None:
         self._display_connection = Aspect_DisplayConnection()
         self._driver = OpenGl_GraphicDriver(self._display_connection)
 
@@ -183,12 +233,6 @@ class Viewport(QWidget):
             0.08,
         )
         self.view.SetProj(PRESET_VIEWS["iso"])
-        self._initialised = True
-        self._sync_window_size()
-        QTimer.singleShot(0, lambda: self._sync_window_size(refit=True))
-        QTimer.singleShot(60, lambda: self._sync_window_size(refit=True))
-
-        self.ready.emit()
 
     def _setup_lights(self) -> None:
         """Even light from every side, the way a CAD viewer lights a part.
@@ -222,18 +266,19 @@ class Viewport(QWidget):
         self.viewer.SetLightOn(ambient)
 
     def _make_window(self):
-        # OCP 7.9's pybind wrappers take the native handle as an integer.  PySide
-        # may return a Shiboken wrapper here, hence the explicit conversion.
+        # PySide may return a Shiboken wrapper for winId(), hence the conversion.
+        # What OCP wants from there differs by platform: a pointer capsule on
+        # Windows and macOS, a plain XID integer on X11.  See _pointer_handle.
         handle = int(self.winId())
         system = platform.system()
         if system == "Windows":
             from OCP.WNT import WNT_Window
 
-            return WNT_Window(handle)
+            return WNT_Window(_pointer_handle(handle))
         if system == "Darwin":
             from OCP.Cocoa import Cocoa_Window
 
-            return Cocoa_Window(handle)
+            return Cocoa_Window(_pointer_handle(handle))
         # Linux/BSD: X11 or XWayland.  Native Wayland is not supported - see spec 3.1.
         from OCP.Xw import Xw_Window
 
@@ -252,11 +297,16 @@ class Viewport(QWidget):
         matte: bool = False,
         selectable: bool = True,
         update: bool = True,
-    ) -> AIS_Shape:
-        """Display *shape* under *key*, replacing anything already shown there."""
+    ) -> AIS_Shape | None:
+        """Display *shape* under *key*, replacing anything already shown there.
+
+        Returns ``None`` when the viewer could not start, so a dead viewport makes
+        the 3D view empty rather than making every later call raise.
+        """
         if self.context is None:
             self._init_viewer()
-        assert self.context is not None
+        if self.context is None:
+            return None
 
         self.erase(key, update=False)
         ais = AIS_Shape(shape)
@@ -334,11 +384,19 @@ class Viewport(QWidget):
         self.fit_all()
 
     def set_background(self, r1, g1, b1, r2, g2, b2) -> None:
+        """Set the vertical gradient behind the part, from sRGB triples.
+
+        sRGB, not the linear RGB the lights and materials use.  The background
+        sits next to the Qt panels, so it has to be the colour a stylesheet would
+        name: given to Quantity_TOC_RGB, a dark slate came out mid-grey and the
+        3D view read as a light panel in a dark window.  Same trap as
+        :data:`BOUNDARY_COLOR`.
+        """
         if self.view is None:
             return
         self.view.SetBgGradientColors(
-            Quantity_Color(r1, g1, b1, Quantity_TOC_RGB),
-            Quantity_Color(r2, g2, b2, Quantity_TOC_RGB),
+            Quantity_Color(r1, g1, b1, Quantity_TOC_sRGB),
+            Quantity_Color(r2, g2, b2, Quantity_TOC_sRGB),
             Aspect_GradientFillMethod.Aspect_GradientFillMethod_Vertical,
             True,
         )
@@ -365,6 +423,24 @@ class Viewport(QWidget):
         if self.context is not None:
             self.context.ClearSelected(True)
 
+    # -------------------------------------------------------- pixel conversion
+
+    def device_px(self, value: float) -> int:
+        """Qt reports positions in logical pixels; the OCC view is in device ones.
+
+        On a Windows display at 150% those differ by half: OCC sizes its window
+        from the HWND, which is physical, while every Qt mouse position arrives
+        scaled down.  Handing one to the other put every click a third of the way
+        up and to the left of where the user aimed.  Everything crossing into the
+        view goes through here, and :meth:`logical_px` brings it back.
+        """
+        return int(round(value * self.devicePixelRatioF()))
+
+    def logical_px(self, value: float) -> float:
+        """Device pixels from the view, back in the units Qt positions use."""
+        ratio = self.devicePixelRatioF()
+        return value / ratio if ratio else value
+
     # ------------------------------------------------------------ mouse handling
 
     def mousePressEvent(self, event: QMouseEvent) -> None:  # noqa: N802
@@ -380,7 +456,7 @@ class Viewport(QWidget):
                 self._drag_kind = "pan"
             else:
                 self._drag_kind = "orbit"
-                self.view.StartRotation(pos.x(), pos.y())
+                self.view.StartRotation(self.device_px(pos.x()), self.device_px(pos.y()))
         elif buttons & Qt.MouseButton.RightButton:
             self._drag_kind = "pan"
         else:
@@ -392,15 +468,17 @@ class Viewport(QWidget):
         pos = event.position().toPoint()
 
         if self._drag_kind == "orbit":
-            self.view.Rotation(pos.x(), pos.y())
+            self.view.Rotation(self.device_px(pos.x()), self.device_px(pos.y()))
             self.view_changed.emit()
         elif self._drag_kind == "pan" and self._drag_start is not None:
             delta = pos - self._drag_start
-            self.view.Pan(delta.x(), -delta.y())
+            self.view.Pan(self.device_px(delta.x()), -self.device_px(delta.y()))
             self._drag_start = pos
             self.view_changed.emit()
         elif self._drag_kind is None:
-            self.context.MoveTo(pos.x(), pos.y(), self.view, True)
+            self.context.MoveTo(
+                self.device_px(pos.x()), self.device_px(pos.y()), self.view, True
+            )
 
     def mouseReleaseEvent(self, event: QMouseEvent) -> None:  # noqa: N802
         if self.view is None or self.context is None:
@@ -415,9 +493,12 @@ class Viewport(QWidget):
         self._drag_start = None
 
     def _do_pick(self, pos: QPoint, *, additive: bool) -> None:
-        assert self.context is not None and self.view is not None
+        if self.context is None or self.view is None:
+            return
         self.last_pick_position = QPoint(pos)
-        self.context.MoveTo(pos.x(), pos.y(), self.view, True)
+        self.context.MoveTo(
+            self.device_px(pos.x()), self.device_px(pos.y()), self.view, True
+        )
         if additive:
             self.context.ShiftSelect(True)
         else:
@@ -435,13 +516,13 @@ class Viewport(QWidget):
         """Return the 3D point under the cursor, from the selector's pick depth."""
         from OCP.gp import gp_Pnt
 
-        assert self.view is not None and self.context is not None
+        assert self.view is not None and self.context is not None  # _do_pick checked
         if self.context.HasDetected():
             selector = self.context.MainSelector()
             if selector.NbPicked() > 0:
                 p = selector.PickedPoint(1)
                 return gp_Pnt(p.X(), p.Y(), p.Z())
-        x, y, z = self.view.Convert(pos.x(), pos.y())
+        x, y, z = self.view.Convert(self.device_px(pos.x()), self.device_px(pos.y()))
         return gp_Pnt(x, y, z)
 
     def wheelEvent(self, event: QWheelEvent) -> None:  # noqa: N802
@@ -452,7 +533,7 @@ class Viewport(QWidget):
         if delta == 0:
             return
         factor = 1.12 if delta > 0 else 1.0 / 1.12
-        self.view.StartZoomAtPoint(pos.x(), pos.y())
+        self.view.StartZoomAtPoint(self.device_px(pos.x()), self.device_px(pos.y()))
         self.view.SetZoom(factor, True)
         self.view.Redraw()
         self.view_changed.emit()
@@ -466,7 +547,9 @@ class Viewport(QWidget):
         if self.view is None:
             return None
         try:
-            px, py, pz, dx, dy, dz = self.view.ConvertWithProj(int(x), int(y))
+            px, py, pz, dx, dy, dz = self.view.ConvertWithProj(
+                self.device_px(x), self.device_px(y)
+            )
         except Exception:
             return None
         return (px, py, pz), (dx, dy, dz)
@@ -479,7 +562,7 @@ class Viewport(QWidget):
         """
         if self.context is None or self.view is None:
             return None
-        self.context.MoveTo(x, y, self.view, True)
+        self.context.MoveTo(self.device_px(x), self.device_px(y), self.view, True)
         if not self.context.HasDetected():
             return None
         shape = self.context.DetectedShape()
