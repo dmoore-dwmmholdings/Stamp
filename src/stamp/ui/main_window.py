@@ -258,6 +258,7 @@ class MainWindow(QMainWindow):
         strip.setFixedHeight(30)
         layout = QHBoxLayout(strip)
         layout.setContentsMargins(10, 2, 10, 2)
+        self._status_strip_layout = layout
 
         self.status_label = QLabel("")
         self.warning_label = QLabel("")
@@ -366,10 +367,11 @@ class MainWindow(QMainWindow):
             "surface. Raise it on a coarse mesh."
         )
         self.region_tolerance.valueChanged.connect(self._on_region_tolerance_changed)
-        # A toolbar wraps a widget in a QWidgetAction and re-shows it on every
-        # layout pass, so visibility has to be set on the action, not the widget.
-        self._region_tolerance_action = bar.addWidget(self.region_tolerance)
-        self._region_tolerance_action.setVisible(False)
+        # This is contextual to mesh picking and must remain reachable.  The
+        # toolbar can overflow on ordinary laptop-sized windows, so keep this
+        # compact control in the viewport status strip instead.
+        self.region_tolerance.setVisible(False)
+        self._status_strip_layout.addWidget(self.region_tolerance)
 
         self.density_field = QDoubleSpinBox()
         self.density_field.setPrefix("Density: ")
@@ -398,7 +400,7 @@ class MainWindow(QMainWindow):
                              spacer.sizePolicy().verticalPolicy().Preferred)
         bar.addWidget(spacer)
 
-        # The two view toggles live under the viewport, in the status strip.  The
+        # The view toggles live under the viewport, in the status strip.  The
         # toolbar is full, and what does not fit there goes into an overflow menu
         # that shuts again at each layout pass.
         self.action_preview.setShortcut(QKeySequence("Space"))
@@ -617,7 +619,7 @@ class MainWindow(QMainWindow):
             "" if solid else export_io.MESH_MODE_NO_STEP
         )
         mesh = has_part and self.document.base.mode == "mesh"
-        self._region_tolerance_action.setVisible(mesh)
+        self.region_tolerance.setVisible(mesh)
 
     def _refresh_tree(self) -> None:
         results = {}

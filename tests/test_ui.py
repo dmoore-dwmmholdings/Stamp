@@ -51,6 +51,35 @@ def a_feature(name: str = "Logo") -> Feature:
     )
 
 
+class TestViewportWindowBinding:
+    def test_linux_window_binding_receives_an_integer_handle(self, monkeypatch, qtbot):
+        """OCP 7.9's X11 wrapper rejects the PyCapsule used by older bindings."""
+        import OCP.Xw as xw
+
+        from stamp.ui import viewport as viewport_module
+        from stamp.ui.viewport import Viewport
+
+        captured: dict[str, object] = {}
+        sentinel = object()
+
+        def fake_window(connection, handle):
+            captured["connection"] = connection
+            captured["handle"] = handle
+            return sentinel
+
+        monkeypatch.setattr(viewport_module.platform, "system", lambda: "Linux")
+        monkeypatch.setattr(Viewport, "winId", lambda _self: 12345)
+        monkeypatch.setattr(xw, "Xw_Window", fake_window)
+
+        widget = Viewport()
+        qtbot.addWidget(widget)
+        widget._display_connection = object()
+
+        assert widget._make_window() is sentinel
+        assert captured["handle"] == 12345
+        assert type(captured["handle"]) is int
+
+
 class TestPropertiesPanel:
     @pytest.fixture
     def panel(self, qtbot):

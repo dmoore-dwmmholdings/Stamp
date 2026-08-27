@@ -3,15 +3,10 @@
 Ported from CQ-editor's occt_widget.py (PyQt5) to PySide6.  The only coupling
 between Qt and OpenCascade is a single native window handle, which OCC wraps in a
 platform window object (WNT_Window / Xw_Window / Cocoa_Window).
-
-The one non-obvious detail: OCP's platform-window constructors take a *PyCapsule*,
-not an int, so QWidget.winId() has to be wrapped with PyCapsule_New before it can
-be handed over.  See :func:`_handle_capsule`.
 """
 
 from __future__ import annotations
 
-import ctypes
 import platform
 
 from OCP.AIS import AIS_DisplayMode, AIS_InteractiveContext, AIS_Shaded, AIS_Shape
@@ -41,16 +36,6 @@ from OCP.V3d import (
 from PySide6.QtCore import QPoint, Qt, QTimer, Signal
 from PySide6.QtGui import QMouseEvent, QResizeEvent, QWheelEvent
 from PySide6.QtWidgets import QWidget
-
-_PyCapsule_New = ctypes.pythonapi.PyCapsule_New
-_PyCapsule_New.restype = ctypes.py_object
-_PyCapsule_New.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_void_p]
-
-
-def _handle_capsule(win_id: int):
-    """Wrap a native window id in a PyCapsule, which is what OCP's binding wants."""
-    return _PyCapsule_New(ctypes.c_void_p(int(win_id)), None, None)
-
 
 #: Face boundary edges.  They are what makes a contour readable on a shaded solid.
 #: This one is sRGB, not the linear RGB the other colors here use: Quantity_TOC_RGB
@@ -236,7 +221,9 @@ class Viewport(QWidget):
         self.viewer.SetLightOn(ambient)
 
     def _make_window(self):
-        handle = _handle_capsule(self.winId())
+        # OCP 7.9's pybind wrappers take the native handle as an integer.  PySide
+        # may return a Shiboken wrapper here, hence the explicit conversion.
+        handle = int(self.winId())
         system = platform.system()
         if system == "Windows":
             from OCP.WNT import WNT_Window
