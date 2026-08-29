@@ -5,6 +5,7 @@ from __future__ import annotations
 import pytest
 
 from stamp.core.document import (
+    COLOR_STAMP_DEPTH,
     Anchor,
     AnchorKind,
     DepthMode,
@@ -653,6 +654,135 @@ class TestColorSplit:
         split = color_split.split_for_color(doc, result)
         assert [b.role for b in split.bodies] == ["base", "feature"]
         assert all(b.triangle_count > 0 for b in split.bodies)
+
+
+class TestColorStamp:
+    """A colour stamp is a layer-thin recess the 3MF export fills back in - §9.
+
+    The mark is not embossing and not an engraving anyone is meant to feel: the
+    recess exists only so the slicer has somewhere to change filament.  What these
+    tests pin is that the two bodies put the part back exactly as it came in.
+    """
+
+    def _stamped(self, part, fixtures, ref, *, depth=COLOR_STAMP_DEPTH):
+        doc = Document(base=part)
+        doc.add_feature(
+            a_feature("Emblem", fixtures / "logo.svg", ref,
+                      kind=OperationKind.COLOR, depth=depth,
+                      direction=Direction.INTO)
+        )
+        result = RebuildEngine(ProfileCache().get).rebuild(doc)
+        assert result.ok, result.errors
+        return doc, result
+
+    def test_the_recess_is_only_as_deep_as_the_ink(self, bracket_step, fixtures, top_ref):
+        """It cuts, and it cuts a layer's worth - not an engraving's worth."""
+        from stamp.geom import solid_ops
+
+        _, result = self._stamped(bracket_step, fixtures, top_ref)
+        removed = solid_ops.volume(bracket_step.runtime) - result.volume
+        assert removed > 0.0, "the stamp has to cut, or there is nothing to fill"
+        # The logo is roughly 36 x 16 mm of bounding box, so even solid it cannot
+        # take more than that footprint times the ink thickness.
+        assert removed < 36.0 * 16.0 * COLOR_STAMP_DEPTH
+
+    def test_the_inlay_sits_flush_with_the_face(self, bracket_step, fixtures, top_ref):
+        import numpy as np
+
+        from stamp.geom import color_split
+
+        doc, result = self._stamped(bracket_step, fixtures, top_ref)
+        split = color_split.split_for_color(doc, result)
+        inlays = [b for b in split.bodies if b.role == "feature"]
+        assert len(inlays) == 1
+
+        z = np.asarray(inlays[0].vertices)[:, 2]
+        # Top at the face it was stamped on, bottom one ink thickness below it.
+        assert float(z.max()) == pytest.approx(8.0, abs=1e-3)
+        assert float(z.min()) == pytest.approx(8.0 - COLOR_STAMP_DEPTH, abs=1e-3)
+
+    def test_the_two_bodies_add_back_up_to_the_part(self, bracket_step, fixtures, top_ref):
+        """Filled, the stamped part is the part: no bump, no dent, no gap."""
+        import trimesh
+
+        from stamp.geom import color_split, solid_ops
+
+        doc, result = self._stamped(bracket_step, fixtures, top_ref)
+        split = color_split.split_for_color(doc, result, deflection=0.01)
+        volumes = [
+            trimesh.Trimesh(vertices=b.vertices, faces=b.triangles, process=False).volume
+            for b in split.bodies
+        ]
+        assert len(volumes) == 2
+        original = solid_ops.volume(bracket_step.runtime)
+        assert sum(volumes) == pytest.approx(original, rel=1e-3)
+
+    def test_a_stamp_takes_a_blind_depth_and_nothing_else(self, bracket_step, fixtures, top_ref):
+        """Every other depth mode has no floor for the export to fill up to."""
+        doc = Document(base=bracket_step)
+        feature = a_feature("Emblem", fixtures / "logo.svg", top_ref,
+                            kind=OperationKind.COLOR, depth=COLOR_STAMP_DEPTH,
+                            direction=Direction.INTO)
+        feature.operation.depth_mode = DepthMode.THROUGH_ALL
+        doc.add_feature(feature)
+
+        result = RebuildEngine(ProfileCache().get).rebuild(doc)
+        assert not result.ok
+        assert any("blind depth" in e for e in result.errors)
+
+    def test_a_stamp_on_a_mesh_part_is_filled_too(self, bracket_stl, fixtures):
+        from stamp.core.document import Plane
+        from stamp.geom import color_split
+
+        doc = Document(base=bracket_stl)
+        doc.add_feature(Feature(
+            name="Emblem",
+            profile=ProfileRef(source_path=str(fixtures / "logo.svg"),
+                               source_hash=file_hash(fixtures / "logo.svg")),
+            placement=Placement(anchor=Anchor(
+                kind=AnchorKind.MESH_REGION,
+                plane=Plane(origin=(30.0, 20.0, 8.0), normal=(0.0, 0.0, 1.0),
+                            u_axis=(1.0, 0.0, 0.0)),
+            )),
+            operation=Operation(kind=OperationKind.COLOR, depth_mode=DepthMode.BLIND,
+                                depth=COLOR_STAMP_DEPTH, direction=Direction.INTO),
+        ))
+        result = RebuildEngine(ProfileCache().get).rebuild(doc)
+        assert result.ok, result.errors
+
+        split = color_split.split_for_color(doc, result)
+        assert [b.role for b in split.bodies] == ["base", "feature"]
+        assert all(b.triangle_count > 0 for b in split.bodies)
+
+    def test_the_export_writes_the_ink_as_its_own_named_body(
+        self, bracket_step, fixtures, top_ref, tmp_path
+    ):
+        import xml.etree.ElementTree as ET
+        import zipfile
+
+        from stamp.geom import color_split
+        from stamp.io.export import export_3mf
+
+        doc, result = self._stamped(bracket_step, fixtures, top_ref)
+        split = color_split.split_for_color(doc, result)
+        path = tmp_path / "stamped.3mf"
+        export_3mf(split.bodies, path, base_color="#101010", feature_color="#D62E2E")
+
+        core = "http://schemas.microsoft.com/3dmanufacturing/core/2015/02"
+        with zipfile.ZipFile(path) as archive:
+            model = ET.fromstring(archive.read("3D/3dmodel.model"))
+        named = [o.get("name") for o in model.iter(f"{{{core}}}object")]
+        assert "base" in named
+        assert "Emblem" in named
+
+    def test_a_stamp_that_yields_no_body_says_the_recess_is_left_open(self):
+        """The consequence differs from a plain feature, so the wording does too."""
+        from stamp.geom.color_split import _skipped
+
+        stamp = Feature(name="Emblem", operation=Operation(kind=OperationKind.COLOR))
+        plain = Feature(name="Slot", operation=Operation(kind=OperationKind.CUT))
+        assert "open recess" in _skipped(stamp, "it broke.")
+        assert "open recess" not in _skipped(plain, "it broke.")
 
 
 class TestExport3mf:

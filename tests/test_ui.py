@@ -177,6 +177,100 @@ class TestViewportWindowBinding:
         assert widget.logical_px(150) == pytest.approx(100)
 
 
+class TestColorStampMode:
+    """The third operation kind - §9.  A thin recess the 3MF export fills back in."""
+
+    @pytest.fixture
+    def panel(self, qtbot):
+        from stamp.ui.properties import PropertiesPanel
+
+        widget = PropertiesPanel()
+        qtbot.addWidget(widget)
+        return widget
+
+    def _select_stamp(self, panel, feature):
+        panel.show_feature(Document(), feature, (36.0, 16.0))
+        panel.stamp_radio.setChecked(True)
+        return feature.operation
+
+    def test_choosing_it_sets_the_kind_and_pins_the_depth_mode(self, panel):
+        operation = self._select_stamp(panel, a_feature())
+        assert operation.kind is OperationKind.COLOR
+        assert operation.depth_mode is DepthMode.BLIND
+
+    def test_an_engraving_depth_becomes_an_ink_thickness(self, panel):
+        """3 mm of the second filament buried in the part is nobody's intent."""
+        from stamp.core.document import COLOR_STAMP_DEPTH
+
+        feature = a_feature()
+        feature.operation.depth = 3.0
+        operation = self._select_stamp(panel, feature)
+        assert operation.depth == COLOR_STAMP_DEPTH
+        assert panel.depth_field.value() == COLOR_STAMP_DEPTH
+
+    def test_a_depth_already_thin_enough_is_left_where_it_was(self, panel):
+        feature = a_feature()
+        feature.operation.depth = 0.3
+        assert self._select_stamp(panel, feature).depth == 0.3
+
+    def test_the_depth_mode_picker_gives_way_to_a_thickness_field(self, panel, qtbot):
+        panel.show_feature(Document(), a_feature(), (36.0, 16.0))
+        panel.show()
+        qtbot.waitExposed(panel)
+        assert panel.depth_mode.isVisible()
+
+        panel.stamp_radio.setChecked(True)
+        assert not panel.depth_mode.isVisible()
+        assert panel.depth_field.isVisible()
+        assert panel._depth_value_label.text() == "Thickness:"
+        assert panel.stamp_hint.isVisible()
+
+    def test_going_back_to_a_cut_restores_the_depth_picker(self, panel, qtbot):
+        panel.show_feature(Document(), a_feature(), (36.0, 16.0))
+        panel.show()
+        qtbot.waitExposed(panel)
+        panel.stamp_radio.setChecked(True)
+        panel.cut_radio.setChecked(True)
+
+        assert panel.depth_mode.isVisible()
+        assert not panel.stamp_hint.isVisible()
+
+    def test_reopening_a_stamped_feature_shows_it_as_a_stamp(self, panel):
+        feature = a_feature()
+        feature.operation.kind = OperationKind.COLOR
+        panel.show_feature(Document(), feature, (36.0, 16.0))
+        assert panel.stamp_radio.isChecked()
+        assert not panel.cut_radio.isChecked()
+
+    def test_the_export_dialog_says_which_bodies_are_stamps(self, qtbot):
+        from PySide6.QtWidgets import QLabel
+
+        from stamp.ui.dialogs import Color3mfDialog
+
+        dialog = Color3mfDialog(2, stamp_count=1)
+        qtbot.addWidget(dialog)
+        text = " ".join(label.text() for label in dialog.findChildren(QLabel))
+        assert "1 of them is a color stamp" in text
+
+        plain = Color3mfDialog(2)
+        qtbot.addWidget(plain)
+        text = " ".join(label.text() for label in plain.findChildren(QLabel))
+        assert "color stamp" not in text
+
+    def test_the_tree_gives_a_stamp_its_own_icon(self, qtbot):
+        from stamp.ui.feature_tree import CUT_ICON, STAMP_ICON, FeatureTree
+
+        tree = FeatureTree()
+        qtbot.addWidget(tree)
+        stamp = a_feature("Emblem")
+        stamp.operation.kind = OperationKind.COLOR
+        tree.set_document(Document(features=[a_feature("Slot"), stamp]))
+
+        labels = [tree.topLevelItem(i).text(0) for i in range(tree.topLevelItemCount())]
+        assert any(text.startswith(STAMP_ICON) and "Emblem" in text for text in labels)
+        assert any(text.startswith(CUT_ICON) and "Slot" in text for text in labels)
+
+
 class TestPropertiesPanel:
     @pytest.fixture
     def panel(self, qtbot):

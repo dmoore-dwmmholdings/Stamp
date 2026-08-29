@@ -108,6 +108,9 @@ SLOW_REBUILD_MS = 10_000.0
 
 ADD_COLOR = (0.36, 0.72, 0.42)
 CUT_COLOR = (0.82, 0.36, 0.32)
+#: A colour stamp neither adds nor removes anything you can feel, so it gets its
+#: own preview colour rather than borrowing the cut's red.
+STAMP_COLOR = (0.35, 0.55, 0.90)
 PART_COLOR = (0.62, 0.66, 0.72)
 REGION_COLOR = (0.36, 0.62, 0.92)
 DIMENSIONS_COLOR = (0.25, 0.78, 0.94)
@@ -2091,7 +2094,10 @@ class MainWindow(QMainWindow):
             self.viewport.context and self.viewport.context.UpdateCurrentViewer()
             return
 
-        color = ADD_COLOR if feature.operation.kind is OperationKind.ADD else CUT_COLOR
+        color = {
+            OperationKind.ADD: ADD_COLOR,
+            OperationKind.COLOR: STAMP_COLOR,
+        }.get(feature.operation.kind, CUT_COLOR)
         self.viewport.display_shape(
             PREVIEW_KEY, result.tool.shape, color=color, transparency=0.65,
             material=False, selectable=False, update=False,
@@ -2387,8 +2393,13 @@ class MainWindow(QMainWindow):
         # Remembered, because a slicer makes a filament for every colour it does
         # not have: setting these to the filaments actually loaded, once, is what
         # stops unwanted entries arriving with every export.
+        stamp_count = sum(
+            1 for f in self.document.features
+            if f.enabled and f.operation.kind is OperationKind.COLOR
+        )
         dialog = dialogs.Color3mfDialog(
             feature_count,
+            stamp_count=stamp_count,
             mode=self.document.base.mode,
             base_color=self.settings.value("3mf/base_color", type=str) or None,
             feature_color=self.settings.value("3mf/feature_color", type=str) or None,

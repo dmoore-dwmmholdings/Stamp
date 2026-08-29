@@ -18,6 +18,7 @@ from typing import TYPE_CHECKING
 
 from OCP.TopoDS import TopoDS_Shape
 
+from stamp.core.document import COLOR_STAMP_MIN_DEPTH, OperationKind
 from stamp.core.inspection import inspect_document
 from stamp.geom import mesh_ops, solid_ops
 
@@ -98,7 +99,38 @@ def preflight_export(
             report.warnings.append("One or more modifier values were reduced to rebuild safely.")
     if fmt == "3mf":
         report.warnings.append("3MF exports separate bodies; verify material assignment in your slicer.")
+    report.warnings.extend(_color_stamp_warnings(document, fmt))
     return report
+
+
+def _color_stamp_warnings(document: Document, fmt: str) -> list[str]:
+    """What a color stamp needs said before it is written - §9.
+
+    A stamp is a recess the 3MF export fills back in.  Only 3MF carries the second
+    body, so every other format writes the recess and nothing else, and the user
+    should hear that from Stamp rather than discover it on the printer.
+    """
+    stamps = [
+        f for f in document.features
+        if f.enabled and f.operation.kind is OperationKind.COLOR
+    ]
+    if not stamps:
+        return []
+    out = [
+        f"{f.name}: {f.operation.depth:.3f} mm is thinner than one printed layer on "
+        f"most machines, so the color may not appear. Use "
+        f"{COLOR_STAMP_MIN_DEPTH} mm or more."
+        for f in stamps
+        if f.operation.depth < COLOR_STAMP_MIN_DEPTH
+    ]
+    if fmt in {"step", "stl"}:
+        names = ", ".join(f.name for f in stamps)
+        out.append(
+            f"{names}: a color stamp is color, and {fmt.upper()} carries none. It is "
+            f"written as the shallow recess it cuts. Export 3MF to have it filled "
+            f"back in and printed flush."
+        )
+    return out
 
 
 @dataclass
@@ -144,7 +176,7 @@ def _proof_html(document, warnings: list[str], screenshot: bytes | None) -> str:
         for values in [
             (
                 feature.name,
-                str(feature.operation.kind).title(),
+                feature.operation.label,
                 f"{feature.operation.depth:.2f} mm",
                 feature.metadata.identifier,
                 feature.metadata.process,

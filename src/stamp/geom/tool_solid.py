@@ -20,7 +20,15 @@ from OCP.BRepPrimAPI import (
 from OCP.gp import gp_Ax1, gp_Ax2, gp_Ax3, gp_Dir, gp_Pnt, gp_Trsf, gp_Vec
 from OCP.TopoDS import TopoDS_Face, TopoDS_Shape
 
-from stamp.core.document import DepthMode, Direction, Operation, Placement, PlacementMode, Plane
+from stamp.core.document import (
+    DepthMode,
+    Direction,
+    Operation,
+    OperationKind,
+    Placement,
+    PlacementMode,
+    Plane,
+)
 from stamp.io.normalize import Profile
 
 
@@ -107,6 +115,13 @@ def extrusion_length(
     non-zero only for the symmetric mode.
     """
     mode = operation.depth_mode
+    if operation.kind is OperationKind.COLOR and mode is not DepthMode.BLIND:
+        # A colour stamp is a thin layer sitting at the face, and the 3MF export
+        # fills it back in from the face down.  Every other depth mode either has
+        # no floor to fill to or puts the mark somewhere the face is not.
+        raise ToolSolidError(
+            "A color stamp is a thin layer at the face, so it takes a blind depth."
+        )
     if mode is DepthMode.BLIND:
         if operation.depth <= 0:
             raise ToolSolidError("The depth must be greater than zero.")
@@ -150,9 +165,9 @@ def contact_overlap_for(
     if abs(placement.lift) > 1e-9:
         return 0.0
     growing_outward = operation.direction is Direction.OUT_OF
-    if operation.kind.value == "add" and not growing_outward:
+    if not operation.removes_material and not growing_outward:
         return 0.0
-    if operation.kind.value == "cut" and growing_outward:
+    if operation.removes_material and growing_outward:
         return 0.0
     return max(1e-3, part_diagonal * 1e-5)
 

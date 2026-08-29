@@ -33,6 +33,8 @@ from PySide6.QtWidgets import (
 )
 
 from stamp.core.document import (
+    COLOR_STAMP_DEPTH,
+    COLOR_STAMP_MAX_KEPT_DEPTH,
     BasePart,
     CodeKind,
     DepthMode,
@@ -116,6 +118,9 @@ class PropertiesPanel(QScrollArea):
         self._feature: Feature | None = None
         self._native_size = (1.0, 1.0)
         self._updating = False
+        #: Held so a kind change can redraw the modifier rows, whose captions read
+        #: differently for something that cuts than for something that adds.
+        self._mesh_mode = False
 
         self._body = QWidget()
         self._layout = QVBoxLayout(self._body)
@@ -479,11 +484,19 @@ class PropertiesPanel(QScrollArea):
         kind_row = QHBoxLayout()
         self.add_radio = QRadioButton("Add material")
         self.cut_radio = QRadioButton("Cut material")
+        self.stamp_radio = QRadioButton("Color stamp")
+        self.stamp_radio.setToolTip(
+            "A layer-thin recess that the 3MF export fills back in with a second "
+            "color, so the artwork prints flush with the face instead of standing "
+            "proud of it."
+        )
         self._kind_group = QButtonGroup(box)
         self._kind_group.addButton(self.add_radio)
         self._kind_group.addButton(self.cut_radio)
+        self._kind_group.addButton(self.stamp_radio)
         kind_row.addWidget(self.add_radio)
         kind_row.addWidget(self.cut_radio)
+        kind_row.addWidget(self.stamp_radio)
         layout.addLayout(kind_row)
 
         self.depth_mode = QComboBox()
@@ -503,8 +516,13 @@ class PropertiesPanel(QScrollArea):
 
         form = QFormLayout()
         form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
-        form.addRow("Depth:", self.depth_mode)
-        form.addRow("", self.depth_field)
+        # A color stamp has one depth mode, so the picker is hidden for it and the
+        # value row takes over the caption.  Both labels are held rather than passed
+        # as strings so the row can be renamed and hidden in place.
+        self._depth_mode_label = QLabel("Depth:")
+        form.addRow(self._depth_mode_label, self.depth_mode)
+        self._depth_value_label = QLabel("")
+        form.addRow(self._depth_value_label, self.depth_field)
         self.pick_face_button = QPushButton("Pick the target face")
         self.pick_face_button.clicked.connect(self.pick_to_face_requested)
         form.addRow("", self.pick_face_button)
@@ -512,12 +530,24 @@ class PropertiesPanel(QScrollArea):
         form.addRow("Draft:", self.draft_field)
         layout.addLayout(form)
 
+        self.stamp_hint = QLabel(
+            f"The stamp cuts this deep and the 3MF export fills it back in with the "
+            f"second color, so it prints flush with the face. "
+            f"{COLOR_STAMP_DEPTH} mm is one printed layer on a typical machine. "
+            f"STEP and STL carry no color, so they get the recess on its own."
+        )
+        self.stamp_hint.setWordWrap(True)
+        self.stamp_hint.setStyleSheet("color: #8a8f98;")
+        layout.addWidget(self.stamp_hint)
+
         hint = QLabel("A positive draft angle makes the walls flare outward toward the opening.")
         hint.setWordWrap(True)
         hint.setStyleSheet("color: #8a8f98;")
         layout.addWidget(hint)
 
         self.add_radio.toggled.connect(self._set_kind)
+        self.cut_radio.toggled.connect(self._set_kind)
+        self.stamp_radio.toggled.connect(self._set_kind)
         self.depth_mode.currentIndexChanged.connect(self._set_depth_mode)
         self.depth_field.valueChanged.connect(self._set_depth)
         self.direction.currentIndexChanged.connect(self._set_direction)
@@ -660,6 +690,7 @@ class PropertiesPanel(QScrollArea):
         operation = feature.operation
         self.add_radio.setChecked(operation.kind is OperationKind.ADD)
         self.cut_radio.setChecked(operation.kind is OperationKind.CUT)
+        self.stamp_radio.setChecked(operation.kind is OperationKind.COLOR)
         self.depth_mode.setCurrentIndex(self.depth_mode.findData(operation.depth_mode))
         self.depth_field.set_silently(operation.depth)
         self.direction.setCurrentIndex(self.direction.findData(operation.direction))
@@ -682,9 +713,20 @@ class PropertiesPanel(QScrollArea):
             self.pattern_center_u, self.pattern_center_v, self.pattern_axis,
         ):
             widget.setEnabled(pattern is not None)
+        self._mesh_mode = mesh_mode
         self._fill_modifiers(feature, mesh_mode=mesh_mode)
 
     def _sync_depth_widgets(self) -> None:
+        stamp = self.stamp_radio.isChecked()
+        self._depth_mode_label.setVisible(not stamp)
+        self.depth_mode.setVisible(not stamp)
+        self._depth_value_label.setText("Thickness:" if stamp else "")
+        self.stamp_hint.setVisible(stamp)
+        if stamp:
+            # Blind is the only depth a stamp can have; see build_tool_solid.
+            self.depth_field.setVisible(True)
+            self.pick_face_button.setVisible(False)
+            return
         mode = DepthMode(self.depth_mode.currentData())
         self.depth_field.setVisible(mode in (DepthMode.BLIND, DepthMode.SYMMETRIC))
         self.pick_face_button.setVisible(mode is DepthMode.TO_FACE)
@@ -696,7 +738,7 @@ class PropertiesPanel(QScrollArea):
             if widget is not None:
                 widget.deleteLater()
 
-        cutting = feature.operation.kind is OperationKind.CUT
+        cutting = feature.operation.removes_material
         for modifier in feature.modifiers:
             self._modifier_layout.addWidget(
                 self._modifier_row(modifier, mesh_mode=mesh_mode, cutting=cutting)
@@ -909,12 +951,34 @@ class PropertiesPanel(QScrollArea):
         self._feature.placement.uniform_scale = on
         self.lock_button.setText("🔒" if on else "🔓")
 
-    def _set_kind(self, add_selected: bool) -> None:
+    def _set_kind(self, _checked: bool) -> None:
+        """One handler for all three radios: a toggle fires twice, off then on."""
         if self._feature is None or self._updating:
             return
-        self._feature.operation.kind = (
-            OperationKind.ADD if add_selected else OperationKind.CUT
-        )
+        if self.add_radio.isChecked():
+            kind = OperationKind.ADD
+        elif self.stamp_radio.isChecked():
+            kind = OperationKind.COLOR
+        else:
+            kind = OperationKind.CUT
+        operation = self._feature.operation
+        if kind is operation.kind:
+            return
+        operation.kind = kind
+        if kind is OperationKind.COLOR:
+            # A stamp is a thin layer at the face: no other depth mode has a floor
+            # for the 3MF export to fill up to.  The depth is left alone unless it
+            # is plainly an engraving depth, which as a colour layer would put a
+            # millimetres-deep slab of the second filament inside the part.
+            operation.depth_mode = DepthMode.BLIND
+            if operation.depth > COLOR_STAMP_MAX_KEPT_DEPTH:
+                operation.depth = COLOR_STAMP_DEPTH
+            self._updating = True
+            self.depth_mode.setCurrentIndex(self.depth_mode.findData(DepthMode.BLIND))
+            self.depth_field.set_silently(operation.depth)
+            self._updating = False
+        self._sync_depth_widgets()
+        self._fill_modifiers(self._feature, mesh_mode=self._mesh_mode)
         self._emit("operation")
 
     def _set_depth_mode(self, _index: int) -> None:

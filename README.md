@@ -186,6 +186,25 @@ feature. Raised artwork becomes its own solid, and engraved artwork becomes an
 inlay that fills the pocket flush with the surface — so a color printer can put
 the artwork in a second filament. Through cuts stay open.
 
+### Color stamps
+
+A **color stamp** is the third operation, next to Add and Cut, for artwork that
+should be *color and nothing else*: a logo or a label that prints in a second
+filament but leaves the face as smooth as it was. It cuts a recess only as deep
+as the ink — 0.2 mm by default, one printed layer on a typical machine — and the
+3MF export fills that recess back in with a second-color body. Filled, the two
+bodies add back up to exactly the part you started with: no embossing to catch a
+fingernail on, no dent, no gap.
+
+Pick "Color stamp" in the Operation panel and the depth picker gives way to a
+single thickness, because a stamp only has a blind depth: it needs a floor for
+the export to fill up to. Switching a deep engraving to a stamp resets its depth,
+since millimeters of the second filament buried in the part is not what the mode
+is for.
+
+Only 3MF fills the recess. STEP and STL carry no color, so they get the shallow
+recess on its own, and preflight says so before it writes one.
+
 Set the colors to the filaments you actually print with. A slicer creates a new
 filament for every color it doesn't recognize, so colors that don't match yours
 arrive as extra entries you have to change back. Stamp remembers what you chose,

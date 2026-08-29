@@ -76,6 +76,81 @@ def test_linear_pattern_rebuilds_each_instance(bracket_step, fixtures):
     assert result.ok, result.errors
 
 
+def _stamped_document(depth: float):
+    from stamp.core.document import Document, Operation, OperationKind
+
+    return Document(
+        base=BasePart(mode="solid", runtime=object()),
+        features=[Feature(name="Emblem",
+                          operation=Operation(kind=OperationKind.COLOR, depth=depth))],
+    )
+
+
+def test_preflight_says_a_color_stamp_is_only_a_recess_in_step_and_stl(tmp_path):
+    """STEP and STL carry no color, so the user hears it before the printer does."""
+    document = _stamped_document(0.2)
+    rebuilt = RebuildResult(geometry=object())
+
+    for fmt in ("step", "stl"):
+        report = preflight_export(document, rebuilt, fmt, tmp_path / f"part.{fmt}")
+        assert report.ok
+        assert any("Emblem" in w and fmt.upper() in w for w in report.warnings)
+
+
+def test_preflight_leaves_a_color_stamp_alone_for_3mf(tmp_path):
+    document = _stamped_document(0.2)
+    report = preflight_export(document, RebuildResult(geometry=object()), "3mf", tmp_path / "p.3mf")
+    assert report.ok
+    assert not any("carries none" in w for w in report.warnings)
+
+
+def test_preflight_calls_out_a_stamp_thinner_than_a_printed_layer(tmp_path):
+    document = _stamped_document(0.02)
+    report = preflight_export(document, RebuildResult(geometry=object()), "3mf", tmp_path / "p.3mf")
+    assert report.ok
+    assert any("thinner than one printed layer" in w for w in report.warnings)
+
+
+def test_a_thin_stamp_is_not_reported_as_a_shallow_machined_mark(tmp_path):
+    """0.15 mm is a fine color stamp and a bad engraving.  Only one limit applies."""
+    document = _stamped_document(0.15)
+    report = preflight_export(document, RebuildResult(geometry=object()), "3mf", tmp_path / "p.3mf")
+    assert report.ok
+    assert not any("manufacturing limit" in w for w in report.warnings)
+    assert not any("thinner than one printed layer" in w for w in report.warnings)
+
+
+def test_a_shallow_engraving_is_still_reported(tmp_path):
+    from stamp.core.document import Document, Operation, OperationKind
+
+    document = Document(
+        base=BasePart(mode="solid", runtime=object()),
+        features=[Feature(name="Slot",
+                          operation=Operation(kind=OperationKind.CUT, depth=0.15))],
+    )
+    report = preflight_export(document, RebuildResult(geometry=object()), "3mf", tmp_path / "p.3mf")
+    assert any("manufacturing limit" in w for w in report.warnings)
+
+
+def test_a_disabled_color_stamp_warns_about_nothing(tmp_path):
+    document = _stamped_document(0.02)
+    document.features[0].enabled = False
+    report = preflight_export(document, RebuildResult(geometry=object()), "step", tmp_path / "p.step")
+    assert not any("Emblem" in w for w in report.warnings)
+
+
+def test_a_color_stamp_round_trips_and_still_counts_as_removing_material():
+    from stamp.core.document import Operation, OperationKind
+
+    operation = Operation(kind=OperationKind.COLOR, depth=0.2)
+    restored = Operation.from_dict(operation.to_dict())
+    assert restored.kind is OperationKind.COLOR
+    assert restored.removes_material
+    assert restored.label == "Color stamp"
+    # An older project has no colour stamps in it and must not grow one.
+    assert Operation.from_dict({}).kind is OperationKind.CUT
+
+
 def test_wrap_placement_round_trips_without_breaking_old_projects():
     placement = Placement(mode=PlacementMode.WRAP)
     assert Placement.from_dict(placement.to_dict()).mode is PlacementMode.WRAP

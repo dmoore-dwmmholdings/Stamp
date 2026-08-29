@@ -18,7 +18,7 @@ from dataclasses import dataclass, field, replace
 from enum import StrEnum
 from typing import Any, Literal
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 Units = Literal["mm", "in"]
 Mode = Literal["solid", "mesh"]
@@ -31,6 +31,24 @@ def new_id() -> str:
 class OperationKind(StrEnum):
     ADD = "add"
     CUT = "cut"
+    #: A colour-only mark (§9): a layer-thin recess that the 3MF export fills back
+    #: in with a second-colour body, so the artwork prints flush with the face
+    #: instead of standing proud of it.  Everywhere colour cannot be carried - the
+    #: viewport, STEP, STL - it is exactly the shallow recess it is built from.
+    COLOR = "color"
+
+
+#: What a new colour stamp is worth in mm: one 0.2 mm layer on a typical FDM
+#: printer, which is the thinnest thing that reliably comes out in a second colour.
+COLOR_STAMP_DEPTH = 0.2
+
+#: Below this there is no whole layer for the slicer to change colour on, so the
+#: mark either vanishes or prints as a single ragged pass.
+COLOR_STAMP_MIN_DEPTH = 0.08
+
+#: Switching an existing feature to a colour stamp keeps its depth unless the depth
+#: is plainly an engraving depth rather than an ink thickness.
+COLOR_STAMP_MAX_KEPT_DEPTH = 1.0
 
 
 class DepthMode(StrEnum):
@@ -494,6 +512,23 @@ class Operation:
     direction: Direction = Direction.INTO
     draft_angle: float = 0.0
     to_face_ref: FaceRef | None = None
+
+    @property
+    def label(self) -> str:
+        """How the operation is named in reports and the proof sheet."""
+        if self.kind is OperationKind.COLOR:
+            return "Color stamp"
+        return str(self.kind).title()
+
+    @property
+    def removes_material(self) -> bool:
+        """True for anything that cuts into the part: a plain cut or a colour stamp.
+
+        A colour stamp is a cut everywhere except the 3MF export, which fills the
+        recess back in, so code asking "does this take material away?" must say yes
+        to both.  Code asking "is this a colour stamp?" compares the kind.
+        """
+        return self.kind is not OperationKind.ADD
 
     def to_dict(self) -> dict[str, Any]:
         return {

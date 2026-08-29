@@ -582,6 +582,26 @@ with the feature that created them and re-derived on rebuild rather than re-sear
 - Binary STL by default, ASCII on request.
 - Verify watertightness before writing; warn if it isn't.
 
+**3MF** (both modes), for multi-color printing:
+- Split the rebuilt result along feature boundaries: a base body, plus one body per feature. Raised
+  artwork is `result ∩ tool`; engraved artwork is the inlay the cut removed, `base ∩ tool − result`,
+  which fills the pocket flush with the surface. A through cut stays open.
+- Write the bodies as components of one object so the part moves in one piece on the plate, and put
+  the colors on the triangles through the materials extension — an object-level `basematerials`
+  group is ignored by Bambu Studio's color parser.
+- Offer to leave the colors out entirely: separate named bodies with no color asks the slicer
+  nothing on the way in.
+
+**Color stamp** (`OperationKind.COLOR`), artwork that is color and nothing else:
+- A third operation kind beside add and cut. It cuts a recess one printed layer deep (0.2 mm by
+  default) and the 3MF export fills it back in as the second-color body, so the artwork prints flush
+  with the face instead of standing proud of it. Base plus inlay equal the original part.
+- Blind depth only — the export needs a floor to fill up to — so the depth-mode picker gives way to
+  a single thickness. Below 0.08 mm there is no whole layer for the slicer to change color on, so
+  preflight warns.
+- Only 3MF carries the second body. STEP and STL get the bare recess, and preflight says so before
+  writing one.
+
 **Both:** default filename = `<project>_<yyyymmdd>.<ext>`. Remember the last export folder.
 Show a completion toast with the file size and, for STL, the triangle count.
 

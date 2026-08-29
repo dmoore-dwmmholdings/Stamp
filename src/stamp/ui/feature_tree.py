@@ -1,7 +1,8 @@
 """The feature tree - spec §7, left panel.
 
 Base part pinned at the top, features in application order, drag to reorder, a
-checkbox to suppress, add/cut icons, and a warning badge on anything that failed.
+checkbox to suppress, an icon per operation kind, and a warning badge on anything
+that failed.
 Double-click renames.  Right-click gives duplicate, mirror, and delete.
 """
 
@@ -21,6 +22,7 @@ from stamp.core.document import Document, Feature, ModifierKind, OperationKind
 
 ADD_ICON = "↗"  # north east arrow - material added
 CUT_ICON = "↘"  # south east arrow - material removed
+STAMP_ICON = "◈"  # a filled shape inside an outline - a colour inlay, flush
 WARN_ICON = "⚠"
 BROKEN_ICON = "✖"
 
@@ -108,7 +110,10 @@ class FeatureTree(QTreeWidget):
 
     def _add_feature_item(self, feature: Feature) -> QTreeWidgetItem:
         item = QTreeWidgetItem(self)
-        icon = ADD_ICON if feature.operation.kind is OperationKind.ADD else CUT_ICON
+        icon = {
+            OperationKind.ADD: ADD_ICON,
+            OperationKind.COLOR: STAMP_ICON,
+        }.get(feature.operation.kind, CUT_ICON)
         item.setText(0, f"{icon}  {feature.name}")
         item.setData(0, ROLE_KIND, "feature")
         item.setData(0, ROLE_FEATURE_ID, feature.id)

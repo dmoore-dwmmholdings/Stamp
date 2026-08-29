@@ -8,6 +8,11 @@ is divided along feature boundaries:
   (``result − tool``), so the two mate exactly with no overlap.
 * An engraved feature becomes an inlay that fills the pocket flush with the
   surface: the volume the cut removed (``base ∩ tool − result``).
+* A color stamp is that same inlay, and it is the whole point of the feature
+  rather than a bonus: the recess is only a layer or two deep and exists so the
+  slicer has somewhere to put a second color.  Filled, the artwork is flush with
+  the face; unfilled, the part ships with an open recess, so a stamp that yields
+  no body is reported in those words.
 * A through cut stays a hole; refilling it in another color would defeat it.
 
 The tool solid used here is the one the rebuild kept, before its own fillets and
@@ -73,6 +78,21 @@ def _feature_of(document: Document, feature_id: str):
     return next((f for f in document.features if f.id == feature_id), None)
 
 
+def _skipped(feature, reason: str) -> str:
+    """Say what a skipped feature costs, which is not the same for both kinds.
+
+    A raised or engraved feature that yields no body simply prints in the base
+    color.  A color stamp that yields no body leaves the recess it cut wide open,
+    which is a defect in the part and not only a missing color.
+    """
+    if feature.operation.kind is OperationKind.COLOR:
+        return (
+            f"{feature.name}: {reason} A color stamp with no body leaves an open "
+            f"recess in the face, so fix it or turn the feature off."
+        )
+    return f"{feature.name}: {reason}"
+
+
 def _split_solid(document: Document, result: RebuildResult, deflection: float) -> ColorSplit:
     out = ColorSplit()
     final = result.geometry
@@ -84,7 +104,7 @@ def _split_solid(document: Document, result: RebuildResult, deflection: float) -
         if feature is None or row.tool is None:
             continue
         if row.broken:
-            out.warnings.append(f"{feature.name}: this feature is broken, so it was skipped.")
+            out.warnings.append(_skipped(feature, "this feature is broken, so it was skipped."))
             continue
         tool = row.tool.shape
         try:
@@ -105,11 +125,11 @@ def _split_solid(document: Document, result: RebuildResult, deflection: float) -
                 ).shape
                 body = solid_ops.boolean(pocket, final, "cut", collect_history=False).shape
         except solid_ops.GeometryError as exc:
-            out.warnings.append(f"{feature.name}: the color split failed ({exc}), skipped.")
+            out.warnings.append(_skipped(feature, f"the color split failed ({exc}), skipped."))
             continue
         if solid_ops.volume(body) < MIN_BODY_VOLUME_MM3:
             out.warnings.append(
-                f"{feature.name}: this feature leaves no printable volume, so it was skipped."
+                _skipped(feature, "this feature leaves no printable volume, so it was skipped.")
             )
             continue
         pieces.append((feature.name, body))
@@ -133,7 +153,7 @@ def _split_mesh(document: Document, result: RebuildResult, deflection: float) ->
         if feature is None or row.tool is None:
             continue
         if row.broken:
-            out.warnings.append(f"{feature.name}: this feature is broken, so it was skipped.")
+            out.warnings.append(_skipped(feature, "this feature is broken, so it was skipped."))
             continue
         try:
             tool = mesh_ops.shape_to_manifold(row.tool.shape, deflection)
@@ -150,11 +170,11 @@ def _split_mesh(document: Document, result: RebuildResult, deflection: float) ->
                 pocket = mesh_ops.boolean(document.base.runtime, tool, "intersect").manifold
                 body = mesh_ops.boolean(pocket, final, "cut").manifold
         except ValueError as exc:
-            out.warnings.append(f"{feature.name}: the color split failed ({exc}), skipped.")
+            out.warnings.append(_skipped(feature, f"the color split failed ({exc}), skipped."))
             continue
         if body.is_empty() or body.volume() < MIN_BODY_VOLUME_MM3:
             out.warnings.append(
-                f"{feature.name}: this feature leaves no printable volume, so it was skipped."
+                _skipped(feature, "this feature leaves no printable volume, so it was skipped.")
             )
             continue
         pieces.append((feature.name, body))

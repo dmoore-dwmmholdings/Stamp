@@ -677,6 +677,10 @@ class Color3mfDialog(QDialog):
     The file carries one body per feature plus the base, each bound to a filament
     slot, so a color printer (Bambu, Orca and friends) prints the artwork in a
     second color without any painting in the slicer.
+
+    *stamp_count* is how many of those features are color stamps, whose recess this
+    export is the only one that fills back in.  It changes what the dialog says,
+    not what it writes.
     """
 
     PRESETS = [("Draft (0.1 mm)", 0.1), ("Normal (0.02 mm)", 0.02), ("Fine (0.005 mm)", 0.005)]
@@ -690,6 +694,7 @@ class Color3mfDialog(QDialog):
         self,
         feature_count: int,
         *,
+        stamp_count: int = 0,
         mode: str = "solid",
         base_color: str | None = None,
         feature_color: str | None = None,
@@ -710,6 +715,18 @@ class Color3mfDialog(QDialog):
         )
         note.setWordWrap(True)
         layout.addWidget(note)
+
+        if stamp_count:
+            # A colour stamp is the one body whose colour is not decoration: without
+            # it the recess the stamp cut stays open, so say what the file is for.
+            stamps = QLabel(
+                f"{stamp_count} of them "
+                f"{'is a color stamp' if stamp_count == 1 else 'are color stamps'}, "
+                f"filled back in flush with the face. This is the only format that "
+                f"fills them; a STEP or STL of this part keeps the bare recess."
+            )
+            stamps.setWordWrap(True)
+            layout.addWidget(stamps)
 
         self.color_box = QCheckBox("Write these colors into the file")
         self.color_box.setChecked(write_colors)

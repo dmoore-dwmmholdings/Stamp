@@ -321,6 +321,27 @@ entries next to the filaments actually loaded. The colours are remembered
 between exports, and they can be left out altogether - the parts stay separate
 and named, and no colour parsing window appears at all.
 
+A color stamp is the third operation kind (`OperationKind.COLOR`). It is a cut
+everywhere except the 3MF export, which fills its recess back in, so the code
+that asks "does this take material away?" reads `operation.removes_material`
+rather than comparing against `CUT` - that comparison was in three places and
+each one would have treated a stamp as an add.
+
+The geometry needed nothing new. `color_split` already turned an engraving into
+an inlay that fills its pocket flush, so a stamp is that path with a layer-thin
+blind depth and a name that says what it is for. What the feature actually
+bought was the constraint and the warnings: blind depth only (every other mode
+leaves no floor to fill up to), a thickness reset when a deep engraving is
+switched over, a preflight line when the thickness is under one printed layer,
+and another when STEP or STL is asked for a mark that only 3MF can fill. A
+stamp that yields no body is reported in different words from a plain feature
+that yields none, because the part ships with an open recess rather than simply
+a missing color.
+
+`SCHEMA_VERSION` went to 4. A project holding a color stamp opened by an older
+build would rebuild it as a plain engraving and export a part with a hole in the
+face, so the version refuses instead.
+
 ## Timings on the standard test
 
 `bracket.step` / `bracket.stl` with `logo.svg`:

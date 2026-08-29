@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from stamp.core.document import Document, Feature, InspectionSettings
+from stamp.core.document import Document, Feature, InspectionSettings, OperationKind
 
 # Conservative starting points, in millimetres.  They are editable after selection.
 MANUFACTURING_RULESETS: dict[str, tuple[float, float, float]] = {
@@ -129,7 +129,13 @@ def inspect_feature(document: Document, feature: Feature) -> list[str]:
         return []
     warnings: list[str] = []
     prefix = f"{feature.name}: "
-    if feature.operation.depth < settings.min_depth_mm:
+    # A colour stamp is read by its colour, not by its depth, so the limit a
+    # machined mark has to clear does not apply to it.  What does apply - whether
+    # the printer has a whole layer to change filament on - is checked at export.
+    if (
+        feature.operation.kind is not OperationKind.COLOR
+        and feature.operation.depth < settings.min_depth_mm
+    ):
         warnings.append(prefix + f"depth {feature.operation.depth:g} mm is below the {settings.min_depth_mm:g} mm manufacturing limit.")
     if abs(feature.operation.draft_angle) > 45:
         warnings.append(prefix + f"draft {feature.operation.draft_angle:g}° is unusually steep; verify the manufacturing process.")

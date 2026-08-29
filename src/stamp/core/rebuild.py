@@ -313,7 +313,7 @@ class RebuildEngine:
             label = f"{feature.name} - {modifier.label}"
             if (
                 edges
-                and feature.operation.kind is OperationKind.CUT
+                and feature.operation.removes_material
                 and not solid_ops.edges_reach_shape(
                     edges, geometry, max(document.base.diagonal * 1e-3, 1e-3)
                 )
