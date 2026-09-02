@@ -18,7 +18,7 @@ from dataclasses import dataclass, field, replace
 from enum import StrEnum
 from typing import Any, Literal
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 Units = Literal["mm", "in"]
 Mode = Literal["solid", "mesh"]
@@ -95,6 +95,29 @@ class PatternKind(StrEnum):
     LINEAR = "linear"
     CIRCULAR = "circular"
     MIRROR = "mirror"
+
+
+class MirrorPlane(StrEnum):
+    """Which principal plane a whole-part mirror reflects across."""
+
+    NONE = "none"
+    YZ = "yz"
+    XZ = "xz"
+    XY = "xy"
+
+    @property
+    def axis(self) -> int:
+        """The index of the axis the reflection negates.  ``NONE`` has none."""
+        return {MirrorPlane.YZ: 0, MirrorPlane.XZ: 1, MirrorPlane.XY: 2}[self]
+
+    @property
+    def label(self) -> str:
+        return {
+            MirrorPlane.NONE: "No mirror",
+            MirrorPlane.YZ: "Mirror left to right (YZ)",
+            MirrorPlane.XZ: "Mirror front to back (XZ)",
+            MirrorPlane.XY: "Mirror top to bottom (XY)",
+        }[self]
 
 
 class CodeKind(StrEnum):
@@ -816,6 +839,107 @@ class BasePart:
         return (dx * dx + dy * dy + dz * dz) ** 0.5
 
 
+
+# -------------------------------------------------------------- part transform
+
+
+#: A scale factor below this is treated as a mistake rather than a tiny part.
+MIN_PART_SCALE = 1e-4
+#: Above this the result is larger than any machine, and usually a units mix-up.
+MAX_PART_SCALE = 1e4
+
+
+@dataclass
+class PartTransform:
+    """A mirror and a scale applied to the finished part - not to the artwork.
+
+    The transform runs once, after every feature has been applied, so nothing in
+    the feature chain has to know about it: sketch planes, anchors, snapping and
+    the drag handles all keep working in the part's own untransformed space.  The
+    exporters take the transformed geometry; the editor shows the untransformed
+    one unless the user asks to see the result.
+    """
+
+    mirror: MirrorPlane = MirrorPlane.NONE
+    scale: tuple[float, float, float] = (1.0, 1.0, 1.0)
+    uniform: bool = True
+
+    @property
+    def is_identity(self) -> bool:
+        return self.mirror is MirrorPlane.NONE and self.scale == (1.0, 1.0, 1.0)
+
+    @property
+    def is_uniform_scale(self) -> bool:
+        sx, sy, sz = self.scale
+        return sx == sy == sz
+
+    @property
+    def mirrors(self) -> bool:
+        return self.mirror is not MirrorPlane.NONE
+
+    def with_uniform(self, factor: float) -> PartTransform:
+        return replace(self, scale=(factor, factor, factor), uniform=True)
+
+    def validate(self) -> list[str]:
+        """Everything wrong with this transform, in words a user can act on."""
+        problems: list[str] = []
+        for name, value in zip("XYZ", self.scale, strict=True):
+            if value <= 0:
+                problems.append(f"The {name} scale must be greater than zero.")
+            elif value < MIN_PART_SCALE:
+                problems.append(
+                    f"The {name} scale of {value:g} is smaller than Stamp will go "
+                    f"({MIN_PART_SCALE:g})."
+                )
+            elif value > MAX_PART_SCALE:
+                problems.append(
+                    f"The {name} scale of {value:g} is larger than Stamp will go "
+                    f"({MAX_PART_SCALE:g}). Check the units."
+                )
+        if self.uniform and not self.is_uniform_scale:
+            problems.append("Uniform scale is on, but the three factors differ.")
+        return problems
+
+    def size_from(self, size: tuple[float, float, float]) -> tuple[float, float, float]:
+        """The finished bounding-box size for a part of *size*.  Mirror keeps it."""
+        return tuple(abs(s) * f for s, f in zip(size, self.scale, strict=True))
+
+    @staticmethod
+    def factor_for(current: float, target: float) -> float:
+        """Solve the scale factor that turns *current* into *target*."""
+        if current <= 0:
+            raise ValueError("That dimension is zero, so there is nothing to scale.")
+        if target <= 0:
+            raise ValueError("A finished dimension has to be greater than zero.")
+        return target / current
+
+    def suffix(self) -> str:
+        """What a mirrored or scaled export adds to the filename."""
+        parts = []
+        if self.mirrors:
+            parts.append("mirrored")
+        if not self.is_identity and self.scale != (1.0, 1.0, 1.0):
+            if self.is_uniform_scale:
+                parts.append(f"{self.scale[0] * 100:g}pct")
+            else:
+                parts.append("scaled")
+        return "-".join(parts)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"mirror": str(self.mirror), "scale": list(self.scale), "uniform": self.uniform}
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> PartTransform:
+        scale = tuple(float(v) for v in d.get("scale", (1.0, 1.0, 1.0)))
+        if len(scale) != 3:
+            scale = (1.0, 1.0, 1.0)
+        return cls(
+            mirror=MirrorPlane(d.get("mirror", "none")),
+            scale=scale,
+            uniform=bool(d.get("uniform", True)),
+        )
+
+
 # --------------------------------------------------------------------- document
 
 
@@ -828,6 +952,7 @@ class Document:
     name: str = "Untitled"
     inspection: InspectionSettings = field(default_factory=InspectionSettings)
     datums: list[DatumDefinition] = field(default_factory=list)
+    transform: PartTransform = field(default_factory=PartTransform)
 
     # ------------------------------------------------------------ serialization
 
@@ -841,6 +966,7 @@ class Document:
             "features": [f.to_dict() for f in self.features],
             "inspection": self.inspection.to_dict(),
             "datums": [datum.to_dict() for datum in self.datums],
+            "transform": self.transform.to_dict(),
         }
 
     @classmethod
@@ -859,6 +985,7 @@ class Document:
             features=[Feature.from_dict(f) for f in d.get("features", [])],
             inspection=InspectionSettings.from_dict(d.get("inspection", {})),
             datums=[DatumDefinition.from_dict(item) for item in d.get("datums", [])],
+            transform=PartTransform.from_dict(d.get("transform", {})),
         )
 
     # ------------------------------------------------------------------ editing
@@ -911,6 +1038,9 @@ class Document:
         self.units = other.units
         self.view_state = other.view_state
         self.features = other.features
+        self.inspection = other.inspection
+        self.datums = other.datums
+        self.transform = other.transform
         if other.base is not None:
             other.base.runtime = runtime
         self.base = other.base
@@ -974,10 +1104,12 @@ __all__ = [
     "EdgeSelector",
     "FaceRef",
     "Feature",
+    "MirrorPlane",
     "Modifier",
     "ModifierKind",
     "Operation",
     "OperationKind",
+    "PartTransform",
     "Placement",
     "Plane",
     "ProfileRef",

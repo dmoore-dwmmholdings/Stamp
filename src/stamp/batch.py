@@ -13,7 +13,7 @@ from stamp.core.document import Document
 from stamp.core.profiles import ProfileCache
 from stamp.core.rebuild import RebuildEngine
 from stamp.core.replace_part import replace_part
-from stamp.geom import color_split
+from stamp.geom import color_split, part_transform
 from stamp.io import export as export_io
 from stamp.io.part_import import import_part
 from stamp.io.project import open_project
@@ -167,13 +167,15 @@ def run_batch(template: str | Path, csv_path: str | Path, output_dir: str | Path
                 output.parent.mkdir(parents=True, exist_ok=True)
                 preflight = export_io.preflight_export(document, rebuilt, fmt, output)
                 preflight.require_ok()
+                geometry = part_transform.for_export(document, rebuilt.geometry)
                 if fmt == "step":
-                    result = export_io.export_step(rebuilt.geometry, output)
+                    result = export_io.export_step(geometry, output)
                 elif fmt == "stl":
-                    result = export_io.export_stl(rebuilt.geometry, output, mode=document.base.mode)
+                    result = export_io.export_stl(geometry, output, mode=document.base.mode)
                 else:
                     split = color_split.split_for_color(document, rebuilt)
-                    result = export_io.export_3mf(split.bodies, output)
+                    bodies = part_transform.transform_bodies(document, split.bodies)
+                    result = export_io.export_3mf(bodies, output)
                     preflight.warnings.extend(split.warnings)
                 report.rows.append(BatchRow(index, str(source), str(result.path), "ok", warnings=preflight.warnings))
             except Exception as exc:

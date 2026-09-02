@@ -150,10 +150,16 @@ class ExportResult:
         return f"{size:.1f} GB"
 
 
-def default_filename(project_name: str, extension: str) -> str:
+def default_filename(project_name: str, extension: str, *, suffix: str = "") -> str:
+    """The suggested name for an export.
+
+    *suffix* names what the part transform did - ``mirrored``, ``125pct`` - so a
+    mirrored copy never lands on top of the original in the same folder.
+    """
     stamp = _dt.date.today().strftime("%Y%m%d")
     safe = "".join(c for c in project_name if c.isalnum() or c in "-_") or "stamp"
-    return f"{safe}_{stamp}.{extension.lstrip('.')}"
+    tail = f"-{suffix}" if suffix else ""
+    return f"{safe}{tail}_{stamp}.{extension.lstrip('.')}"
 
 
 def _proof_html(document, warnings: list[str], screenshot: bytes | None) -> str:

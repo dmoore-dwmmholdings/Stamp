@@ -65,7 +65,7 @@ from stamp.core.refs import (
     plane_from_face,
     resolve_face_ref,
 )
-from stamp.geom import mesh_regions
+from stamp.geom import mesh_regions, part_transform
 from stamp.geom.mesh_regions import DEFAULT_TOLERANCE_DEG
 from stamp.io import export as export_io
 from stamp.io import project as project_io
@@ -2294,9 +2294,26 @@ class MainWindow(QMainWindow):
     # ----------------------------------------------------------------- exports
 
     def _geometry(self):
+        """The rebuilt part, in its own untransformed space."""
         if self._last_result is not None and self._last_result.geometry is not None:
             return self._last_result.geometry
         return self.document.base.runtime if self.document.base else None
+
+    def _export_geometry(self):
+        """What an export writes: the rebuilt part with the part transform applied.
+
+        Returns ``None`` and says why when the transform cannot be applied, so an
+        export command can simply stop.
+        """
+        geometry = self._geometry()
+        try:
+            return part_transform.for_export(self.document, geometry)
+        except part_transform.PartTransformError as exc:
+            self._notify("Stamp could not apply the part transform", str(exc))
+            return None
+
+    def _export_suffix(self) -> str:
+        return self.document.transform.suffix()
 
     def export_step(self) -> None:
         if self.document.base is None:
@@ -2304,13 +2321,18 @@ class MainWindow(QMainWindow):
         if self.document.base.mode != "solid":
             self._notify("There is no STEP to write", export_io.MESH_MODE_NO_STEP)
             return
+        geometry = self._export_geometry()
+        if geometry is None:
+            return
         options = dialogs.StepExportDialog(self)
         if not self._ask(options):
             return
         schema = options.schema_name()
         merge = options.merge_faces()
 
-        suggested = export_io.default_filename(self.document.name, "step")
+        suggested = export_io.default_filename(
+            self.document.name, "step", suffix=self._export_suffix()
+        )
         path, _ = QFileDialog.getSaveFileName(
             self, "Export STEP", str(Path(self._last_dir("export")) / suggested),
             "STEP files (*.step *.stp)",
@@ -2327,13 +2349,13 @@ class MainWindow(QMainWindow):
             return
         try:
             result = export_io.export_step(
-                self._geometry(), path, schema=schema, simplify=merge
+                geometry, path, schema=schema, simplify=merge
             )
         except export_io.ExportError as exc:
             if not self._confirm("Export anyway?", f"{exc}\n\nWrite the file anyway?"):
                 return
             result = export_io.export_step(
-                self._geometry(), path, schema=schema, simplify=merge, allow_invalid=True
+                geometry, path, schema=schema, simplify=merge, allow_invalid=True
             )
         self._remember_dir("export", Path(path))
         result.warnings.extend(preflight.warnings)
@@ -2343,7 +2365,9 @@ class MainWindow(QMainWindow):
         if self.document.base is None:
             return
         mode = self.document.base.mode
-        geometry = self._geometry()
+        geometry = self._export_geometry()
+        if geometry is None:
+            return
 
         def counter(deflection: float) -> int:
             return export_io.triangle_count_for(geometry, mode, deflection)
@@ -2352,7 +2376,9 @@ class MainWindow(QMainWindow):
         if not self._ask(dialog):
             return
 
-        suggested = export_io.default_filename(self.document.name, "stl")
+        suggested = export_io.default_filename(
+            self.document.name, "stl", suffix=self._export_suffix()
+        )
         path, _ = QFileDialog.getSaveFileName(
             self, "Export STL", str(Path(self._last_dir("export")) / suggested),
             "STL files (*.stl)",
@@ -2412,7 +2438,9 @@ class MainWindow(QMainWindow):
         self.settings.setValue("3mf/feature_color", dialog.feature_color())
         self.settings.setValue("3mf/write_colors", dialog.write_colors())
 
-        suggested = export_io.default_filename(self.document.name, "3mf")
+        suggested = export_io.default_filename(
+            self.document.name, "3mf", suffix=self._export_suffix()
+        )
         path, _ = QFileDialog.getSaveFileName(
             self, "Export 3MF", str(Path(self._last_dir("export")) / suggested),
             "3MF files (*.3mf)",
@@ -2431,13 +2459,18 @@ class MainWindow(QMainWindow):
             split = color_split.split_for_color(
                 self.document, self._last_result, deflection=dialog.deflection_mm()
             )
+            bodies = part_transform.transform_bodies(self.document, split.bodies)
             result = export_io.export_3mf(
-                split.bodies, path,
+                bodies, path,
                 base_color=dialog.base_color(),
                 feature_color=dialog.feature_color(),
                 write_colors=dialog.write_colors(),
             )
-        except (color_split.ColorSplitError, export_io.ExportError) as exc:
+        except (
+            color_split.ColorSplitError,
+            export_io.ExportError,
+            part_transform.PartTransformError,
+        ) as exc:
             self._notify("Stamp could not write the 3MF", str(exc))
             return
         result.warnings.extend(split.warnings)
@@ -2462,9 +2495,12 @@ class MainWindow(QMainWindow):
         )
         if not folder:
             return
+        geometry = self._export_geometry()
+        if geometry is None:
+            return
         try:
             written = export_io.export_for_quote(
-                self._geometry(), folder, self.document.name,
+                geometry, folder, self.document.name,
                 mode=self.document.base.mode,
                 screenshot=self._thumbnail(),
                 units=self.document.units,
@@ -2521,9 +2557,12 @@ class MainWindow(QMainWindow):
         )
         if not path:
             return
+        geometry = self._export_geometry()
+        if geometry is None:
+            return
         try:
             result = export_io.export_job_package(
-                self.document, self._geometry(), path, fmt=fmt,
+                self.document, geometry, path, fmt=fmt,
                 screenshot=self._thumbnail(), rebuild=self._last_result,
             )
         except Exception as exc:
