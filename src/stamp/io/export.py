@@ -100,7 +100,65 @@ def preflight_export(
     if fmt == "3mf":
         report.warnings.append("3MF exports separate bodies; verify material assignment in your slicer.")
     report.warnings.extend(_color_stamp_warnings(document, fmt))
+    report.errors.extend(_transform_errors(document))
+    report.warnings.extend(_transform_warnings(document))
     return report
+
+
+def _transform_errors(document: Document) -> list[str]:
+    return list(document.transform.validate())
+
+
+def _transform_warnings(document: Document) -> list[str]:
+    """What a mirrored or scaled export needs said before it is written.
+
+    The transform runs after the features, so every dimension in the project -
+    artwork size, engraving depth, fillet radius - is multiplied along with the
+    part.  That is usually what a user scaling a whole part wants, and always
+    something they should be told rather than left to measure.
+    """
+    transform = document.transform
+    if transform.is_identity:
+        return []
+    out: list[str] = []
+    if transform.mirrors:
+        out.append(
+            "This part is mirrored on the way out, so text and artwork read "
+            "backwards in the exported file. That is right for a die or a "
+            "handed pair, and wrong if you wanted a readable mark."
+        )
+    if transform.scale != (1.0, 1.0, 1.0):
+        factors = transform.scale
+        shown = (
+            f"{factors[0] * 100:g}%"
+            if transform.is_uniform_scale
+            else " x ".join(f"{f:g}" for f in factors)
+        )
+        out.append(
+            f"This part is scaled {shown} on the way out. Artwork sizes, "
+            f"engraving depths, fillet and chamfer radii are all multiplied with "
+            f"it - the numbers in the panel are the ones before scaling."
+        )
+        if not transform.is_uniform_scale and document.base is not None:
+            if document.base.mode == "solid":
+                out.append(
+                    "A different scale on each axis turns holes into ellipses and "
+                    "fillets into variable-radius blends. Check the result before "
+                    "sending it to a shop."
+                )
+        smallest = min(transform.scale)
+        thinned = [
+            f.name for f in document.features
+            if f.enabled and f.operation.kind is OperationKind.COLOR
+            and f.operation.depth * smallest < COLOR_STAMP_MIN_DEPTH
+        ]
+        if thinned:
+            out.append(
+                f"{', '.join(thinned)}: after scaling, the color stamp is thinner "
+                f"than one printed layer on most machines, so the color may not "
+                f"appear."
+            )
+    return out
 
 
 def _color_stamp_warnings(document: Document, fmt: str) -> list[str]:
@@ -162,6 +220,53 @@ def default_filename(project_name: str, extension: str, *, suffix: str = "") -> 
     return f"{safe}{tail}_{stamp}.{extension.lstrip('.')}"
 
 
+NO_QT_FOR_PDF = (
+    "Writing a PDF needs the desktop application. Run this from Stamp rather than "
+    "from a script with no Qt application."
+)
+
+
+def _require_qt_application() -> None:
+    """QPdfWriter aborts the process outright when no QGuiApplication exists.
+
+    That is not an exception a caller can catch - the interpreter dies - so the
+    check has to happen before the writer is built.
+    """
+    try:
+        from PySide6.QtGui import QGuiApplication
+    except Exception as exc:  # pragma: no cover - PySide6 is a hard dependency
+        raise ExportError(NO_QT_FOR_PDF) from exc
+    if QGuiApplication.instance() is None:
+        raise ExportError(NO_QT_FOR_PDF)
+
+
+def transform_summary(document) -> str:
+    """One line describing the part transform, for a handoff record.
+
+    A shop holding a mirrored or scaled file has no way to tell from the geometry
+    alone which hand or which size it received, so every record Stamp writes says
+    it in words.
+    """
+    transform = getattr(document, "transform", None)
+    if transform is None or transform.is_identity:
+        return "As modelled"
+    said = []
+    if transform.mirrors:
+        said.append(transform.mirror.label.split(" (")[0].replace("Mirror ", "Mirrored "))
+    if transform.scale != (1.0, 1.0, 1.0):
+        if transform.is_uniform_scale:
+            said.append(f"scaled to {transform.scale[0] * 100:g}%")
+        else:
+            said.append(
+                "scaled " + " x ".join(f"{f:g}" for f in transform.scale) + " (X, Y, Z)"
+            )
+    line = ", ".join(said)
+    if document.base is not None:
+        dx, dy, dz = transform.size_from(document.base.size)
+        line += f" - finished {dx:.2f} x {dy:.2f} x {dz:.2f} mm"
+    return line[0].upper() + line[1:]
+
+
 def _proof_html(document, warnings: list[str], screenshot: bytes | None) -> str:
     """The readable handoff record shared by standalone and package PDF exports."""
     image = ""
@@ -175,6 +280,7 @@ def _proof_html(document, warnings: list[str], screenshot: bytes | None) -> str:
             ("Source", Path(part.source_path).name or "embedded project part"),
             ("Kind", "Solid" if part.mode == "solid" else "Mesh"),
             ("Bounding box", " × ".join(f"{value:.2f}" for value in part.bbox) + " mm"),
+            ("Mirror and scale", transform_summary(document)),
         ]
     rows = "".join(
         "<tr>" + "".join(f"<td>{html.escape(str(value))}</td>" for value in values) + "</tr>"
@@ -220,6 +326,7 @@ def export_proof_sheet(
     report = preflight_export(document, rebuild, fmt, path)
     report.require_ok()
     path = Path(path).with_suffix(".pdf")
+    _require_qt_application()
     try:
         from PySide6.QtCore import QSizeF
         from PySide6.QtGui import QPageSize, QPdfWriter, QTextDocument
@@ -249,7 +356,9 @@ def export_job_package(document, geometry: object, path: str | Path, *, fmt: str
         path = path.with_suffix(".zip")
     with tempfile.TemporaryDirectory(prefix="stamp-package-") as temp_name:
         temp = Path(temp_name)
-        model = temp / default_filename(document.name, fmt)
+        model = temp / default_filename(
+            document.name, fmt, suffix=document.transform.suffix()
+        )
         if fmt == "step":
             export_step(geometry, model)
         elif fmt == "stl":
@@ -260,15 +369,23 @@ def export_job_package(document, geometry: object, path: str | Path, *, fmt: str
         manifest = {
             "project": document.name, "generated": _dt.datetime.now(tz=_dt.UTC).isoformat(),
             "format": fmt, "warnings": report.warnings,
+            "transform": document.transform.to_dict(),
+            "transform_summary": transform_summary(document),
             "features": [{"name": f.name, "metadata": f.metadata.to_dict()} for f in document.features],
         }
         (temp / "preflight.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
         summary = temp / "production-summary.pdf"
-        lines = [f"<h1>{document.name}</h1>", f"<p>Model: {model.name}</p>", "<h2>Features</h2><ul>"]
+        lines = [
+            f"<h1>{document.name}</h1>",
+            f"<p>Model: {model.name}</p>",
+            f"<p>Mirror and scale: {html.escape(transform_summary(document))}</p>",
+            "<h2>Features</h2><ul>",
+        ]
         for feature in document.features:
             meta = feature.metadata
             lines.append(f"<li><b>{feature.name}</b> {meta.identifier} {meta.process}<br>{meta.notes}</li>")
         lines.append("</ul><h2>Warnings</h2><ul>" + "".join(f"<li>{w}</li>" for w in report.warnings) + "</ul>")
+        _require_qt_application()
         try:
             from PySide6.QtCore import QSizeF
             from PySide6.QtGui import QPageSize, QPdfWriter, QTextDocument

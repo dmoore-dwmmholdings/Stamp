@@ -259,3 +259,241 @@ def test_for_export_uses_the_documents_transform(bracket_step):
     assert solid_ops.volume(written) == pytest.approx(
         8 * solid_ops.volume(bracket_step.runtime), rel=1e-9
     )
+
+
+# ----------------------------------------------------------- exporting a copy
+
+
+@pytest.fixture
+def scaled_document(bracket_step):
+    document = Document(base=bracket_step)
+    document.transform = PartTransform(mirror=MirrorPlane.YZ, scale=(2.0, 2.0, 2.0))
+    return document
+
+
+def a_rebuild(part):
+    from stamp.core.profiles import ProfileCache
+    from stamp.core.rebuild import RebuildEngine
+
+    return RebuildEngine(ProfileCache().get).rebuild(Document(base=part))
+
+
+def test_the_step_written_is_the_transformed_one(scaled_document, bracket_step, tmp_path):
+    from stamp.io import export as export_io
+
+    geometry = part_transform.for_export(scaled_document, bracket_step.runtime)
+    written = export_io.export_step(geometry, tmp_path / "mirrored.step")
+    assert written.path.exists()
+    reread = _reimport(written.path)
+    assert reread.volume == pytest.approx(8 * bracket_step.volume, rel=1e-3)
+
+
+def test_the_stl_written_is_the_transformed_one(scaled_document, bracket_step, tmp_path):
+    from stamp.io import export as export_io
+
+    geometry = part_transform.for_export(scaled_document, bracket_step.runtime)
+    written = export_io.export_stl(geometry, tmp_path / "mirrored.stl", mode="solid")
+    assert written.path.exists()
+    reread = _reimport(written.path)
+    assert reread.size[0] == pytest.approx(2 * bracket_step.size[0], rel=1e-3)
+
+
+def test_both_hands_can_be_written_side_by_side(bracket_step, tmp_path):
+    """The point of the feature: one project, a left and a right, two files."""
+    from stamp.io import export as export_io
+
+    document = Document(base=bracket_step)
+    plain = export_io.default_filename("bracket", "step", suffix=document.transform.suffix())
+    left = export_io.export_step(
+        part_transform.for_export(document, bracket_step.runtime), tmp_path / plain
+    )
+    document.transform = PartTransform(mirror=MirrorPlane.YZ)
+    mirrored_name = export_io.default_filename(
+        "bracket", "step", suffix=document.transform.suffix()
+    )
+    right = export_io.export_step(
+        part_transform.for_export(document, bracket_step.runtime), tmp_path / mirrored_name
+    )
+    assert left.path != right.path
+    assert "mirrored" in right.path.name
+    assert left.path.exists() and right.path.exists()
+    assert not np.allclose(
+        sorted_points(_reimport(left.path).runtime),
+        sorted_points(_reimport(right.path).runtime),
+        atol=1e-4,
+    )
+
+
+def test_the_colour_bodies_are_transformed_too(bracket_step):
+    from dataclasses import dataclass
+
+    @dataclass
+    class Body:
+        name: str
+        role: str
+        vertices: object
+        triangles: object
+
+    document = Document(base=bracket_step)
+    document.transform = PartTransform(mirror=MirrorPlane.YZ, scale=(2.0, 2.0, 2.0))
+    body = Body(
+        "base", "base",
+        np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]]),
+        np.array([[0, 1, 2]]),
+    )
+    out = part_transform.transform_bodies(document, [body])[0]
+    # A mirror without a winding flip leaves the body inside out for a slicer.
+    assert list(out.triangles[0]) == [0, 2, 1]
+    assert not np.allclose(out.vertices, body.vertices)
+
+
+def test_identity_leaves_the_colour_bodies_alone(bracket_step):
+    document = Document(base=bracket_step)
+    bodies = [object()]
+    assert part_transform.transform_bodies(document, bodies) is bodies
+
+
+def _reimport(path):
+    from stamp.io.part_import import import_part
+
+    return import_part(path).part
+
+
+# ------------------------------------------------------------------- preflight
+
+
+def test_preflight_says_a_mirrored_part_reads_backwards(bracket_step):
+    from stamp.io import export as export_io
+
+    document = Document(base=bracket_step)
+    document.transform = PartTransform(mirror=MirrorPlane.YZ)
+    report = export_io.preflight_export(document, a_rebuild(bracket_step), "step")
+    assert report.ok
+    assert any("backwards" in w for w in report.warnings)
+
+
+def test_preflight_says_the_stored_numbers_are_the_unscaled_ones(bracket_step):
+    from stamp.io import export as export_io
+
+    document = Document(base=bracket_step)
+    document.transform = PartTransform(scale=(2.0, 2.0, 2.0))
+    report = export_io.preflight_export(document, a_rebuild(bracket_step), "step")
+    assert any("before scaling" in w for w in report.warnings)
+
+
+def test_preflight_warns_about_a_per_axis_scale_on_a_solid(bracket_step):
+    from stamp.io import export as export_io
+
+    document = Document(base=bracket_step)
+    document.transform = PartTransform(scale=(2.0, 1.0, 1.0), uniform=False)
+    report = export_io.preflight_export(document, a_rebuild(bracket_step), "step")
+    assert any("ellipses" in w for w in report.warnings)
+
+
+def test_preflight_blocks_a_scale_that_cannot_run(bracket_step):
+    from stamp.io import export as export_io
+
+    document = Document(base=bracket_step)
+    document.transform = PartTransform(scale=(0.0, 0.0, 0.0))
+    report = export_io.preflight_export(document, a_rebuild(bracket_step), "step")
+    assert not report.ok
+
+
+def test_an_untransformed_part_gets_no_extra_warnings(bracket_step):
+    from stamp.io import export as export_io
+
+    document = Document(base=bracket_step)
+    report = export_io.preflight_export(document, a_rebuild(bracket_step), "step")
+    assert not any("mirrored" in w or "scaled" in w for w in report.warnings)
+
+
+# ------------------------------------------------------- the handoff records
+
+
+def test_the_summary_line_says_what_was_done(bracket_step):
+    from stamp.io.export import transform_summary
+
+    document = Document(base=bracket_step)
+    assert transform_summary(document) == "As modelled"
+    document.transform = PartTransform(mirror=MirrorPlane.YZ, scale=(2.0, 2.0, 2.0))
+    line = transform_summary(document)
+    assert "Mirrored" in line
+    assert "200%" in line
+    assert "160.00" in line
+
+
+def test_the_job_package_records_the_transform(
+    scaled_document, bracket_step, tmp_path, qapp
+):
+    import json
+    import zipfile
+
+    from stamp.io import export as export_io
+
+    geometry = part_transform.for_export(scaled_document, bracket_step.runtime)
+    package = export_io.export_job_package(
+        scaled_document, geometry, tmp_path / "job.zip", fmt="step",
+        rebuild=a_rebuild(bracket_step),
+    )
+    with zipfile.ZipFile(package.path) as archive:
+        manifest = json.loads(archive.read("preflight.json"))
+        names = archive.namelist()
+    assert manifest["transform"]["mirror"] == "yz"
+    assert "Mirrored" in manifest["transform_summary"]
+    # The model inside the package is named for the copy it is.
+    assert any("mirrored" in name for name in names)
+
+
+def test_a_pdf_needs_the_desktop_application(scaled_document, tmp_path, monkeypatch):
+    """QPdfWriter aborts the process without one, so the check comes first."""
+    from PySide6.QtGui import QGuiApplication
+
+    from stamp.io import export as export_io
+
+    monkeypatch.setattr(QGuiApplication, "instance", staticmethod(lambda: None))
+    with pytest.raises(export_io.ExportError, match="desktop application"):
+        export_io.export_proof_sheet(
+            scaled_document, tmp_path / "proof.pdf",
+            rebuild=a_rebuild(scaled_document.base),
+        )
+
+
+def test_a_batch_writes_the_transformed_copy(bracket_step, fixtures, tmp_path):
+    """The template's transform follows the job, so a run makes one hand of many."""
+    from stamp.batch import run_batch
+    from stamp.core.document import Anchor, AnchorKind, Operation, Placement, ProfileRef
+    from stamp.core.document import Feature as DocFeature
+    from stamp.core.refs import (
+        face_center,
+        faces_of,
+        make_face_ref,
+        plane_from_face,
+        surface_kind,
+    )
+    from stamp.io.part_import import import_part
+    from stamp.io.profile_import import file_hash
+    from stamp.io.project import save
+
+    logo = fixtures / "logo.svg"
+    face = next(f for f in faces_of(bracket_step.runtime) if surface_kind(f) == "plane")
+    point = face_center(face)
+    plane, _ = plane_from_face(face, point)
+    feature = DocFeature(
+        profile=ProfileRef(source_path=str(logo), source_hash=file_hash(logo)),
+        placement=Placement(
+            anchor=Anchor(kind=AnchorKind.FACE, face_ref=make_face_ref(face, point), plane=plane)
+        ),
+        operation=Operation(depth=0.1),
+    )
+    document = Document(base=bracket_step, features=[feature])
+    document.transform = PartTransform(scale=(2.0, 2.0, 2.0))
+    template = save(document, tmp_path / "template.stamp")
+
+    csv_path = tmp_path / "jobs.csv"
+    csv_path.write_text(
+        f"input,output\n{fixtures / 'bracket.step'},bracket.stl\n", encoding="utf-8"
+    )
+    report = run_batch(template, csv_path, tmp_path / "out", "stl")
+    assert not report.stopped, report.rows[0].message
+    written = import_part(tmp_path / "out" / "bracket.stl").part
+    assert written.size[0] == pytest.approx(2 * bracket_step.size[0], rel=1e-3)

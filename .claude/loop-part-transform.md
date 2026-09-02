@@ -84,3 +84,17 @@ Branch: feature/part-mirror-and-scale. Target version: 1.2.0.
   and chamfer sizes scale with the part; a colour-stamp recess thinner than a printed
   layer after a shrink), and the proof sheet / job package manifest should record the
   transform so the shop knows which hand it has. Then README + PROGRESS + version.
+- [iter 3, 2026-09-01] Preflight and handoff. `preflight_export` now blocks a scale
+  that will not run and warns that a mirrored part reads backwards, that the panel's
+  numbers are the pre-scale ones, that a per-axis scale turns holes into ellipses, and
+  that a shrink can take a colour stamp under one printed layer. `export.transform_
+  summary(document)` gives the one line the proof sheet, the job package manifest and
+  the package PDF all carry, so a shop can tell which hand and which size it holds.
+  The model inside a job package is named for the copy it is.
+  Finding worth keeping: QPdfWriter aborts the process outright - not an exception -
+  when no QGuiApplication exists, so both PDF paths now check first and raise
+  ExportError. A test that called export_job_package without `qapp` killed pytest.
+  Suite 341 passed, ruff clean.
+  Next: README (a section on mirroring and scaling, and the limits), PROGRESS v1.2.0,
+  version bump to 1.2.0 in pyproject.toml, src/stamp/__init__.py, packaging/stamp.iss,
+  then delete this file and make the final commit.
