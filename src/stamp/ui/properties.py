@@ -8,6 +8,8 @@ exactly 40 mm wide" works - the single most-used control in the app.
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
     QButtonGroup,
@@ -42,9 +44,11 @@ from stamp.core.document import (
     Document,
     EdgeRole,
     Feature,
+    MirrorPlane,
     Modifier,
     ModifierKind,
     OperationKind,
+    PartTransform,
     PatternKind,
     PatternSpec,
     PlacementMode,
@@ -129,6 +133,7 @@ class PropertiesPanel(QScrollArea):
         self.setWidget(self._body)
 
         self._empty = self._build_empty()
+        self._transform = self._build_transform()
         self._text = self._build_text()
         self._code = self._build_code()
         self._metadata = self._build_metadata()
@@ -138,7 +143,8 @@ class PropertiesPanel(QScrollArea):
         self._modifiers = self._build_modifiers()
 
         for widget in (
-            self._empty, self._text, self._code, self._metadata, self._placement, self._operation, self._pattern, self._modifiers
+            self._empty, self._transform, self._text, self._code, self._metadata,
+            self._placement, self._operation, self._pattern, self._modifiers,
         ):
             self._layout.addWidget(widget)
         self._layout.addStretch(1)
@@ -168,6 +174,65 @@ class PropertiesPanel(QScrollArea):
         self._info_warnings.setWordWrap(True)
         self._info_warnings.setStyleSheet("color: #c58a2a;")
         layout.addRow(self._info_warnings)
+        return box
+
+    def _build_transform(self) -> QWidget:
+        """Mirror and scale for the whole part - what the exporters write."""
+        box = QGroupBox("Mirror and scale")
+        box.setToolTip(
+            "Applied to the finished part on its way out. Artwork stays where you "
+            "put it; only the exported file changes."
+        )
+        layout = QVBoxLayout(box)
+
+        form = QFormLayout()
+        form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
+        self.part_mirror = QComboBox()
+        for plane in MirrorPlane:
+            self.part_mirror.addItem(plane.label, plane)
+        self.part_mirror.setToolTip("Reflect the part across one of its own centre planes.")
+        form.addRow("Mirror:", self.part_mirror)
+        layout.addLayout(form)
+
+        self.part_uniform = QCheckBox("Scale every axis by the same amount")
+        self.part_uniform.setChecked(True)
+        layout.addWidget(self.part_uniform)
+
+        grid = QGridLayout()
+        self.part_scale_percent = NumberField(
+            suffix=" %", decimals=3, minimum=0.01, maximum=100000, step=1
+        )
+        grid.addWidget(QLabel("Scale"), 0, 0)
+        grid.addWidget(self.part_scale_percent, 0, 1)
+        reset = QPushButton("Reset")
+        reset.clicked.connect(self._reset_part_transform)
+        grid.addWidget(reset, 0, 2, 1, 2)
+
+        self.part_axis_fields: list[NumberField] = []
+        self.part_size_fields: list[NumberField] = []
+        for i, axis in enumerate("XYZ"):
+            factor = NumberField(suffix=" x", decimals=4, minimum=0.0001, maximum=10000, step=0.1)
+            size = NumberField(minimum=0.001, maximum=1e6, step=1.0)
+            size.setToolTip(f"The finished {axis} size. Typing one solves the factor.")
+            grid.addWidget(QLabel(axis), i + 1, 0)
+            grid.addWidget(factor, i + 1, 1)
+            grid.addWidget(QLabel("→"), i + 1, 2)
+            grid.addWidget(size, i + 1, 3)
+            self.part_axis_fields.append(factor)
+            self.part_size_fields.append(size)
+        layout.addLayout(grid)
+
+        self.part_transform_note = QLabel("")
+        self.part_transform_note.setWordWrap(True)
+        layout.addWidget(self.part_transform_note)
+
+        self.part_mirror.currentIndexChanged.connect(self._set_part_mirror)
+        self.part_uniform.toggled.connect(self._set_part_uniform)
+        self.part_scale_percent.valueChanged.connect(self._set_part_scale_percent)
+        for i, field_widget in enumerate(self.part_axis_fields):
+            field_widget.valueChanged.connect(lambda v, i=i: self._set_part_axis(i, v))
+        for i, field_widget in enumerate(self.part_size_fields):
+            field_widget.valueChanged.connect(lambda v, i=i: self._set_part_size(i, v))
         return box
 
     def _build_text(self) -> QWidget:
@@ -617,11 +682,16 @@ class PropertiesPanel(QScrollArea):
 
     # ------------------------------------------------------------------- state
 
-    def show_base(self, part: BasePart | None, units: str = "mm") -> None:
+    def show_base(
+        self, part: BasePart | None, units: str = "mm", document: Document | None = None
+    ) -> None:
         self._feature = None
+        self._document = document if document is not None else self._document
         self._empty.setVisible(True)
+        self._transform.setVisible(part is not None)
         for widget in (self._text, self._placement, self._operation, self._pattern, self._modifiers):
             widget.setVisible(False)
+        self._refresh_transform(part, units)
 
         if part is None:
             for label in self._info_labels.values():
@@ -662,6 +732,7 @@ class PropertiesPanel(QScrollArea):
         self._native_size = (max(native_size[0], 1e-9), max(native_size[1], 1e-9))
 
         self._empty.setVisible(False)
+        self._transform.setVisible(False)
         for widget in (self._placement, self._operation, self._pattern, self._modifiers):
             widget.setVisible(True)
         self._text.setVisible(feature.profile.is_text)
@@ -812,6 +883,134 @@ class PropertiesPanel(QScrollArea):
     def _emit(self, label: str) -> None:
         if not self._updating:
             self.changed.emit(label)
+
+    # ------------------------------------------------------- part mirror and scale
+
+    def _part_transform(self) -> PartTransform | None:
+        return self._document.transform if self._document is not None else None
+
+    def _refresh_transform(self, part: BasePart | None, units: str = "mm") -> None:
+        """Put the document's transform on screen without emitting anything back."""
+        transform = self._part_transform()
+        if transform is None or part is None:
+            return
+        was, self._updating = self._updating, True
+        try:
+            index = self.part_mirror.findData(transform.mirror)
+            self.part_mirror.setCurrentIndex(max(index, 0))
+            self.part_uniform.setChecked(transform.uniform)
+            self.part_scale_percent.set_silently(transform.scale[0] * 100.0)
+            self.part_scale_percent.setEnabled(transform.uniform)
+            finished = transform.size_from(part.size)
+            for i, field_widget in enumerate(self.part_axis_fields):
+                field_widget.set_silently(transform.scale[i])
+                field_widget.setEnabled(not transform.uniform)
+            for i, field_widget in enumerate(self.part_size_fields):
+                field_widget.set_silently(finished[i])
+        finally:
+            self._updating = was
+        self._note_transform(part, units)
+
+    def _note_transform(self, part: BasePart | None, units: str = "mm") -> None:
+        transform = self._part_transform()
+        if transform is None or part is None:
+            self.part_transform_note.setText("")
+            return
+        problems = transform.validate()
+        if problems:
+            self.part_transform_note.setStyleSheet("color: #c0392b;")
+            self.part_transform_note.setText("\n".join(problems))
+            return
+        self.part_transform_note.setStyleSheet("color: #7a8290;")
+        if transform.is_identity:
+            self.part_transform_note.setText("Exports are written as the part came in.")
+            return
+        dx, dy, dz = transform.size_from(part.size)
+        said = []
+        if transform.mirrors:
+            said.append("mirrored")
+        if transform.scale != (1.0, 1.0, 1.0):
+            said.append("scaled")
+        self.part_transform_note.setText(
+            f"Exports are written {' and '.join(said)}, "
+            f"{format_length(dx, units)} × {format_length(dy, units)} × "
+            f"{format_length(dz, units)} {units}."
+        )
+
+    def _apply_part_transform(self, transform: PartTransform, label: str) -> None:
+        if self._document is None or self._updating:
+            return
+        self._document.transform = transform
+        part = self._document.base
+        units = self._document.units
+        self._refresh_transform(part, units)
+        self._emit(label)
+
+    def _set_part_mirror(self, _index: int) -> None:
+        transform = self._part_transform()
+        if transform is None or self._updating:
+            return
+        plane = self.part_mirror.currentData()
+        # A QComboBox hands a StrEnum back as a plain string (see the note on the
+        # direction combo), so it goes through MirrorPlane on the way in.
+        self._apply_part_transform(
+            replace(transform, mirror=MirrorPlane(plane)), "part mirror"
+        )
+
+    def _set_part_uniform(self, on: bool) -> None:
+        transform = self._part_transform()
+        if transform is None or self._updating:
+            return
+        if on:
+            # Coming back to uniform, X wins: it is the one field that was never
+            # disabled, so it is the number the user was last looking at.
+            transform = transform.with_uniform(transform.scale[0])
+        else:
+            transform = replace(transform, uniform=False)
+        self._apply_part_transform(transform, "part scale")
+
+    def _set_part_scale_percent(self, percent: float) -> None:
+        transform = self._part_transform()
+        if transform is None or self._updating:
+            return
+        self._apply_part_transform(transform.with_uniform(percent / 100.0), "part scale")
+
+    def _set_part_axis(self, axis: int, value: float) -> None:
+        transform = self._part_transform()
+        if transform is None or self._updating:
+            return
+        scale = list(transform.scale)
+        scale[axis] = value
+        self._apply_part_transform(
+            replace(transform, scale=tuple(scale), uniform=False), "part scale"
+        )
+
+    def _set_part_size(self, axis: int, value: float) -> None:
+        """Type the finished size; Stamp solves the factor that gets there."""
+        transform = self._part_transform()
+        if transform is None or self._updating or self._document is None:
+            return
+        part = self._document.base
+        if part is None:
+            return
+        try:
+            factor = PartTransform.factor_for(part.size[axis], value)
+        except ValueError as exc:
+            self.part_transform_note.setStyleSheet("color: #c0392b;")
+            self.part_transform_note.setText(str(exc))
+            return
+        if transform.uniform:
+            transform = transform.with_uniform(factor)
+        else:
+            scale = list(transform.scale)
+            scale[axis] = factor
+            transform = replace(transform, scale=tuple(scale))
+        self._apply_part_transform(transform, "part scale")
+
+    def _reset_part_transform(self) -> None:
+        if self._document is None:
+            return
+        self._apply_part_transform(PartTransform(), "part transform")
 
     def _set_offset(self, axis: int, value: float) -> None:
         if self._feature is None or self._updating:

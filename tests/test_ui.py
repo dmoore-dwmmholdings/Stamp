@@ -1704,3 +1704,136 @@ class TestReplacePartCommand:
 
         assert window.document.base.source_path == before
         assert len(window.document.features) == 1
+
+
+class TestPartTransformPanel:
+    """The mirror and scale group in the base-part view."""
+
+    @pytest.fixture
+    def panel(self, qtbot):
+        from stamp.ui.properties import PropertiesPanel
+
+        widget = PropertiesPanel()
+        qtbot.addWidget(widget)
+        return widget
+
+    def _document(self, part):
+        return Document(base=part)
+
+    def test_the_group_shows_for_a_part_and_hides_for_a_feature(self, panel, bracket_step):
+        panel.show_base(bracket_step, "mm", document=self._document(bracket_step))
+        assert panel._transform.isVisibleTo(panel)
+        panel.show_feature(Document(), a_feature(), (36.0, 16.0))
+        assert not panel._transform.isVisibleTo(panel)
+
+    def test_choosing_a_mirror_plane_reports_it(self, panel, bracket_step, qtbot):
+        from stamp.core.document import MirrorPlane
+
+        document = self._document(bracket_step)
+        panel.show_base(bracket_step, "mm", document=document)
+        with qtbot.waitSignal(panel.changed, timeout=1000):
+            panel.part_mirror.setCurrentIndex(panel.part_mirror.findData(MirrorPlane.YZ))
+        assert document.transform.mirror is MirrorPlane.YZ
+
+    def test_a_uniform_scale_percentage_reaches_the_document(self, panel, bracket_step, qtbot):
+        document = self._document(bracket_step)
+        panel.show_base(bracket_step, "mm", document=document)
+        with qtbot.waitSignal(panel.changed, timeout=1000):
+            panel.part_scale_percent.setValue(125.0)
+        assert document.transform.scale == (1.25, 1.25, 1.25)
+
+    def test_typing_a_finished_size_solves_the_factor(self, panel, bracket_step, qtbot):
+        document = self._document(bracket_step)
+        panel.show_base(bracket_step, "mm", document=document)
+        with qtbot.waitSignal(panel.changed, timeout=1000):
+            panel.part_size_fields[0].setValue(160.0)
+        # The bracket is 80 mm across, so 160 mm is twice the size.
+        assert document.transform.scale[0] == pytest.approx(2.0)
+
+    def test_per_axis_factors_need_uniform_off(self, panel, bracket_step, qtbot):
+        document = self._document(bracket_step)
+        panel.show_base(bracket_step, "mm", document=document)
+        assert not panel.part_axis_fields[0].isEnabled()
+        with qtbot.waitSignal(panel.changed, timeout=1000):
+            panel.part_uniform.setChecked(False)
+        assert panel.part_axis_fields[0].isEnabled()
+        with qtbot.waitSignal(panel.changed, timeout=1000):
+            panel.part_axis_fields[1].setValue(0.5)
+        assert document.transform.scale[1] == pytest.approx(0.5)
+        assert not document.transform.uniform
+
+    def test_reset_puts_the_part_back(self, panel, bracket_step, qtbot):
+        from stamp.core.document import MirrorPlane, PartTransform
+
+        document = self._document(bracket_step)
+        document.transform = PartTransform(mirror=MirrorPlane.XZ, scale=(2.0, 2.0, 2.0))
+        panel.show_base(bracket_step, "mm", document=document)
+        with qtbot.waitSignal(panel.changed, timeout=1000):
+            panel._reset_part_transform()
+        assert document.transform.is_identity
+
+    def test_the_note_says_the_finished_size(self, panel, bracket_step):
+        from stamp.core.document import PartTransform
+
+        document = self._document(bracket_step)
+        document.transform = PartTransform(scale=(2.0, 2.0, 2.0))
+        panel.show_base(bracket_step, "mm", document=document)
+        assert "160" in panel.part_transform_note.text()
+
+    def test_the_note_reports_a_scale_that_will_not_run(self, panel, bracket_step):
+        from stamp.core.document import PartTransform
+
+        document = self._document(bracket_step)
+        document.transform = PartTransform(scale=(1e9, 1e9, 1e9))
+        panel.show_base(bracket_step, "mm", document=document)
+        assert "larger than Stamp will go" in panel.part_transform_note.text()
+
+
+class TestPartScaleDialog:
+    def test_typing_a_size_updates_the_percentage(self, qtbot):
+        from stamp.core.document import PartTransform
+        from stamp.ui.dialogs import PartScaleDialog
+
+        dialog = PartScaleDialog((80.0, 40.0, 14.0), PartTransform(), units="mm")
+        qtbot.addWidget(dialog)
+        dialog.sizes[0].setValue(120.0)
+        assert dialog.percent.value() == pytest.approx(150.0)
+        assert dialog.transform().scale == pytest.approx((1.5, 1.5, 1.5))
+
+    def test_inches_are_converted_on_the_way_in(self, qtbot):
+        from stamp.core.document import PartTransform
+        from stamp.ui.dialogs import PartScaleDialog
+
+        dialog = PartScaleDialog((80.0, 40.0, 14.0), PartTransform(), units="in")
+        qtbot.addWidget(dialog)
+        # 80 mm is 3.1496 in; ask for 6.2992 in and the factor is 2.
+        dialog.sizes[0].setValue(80.0 * 2 / 25.4)
+        # The field shows three decimals of an inch, so the factor lands within
+        # a thousandth of an inch of two - which is the precision on screen.
+        assert dialog.transform().scale[0] == pytest.approx(2.0, abs=1e-3)
+
+    def test_per_axis_scaling_keeps_the_axes_apart(self, qtbot):
+        from stamp.core.document import PartTransform
+        from stamp.ui.dialogs import PartScaleDialog
+
+        dialog = PartScaleDialog((80.0, 40.0, 14.0), PartTransform(), units="mm")
+        qtbot.addWidget(dialog)
+        dialog.uniform.setChecked(False)
+        dialog.factors[0].setValue(2.0)
+        dialog.factors[2].setValue(0.5)
+        assert dialog.transform().scale == pytest.approx((2.0, 1.0, 0.5))
+        assert not dialog.transform().uniform
+
+    def test_the_fields_cannot_be_pushed_past_what_stamp_accepts(self, qtbot):
+        """The spin ranges and PartTransform.validate agree, so OK never lies."""
+        from stamp.core.document import MAX_PART_SCALE, MIN_PART_SCALE, PartTransform
+        from stamp.ui.dialogs import PartScaleDialog
+
+        dialog = PartScaleDialog((80.0, 40.0, 14.0), PartTransform(), units="mm")
+        qtbot.addWidget(dialog)
+        dialog.percent.setValue(1e12)
+        assert dialog.percent.value() == pytest.approx(MAX_PART_SCALE * 100.0)
+        assert not dialog.transform().validate()
+        dialog.percent.setValue(0.0)
+        assert dialog.percent.value() == pytest.approx(MIN_PART_SCALE * 100.0)
+        assert not dialog.transform().validate()

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import math
 import time
+from dataclasses import replace
 from pathlib import Path
 
 from PySide6.QtCore import QSettings, Qt, QTimer, Signal
@@ -45,10 +46,12 @@ from stamp.core.document import (
     EdgeRole,
     EdgeSelector,
     Feature,
+    MirrorPlane,
     Modifier,
     ModifierKind,
     Operation,
     OperationKind,
+    PartTransform,
     Placement,
     ProfileRef,
     TextSpec,
@@ -149,6 +152,10 @@ class MainWindow(QMainWindow):
         self._dirty = False
         self._draft_display = False
         self._slow_offer_declined = False
+        #: Draw the part the way it will be exported.  Read-only: the artwork is
+        #: placed against the part as it came in, so a pick here would land on
+        #: the wrong face.
+        self._show_transformed = False
         self._busy_since = 0.0
         self._busy_step = ""
         self._mesh_pick_cache: dict | None = None
@@ -313,6 +320,15 @@ class MainWindow(QMainWindow):
         )
         self.action_preview.toggled.connect(self.set_preview_visible)
 
+        self.action_show_transformed = QAction("Show the export", self)
+        self.action_show_transformed.setCheckable(True)
+        self.action_show_transformed.setToolTip(
+            "Draw the part as it will be exported - mirrored and scaled. Faces "
+            "cannot be picked while this is on, because the artwork is placed "
+            "against the part as it came in."
+        )
+        self.action_show_transformed.toggled.connect(self.set_show_transformed)
+
         self.action_draft = QAction("Draft view", self)
         self.action_draft.setCheckable(True)
         self.action_draft.setToolTip(
@@ -380,6 +396,19 @@ class MainWindow(QMainWindow):
         self.action_export_package = add("Export job package", self.export_job_package)
         self.action_batch = add("Batch stamp", self.batch_stamp)
         bar.addSeparator()
+        self.action_mirror_yz = QAction(MirrorPlane.YZ.label, self)
+        self.action_mirror_yz.setCheckable(True)
+        self.action_mirror_yz.triggered.connect(lambda: self.toggle_part_mirror(MirrorPlane.YZ))
+        self.action_mirror_xz = QAction(MirrorPlane.XZ.label, self)
+        self.action_mirror_xz.setCheckable(True)
+        self.action_mirror_xz.triggered.connect(lambda: self.toggle_part_mirror(MirrorPlane.XZ))
+        self.action_mirror_xy = QAction(MirrorPlane.XY.label, self)
+        self.action_mirror_xy.setCheckable(True)
+        self.action_mirror_xy.triggered.connect(lambda: self.toggle_part_mirror(MirrorPlane.XY))
+        self.action_scale_part = QAction("Scale part to size", self)
+        self.action_scale_part.triggered.connect(self.scale_part_dialog)
+        self.action_reset_transform = QAction("Reset mirror and scale", self)
+        self.action_reset_transform.triggered.connect(self.reset_part_transform)
 
         self.units_box = QComboBox()
         self.units_box.addItem("Units: mm", "mm")
@@ -532,8 +561,20 @@ class MainWindow(QMainWindow):
         ):
             export_menu.addAction(action)
 
+        part_menu = bar.addMenu("&Part")
+        for action in (
+            self.action_mirror_yz,
+            self.action_mirror_xz,
+            self.action_mirror_xy,
+        ):
+            part_menu.addAction(action)
+        part_menu.addSeparator()
+        part_menu.addAction(self.action_scale_part)
+        part_menu.addAction(self.action_reset_transform)
+
         view_menu = bar.addMenu("&View")
         view_menu.addAction(self.action_preview)
+        view_menu.addAction(self.action_show_transformed)
         view_menu.addAction(self.action_inspection)
         view_menu.addAction(self.action_draft)
         view_menu.addSeparator()
@@ -726,6 +767,7 @@ class MainWindow(QMainWindow):
         )
         mesh = has_part and self.document.base.mode == "mesh"
         self.region_tolerance.setVisible(mesh)
+        self._refresh_transform_actions()
 
     def _refresh_tree(self) -> None:
         results = {}
@@ -736,7 +778,9 @@ class MainWindow(QMainWindow):
     def _refresh_properties(self) -> None:
         feature = self.selected_feature
         if feature is None:
-            self.properties.show_base(self.document.base, self.document.units)
+            self.properties.show_base(
+                self.document.base, self.document.units, document=self.document
+            )
             self.handles.set_feature(None, None)
             return
         size = self._native_size(feature)
@@ -1373,6 +1417,14 @@ class MainWindow(QMainWindow):
         from OCP.TopAbs import TopAbs_ShapeEnum
         from OCP.TopoDS import TopoDS
 
+        if self._show_transformed:
+            # What is on screen is the export, not the part the artwork is placed
+            # against, so a pick here would anchor to a face that does not exist in
+            # the document's own space.
+            self.statusBar().showMessage(
+                "Turn off View \u2192 Show the export to pick a face.", 4000
+            )
+            return
         if self.document.base is not None and self.document.base.mode == "mesh":
             self._on_mesh_picked()
             return
@@ -2030,6 +2082,12 @@ class MainWindow(QMainWindow):
         self.warning_label.setStyleSheet("color: #c0453a;")
 
     def _display_geometry(self, geometry, mode: str) -> None:
+        if self._show_transformed:
+            try:
+                geometry = part_transform.for_export(self.document, geometry)
+            except part_transform.PartTransformError as exc:
+                self.warning_label.setText(str(exc))
+                self.warning_label.setStyleSheet("color: #c0453a;")
         if mode == "solid":
             self.viewport.display_shape(RESULT_KEY, geometry, color=PART_COLOR)
         else:
@@ -2290,6 +2348,74 @@ class MainWindow(QMainWindow):
         except Exception:
             return None
         return None
+
+    # -------------------------------------------------- part mirror and scale
+
+    def toggle_part_mirror(self, plane: MirrorPlane) -> None:
+        """Turn the mirror on across *plane*, or off if it is already that one."""
+        if self.document.base is None:
+            return
+        current = self.document.transform.mirror
+        wanted = MirrorPlane.NONE if current is plane else plane
+        self._push_undo("part mirror")
+        self.document.transform = replace(self.document.transform, mirror=wanted)
+        self._after_transform_changed()
+
+    def scale_part_dialog(self) -> None:
+        """Type a finished size or a percentage for the whole part."""
+        if self.document.base is None:
+            return
+        dialog = dialogs.PartScaleDialog(
+            self.document.base.size, self.document.transform, units=self.document.units,
+            parent=self,
+        )
+        if not self._ask(dialog):
+            return
+        transform = dialog.transform()
+        problems = transform.validate()
+        if problems:
+            self._notify("That scale will not work", "\n".join(problems))
+            return
+        self._push_undo("part scale")
+        self.document.transform = transform
+        self._after_transform_changed()
+
+    def reset_part_transform(self) -> None:
+        if self.document.base is None or self.document.transform.is_identity:
+            return
+        self._push_undo("part transform")
+        self.document.transform = PartTransform()
+        self._after_transform_changed()
+
+    def set_show_transformed(self, on: bool) -> None:
+        """Draw the part the way it will be exported, read-only."""
+        self._show_transformed = bool(on)
+        if self._last_result is not None and self._last_result.geometry is not None:
+            self._display_geometry(self._last_result.geometry, self._last_result.mode)
+        self._refresh_status()
+
+    def _after_transform_changed(self) -> None:
+        self._refresh_transform_actions()
+        self._refresh_properties()
+        if self._last_result is not None and self._last_result.geometry is not None:
+            self._display_geometry(self._last_result.geometry, self._last_result.mode)
+        self._refresh_status()
+
+    def _refresh_transform_actions(self) -> None:
+        mirror = self.document.transform.mirror
+        has_part = self.document.base is not None
+        for action, plane in (
+            (self.action_mirror_yz, MirrorPlane.YZ),
+            (self.action_mirror_xz, MirrorPlane.XZ),
+            (self.action_mirror_xy, MirrorPlane.XY),
+        ):
+            action.setChecked(mirror is plane)
+            action.setEnabled(has_part)
+        self.action_scale_part.setEnabled(has_part)
+        self.action_reset_transform.setEnabled(
+            has_part and not self.document.transform.is_identity
+        )
+        self.action_show_transformed.setEnabled(has_part)
 
     # ----------------------------------------------------------------- exports
 

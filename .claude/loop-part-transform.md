@@ -71,3 +71,16 @@ Branch: feature/part-mirror-and-scale. Target version: 1.2.0.
   reset), a Part menu with mirror commands, and a viewport toggle that previews the
   transformed result read-only. Then preflight warnings for a scaled part, README
   and PROGRESS.
+- [iter 2, 2026-09-01] UI landed. Properties panel gains a "Mirror and scale" group in
+  the base-part view (mirror plane combo, uniform % or per-axis factors, three
+  finished-size fields that solve the factor, reset, and a note giving the finished
+  bounding box). New `dialogs.PartScaleDialog` for the same thing as a modal; its spin
+  ranges are taken from MIN/MAX_PART_SCALE so OK can never offer a scale validate
+  would refuse. New "Part" menu: three mirror toggles, "Scale part to size", "Reset
+  mirror and scale". View menu gains "Show the export", which draws the transformed
+  result; picking is blocked while it is on, because the artwork is anchored to the
+  part as it came in. 12 new UI tests; suite 327 passed, ruff clean.
+  Next: preflight. `preflight_export` should warn when a transform is active (fillet
+  and chamfer sizes scale with the part; a colour-stamp recess thinner than a printed
+  layer after a shrink), and the proof sheet / job package manifest should record the
+  transform so the shop knows which hand it has. Then README + PROGRESS + version.
