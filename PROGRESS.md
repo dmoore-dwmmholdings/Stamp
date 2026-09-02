@@ -41,8 +41,8 @@ python -m uv run pyinstaller packaging/stamp.spec --noconfirm
 | M5 | Polish: error messages, packaging. | Done for Windows |
 
 Version 1 is complete. The seven-step acceptance flow from section 14 exists as a
-single test, and it passes. The suite is 263 tests, all passing, with a clean ruff
-run. Headless (`QT_QPA_PLATFORM=offscreen`) 210 run and 53 skip — the skipped ones
+single test, and it passes. The suite is 402 tests, all passing, with a clean ruff
+run. Headless (`QT_QPA_PLATFORM=offscreen`) 341 run and 61 skip — the skipped ones
 need a real window and an OpenGL context.
 
 ## Modules
@@ -66,6 +66,7 @@ need a real window and an OpenGL context.
 | `geom/mesh_ops.py` | The manifold3d path. Sections 2 and 6.5. |
 | `geom/mesh_regions.py` | Face selection on mesh parts. Section 6.1. |
 | `geom/color_split.py` | One body per feature, for multi-color printing. |
+| `geom/part_transform.py` | Whole-part mirror and scale, applied on the way out. |
 | `ui/viewport.py` | The OCC viewport widget. |
 | `ui/main_window.py` | The window and all commands. Section 7. |
 | `ui/feature_tree.py` | The feature tree on the left. |
@@ -341,6 +342,61 @@ a missing color.
 `SCHEMA_VERSION` went to 4. A project holding a color stamp opened by an older
 build would rebuild it as a plain engraving and export a part with a hole in the
 face, so the version refuses instead.
+
+## v1.2.0
+
+A part now carries a `PartTransform`: a mirror across one of its own principal
+planes, and a scale that is either uniform or one factor per axis. The point of
+it is the handed pair - export the part, turn the mirror on, export again, and
+the shop has a left and a right from one project.
+
+The transform runs on the finished geometry, on its way out, not as a stage of
+the rebuild. That one decision is what makes the feature cheap. Sketch planes,
+anchors, snap targets and the drag handles all stay in the part's own
+untransformed space, so nothing in the feature chain needed to learn about it and
+editing a mirrored part is editing an ordinary part. `part_transform.for_export`
+is the single chokepoint every exporter goes through - STEP, STL, 3MF, quote
+files, job package, `stamp batch`.
+
+Both the mirror plane and the scale centre on the *base part's* bounding box, not
+the rebuilt result's. Artwork would otherwise move the centre, and a mirrored copy
+would stop lining up with the original as features were added.
+
+Scaling to a size is the number people actually have: type the finished X, Y or Z
+and Stamp solves the factor. `PartTransform.factor_for` is that solve, and both
+the panel and the modal dialog use it, in the units on screen.
+
+The suggested filename carries what was done - `-mirrored`, `-125pct` - so a
+second export never lands on top of the first. Every handoff record repeats it in
+words (`export.transform_summary`), because a shop holding one file cannot tell
+which hand or which size it received from the geometry.
+
+### Findings worth keeping
+
+A non-uniform `gp_GTrsf` carries the source triangulation across unchanged, and
+that triangulation no longer sits on the stretched surfaces - so `BRepCheck` calls
+the result invalid and the STEP exporter refuses to write it. The failure only
+appears once something has meshed the part, which in the app is always and in a
+fresh script is never. `BRepTools.Clean_s` on the result is the whole fix.
+
+`SetMirror` on a solid came back with a positive volume on every part tested, so
+OpenCascade is handling the face orientations itself. The signed-volume check and
+the `Reversed()` fallback stay in, because a reflected solid that encloses
+negative volume is read as a hole in space by a CAM system, and that is not a
+thing to find out at the shop.
+
+manifold3d's `transform` flips triangle winding itself when the determinant of the
+matrix is negative. Negating vertex coordinates by hand does not, and gives a mesh
+that is inside out with a watertight test that still passes. The 3MF colour bodies
+are already tessellated, so those *do* swap two indices of every triangle by hand.
+
+`QPdfWriter` aborts the process when no `QGuiApplication` exists. Not an
+exception - the interpreter dies, and a pytest run dies with it. Both PDF paths
+check first and raise `ExportError`.
+
+`Document.restore` was putting back the name, units, view state, features and base
+part, and silently dropping the inspection settings and the datums. Undo has been
+losing those since they were added; the transform would have been the third.
 
 ## Timings on the standard test
 

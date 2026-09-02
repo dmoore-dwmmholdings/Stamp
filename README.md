@@ -90,6 +90,36 @@ The same panel also turns a seed feature into an editable linear, circular, or
 mirror pattern. The pattern remains one feature-tree item: edit its text,
 profile, or operation once and every generated instance rebuilds.
 
+## Mirroring and scaling the part
+
+**Part → Mirror left to right** makes the exported file the other hand of the
+part. Nothing in the project moves: the mirror is applied on the way out, so the
+artwork stays where you put it, face picking still works, and turning the mirror
+off gives the original back exactly. Export once with it off and once with it on
+and you have the pair — the suggested filename carries `-mirrored`, so the second
+file never lands on top of the first.
+
+**Part → Scale part to size** scales the whole part about its own centre. Type a
+percentage, a factor per axis, or the finished X, Y or Z size and Stamp solves the
+factor for you. The same controls sit in the properties panel when no feature is
+selected, along with the finished bounding box.
+
+**View → Show the export** draws the part the way it will be written. Faces cannot
+be picked while it is on, because the artwork is anchored to the part as it came
+in.
+
+What to know before you send the file:
+
+- A mirrored part reads backwards. That is right for a die or a handed pair, and
+  wrong if you wanted a readable mark.
+- Scaling multiplies everything with the part — artwork size, engraving depth,
+  fillet and chamfer radii. The numbers in the panel are the ones before scaling.
+- A different factor on each axis turns holes into ellipses and constant fillets
+  into variable-radius blends. Stamp will do it and will say so.
+- Every export path honours the transform: STEP, STL, 3MF, quote files, job
+  package, and `stamp batch`. The proof sheet and the package manifest record
+  which hand and which size the file is.
+
 ## Text
 
 No artwork file? Type it instead.
@@ -264,7 +294,8 @@ needs a STEP file, start from a STEP file.
 
 - Full parametric sketching — profiles come from files.
 - Assemblies, multiple bodies, materials.
-- Editing the part's original geometry.
+- Editing the part's original geometry — mirror and scale apply to the export,
+  not to the model.
 - Toolpaths, drawings, GD&T.
 - Cloud, accounts, plugins.
 
