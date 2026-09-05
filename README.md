@@ -327,28 +327,42 @@ attachment, the full report also goes to a file, and the email names it.
 
 ## Building release applications
 
+One command builds the installer for the platform you are sitting at:
+
 ```
-python -m uv run python packaging/make_icons.py
-python -m uv run pyinstaller packaging/stamp.spec --noconfirm --distpath build/dist --workpath build/work
-ISCC.exe packaging/stamp.iss
+uv run python packaging/build_installer.py
 ```
 
-On macOS, build the application bundle plus a drag-to-Applications DMG and a
-standard Installer package:
+It generates the icons, freezes the application with PyInstaller, and wraps the
+installer around it, writing the same file names a tagged release publishes:
+
+| Platform | Result in `build/` |
+|---|---|
+| Windows | `Stamp-x.y.z-Setup.exe` |
+| macOS | `Stamp-x.y.z-macos-arm64.dmg` and `.pkg` (`x86_64` on an Intel Mac) |
+| Linux | `Stamp-x.y.z-linux-x86_64.tar.gz` |
+
+Expect several minutes and a couple of gigabytes of scratch space — OpenCascade
+is large and PyInstaller copies all of it. Two options are worth knowing:
+`--app-only` stops after `build/dist`, when you want to run the frozen
+application without packaging it, and `--skip-icons` reuses `packaging/assets`
+instead of regenerating the icons.
+
+The version is read from `src/stamp/__init__.py`, and the script refuses to
+start if `pyproject.toml` or `packaging/stamp.iss` disagrees with it, rather
+than producing an installer that misstates its own version.
+
+The Windows installer needs [Inno Setup 6](https://jrsoftware.org/isdl.php)
+(`winget install JRSoftware.InnoSetup`); the macOS and Linux paths use only
+what ships with the OS. To drive the underlying steps yourself:
 
 ```
 uv run python packaging/make_icons.py
 uv run pyinstaller packaging/stamp.spec --noconfirm --distpath build/dist --workpath build/work
-mkdir -p build/dmg
-ditto build/dist/Stamp.app build/dmg/Stamp.app
-ln -s /Applications build/dmg/Applications
-hdiutil create -volname Stamp -srcfolder build/dmg -ov -format UDZO Stamp-x.y.z-macos-arm64.dmg
-pkgbuild --component build/dist/Stamp.app --install-location /Applications Stamp-x.y.z-macos-arm64.pkg
 ```
 
-Use `macos-x86_64` in the filename when building on an Intel Mac. Tagged releases
-build and attach the Windows installer plus macOS DMG and PKG installers for Intel
-and Apple silicon.
+Tagged releases build and attach the Windows installer plus macOS DMG and PKG
+installers for Intel and Apple silicon.
 
 ## Development
 
