@@ -467,6 +467,42 @@ def _inspect(ink: _Ink) -> None:
     _line(ink.painter, 7.2, 10.5, 13.8, 10.5)
 
 
+def _mirror(ink: _Ink) -> None:
+    """A shape and its reflection, with the plane between them."""
+    _poly(ink.painter, [(3.5, 5.5), (9.5, 8.5), (9.5, 15.5), (3.5, 18.5)], close=True)
+    _poly(ink.painter, [(20.5, 5.5), (14.5, 8.5), (14.5, 15.5), (20.5, 18.5)], close=True)
+    ink.mark(1.4)
+    _line(ink.painter, 12, 3.5, 12, 20.5)
+
+
+def _scale_part(ink: _Ink) -> None:
+    """A box being pulled bigger by the corner."""
+    _rect(ink.painter, 3.5, 9.0, 11.5, 11.5, 1.5)
+    ink.mark()
+    _arrow(ink.painter, 13.0, 11.0, 20.5, 3.5)
+    _line(ink.painter, 20.5, 3.5, 20.5, 8.0)
+    _line(ink.painter, 20.5, 3.5, 16.0, 3.5)
+
+
+def _reset_transform(ink: _Ink) -> None:
+    """A box, and the turn back to how it came in."""
+    _rect(ink.painter, 4.5, 8.5, 11.0, 11.0, 1.5)
+    ink.mark()
+    _turn(ink.painter, 13.5, 9.0, 6.0, 20, 250)
+
+
+def _show_export(ink: _Ink) -> None:
+    """An eye over the box: what leaves, seen before it leaves."""
+    _rect(ink.painter, 4.0, 4.0, 16.0, 10.0, 1.5)
+    ink.mark()
+    path = QPainterPath()
+    path.moveTo(4.0, 18.5)
+    path.quadTo(12.0, 12.5, 20.0, 18.5)
+    path.quadTo(12.0, 24.5, 4.0, 18.5)
+    ink.painter.drawPath(path)
+    _circle(ink.painter, 12.0, 18.5, 1.8)
+
+
 def _chevron_up(ink: _Ink) -> None:
     _poly(ink.painter, [(6.5, 14.5), (12, 9.0), (17.5, 14.5)])
 
@@ -509,6 +545,10 @@ DRAWINGS = {
     "preview": _preview,
     "draft": _draft,
     "inspect": _inspect,
+    "mirror": _mirror,
+    "scale-part": _scale_part,
+    "reset-transform": _reset_transform,
+    "show-export": _show_export,
     "chevron-up": _chevron_up,
     "chevron-down": _chevron_down,
 }

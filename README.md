@@ -125,6 +125,36 @@ The same panel also turns a seed feature into an editable linear, circular, or
 mirror pattern. The pattern remains one feature-tree item: edit its text,
 profile, or operation once and every generated instance rebuilds.
 
+## Mirroring and scaling the part
+
+**Part → Mirror left to right** makes the exported file the other hand of the
+part. Nothing in the project moves: the mirror is applied on the way out, so the
+artwork stays where you put it, face picking still works, and turning the mirror
+off gives the original back exactly. Export once with it off and once with it on
+and you have the pair — the suggested filename carries `-mirrored`, so the second
+file never lands on top of the first.
+
+**Part → Scale part to size** scales the whole part about its own centre. Type a
+percentage, a factor per axis, or the finished X, Y or Z size and Stamp solves the
+factor for you. The same controls sit in the properties panel when no feature is
+selected, along with the finished bounding box.
+
+**View → Show the export** draws the part the way it will be written. Faces cannot
+be picked while it is on, because the artwork is anchored to the part as it came
+in.
+
+What to know before you send the file:
+
+- A mirrored part reads backwards. That is right for a die or a handed pair, and
+  wrong if you wanted a readable mark.
+- Scaling multiplies everything with the part — artwork size, engraving depth,
+  fillet and chamfer radii. The numbers in the panel are the ones before scaling.
+- A different factor on each axis turns holes into ellipses and constant fillets
+  into variable-radius blends. Stamp will do it and will say so.
+- Every export path honours the transform: STEP, STL, 3MF, quote files, job
+  package, and `stamp batch`. The proof sheet and the package manifest record
+  which hand and which size the file is.
+
 ## Text
 
 No artwork file? Type it instead.
@@ -325,7 +355,8 @@ needs a STEP file, start from a STEP file.
 
 - Full parametric sketching — profiles come from files.
 - Assemblies, multiple bodies, materials.
-- Editing the part's original geometry.
+- Editing the part's original geometry — mirror and scale apply to the export,
+  not to the model.
 - Toolpaths, drawings, GD&T.
 - Cloud, accounts, plugins.
 
@@ -401,11 +432,42 @@ attachment, the full report also goes to a file, and the email names it.
 
 ## Building release applications
 
+One command builds the installer for the platform you are sitting at:
+
 ```
-python -m uv run python packaging/make_icons.py
-python -m uv run pyinstaller packaging/stamp.spec --noconfirm --distpath build/dist --workpath build/work
-ISCC.exe packaging/stamp.iss
+uv run python packaging/build_installer.py
 ```
+
+It generates the icons, freezes the application with PyInstaller, and wraps the
+installer around it, writing the same file names a tagged release publishes:
+
+| Platform | Result in `build/` |
+|---|---|
+| Windows | `Stamp-x.y.z-Setup.exe` |
+| macOS | `Stamp-x.y.z-macos-arm64.dmg` and `.pkg` (`x86_64` on an Intel Mac) |
+| Linux | `Stamp-x.y.z-linux-x86_64.tar.gz` |
+
+Expect several minutes and a couple of gigabytes of scratch space — OpenCascade
+is large and PyInstaller copies all of it. Two options are worth knowing:
+`--app-only` stops after `build/dist`, when you want to run the frozen
+application without packaging it, and `--skip-icons` reuses `packaging/assets`
+instead of regenerating the icons.
+
+The version is read from `src/stamp/__init__.py`, and the script refuses to
+start if `pyproject.toml` or `packaging/stamp.iss` disagrees with it, rather
+than producing an installer that misstates its own version.
+
+The Windows installer needs [Inno Setup 6](https://jrsoftware.org/isdl.php)
+(`winget install JRSoftware.InnoSetup`); the macOS and Linux paths use only
+what ships with the OS. To drive the underlying steps yourself:
+
+```
+uv run python packaging/make_icons.py
+uv run pyinstaller packaging/stamp.spec --noconfirm --distpath build/dist --workpath build/work
+```
+
+Tagged releases build and attach the Windows installer plus macOS DMG and PKG
+installers for Intel and Apple silicon.
 
 ### Signing releases, once
 
@@ -426,23 +488,6 @@ Without the secret the workflow skips the feed with a warning and everything
 else still builds — nobody is offered the release automatically, which is the
 safe way round. Keep the private half as carefully as a signing certificate:
 anyone holding it can publish something Stamp will install.
-
-On macOS, build the application bundle plus a drag-to-Applications DMG and a
-standard Installer package:
-
-```
-uv run python packaging/make_icons.py
-uv run pyinstaller packaging/stamp.spec --noconfirm --distpath build/dist --workpath build/work
-mkdir -p build/dmg
-ditto build/dist/Stamp.app build/dmg/Stamp.app
-ln -s /Applications build/dmg/Applications
-hdiutil create -volname Stamp -srcfolder build/dmg -ov -format UDZO Stamp-x.y.z-macos-arm64.dmg
-pkgbuild --component build/dist/Stamp.app --install-location /Applications Stamp-x.y.z-macos-arm64.pkg
-```
-
-Use `macos-x86_64` in the filename when building on an Intel Mac. Tagged releases
-build and attach the Windows installer plus macOS DMG and PKG installers for Intel
-and Apple silicon.
 
 ## Running the tests
 

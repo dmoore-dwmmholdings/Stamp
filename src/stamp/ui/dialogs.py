@@ -31,6 +31,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from stamp.core.document import MAX_PART_SCALE, MIN_PART_SCALE
 from stamp.io.normalize import Issue, IssueKind
 from stamp.io.presets import PresetInfo
 from stamp.units import TO_MM
@@ -463,6 +464,177 @@ class StepExportDialog(QDialog):
 
     def merge_faces(self) -> bool:
         return self.simplify.isChecked()
+
+
+class PartScaleDialog(QDialog):
+    """Scale the whole part by a percentage, or to a size typed in the units shown.
+
+    The percentage and the three finished sizes are the same number seen two ways,
+    so typing in either place updates the other.  Nothing is applied until OK, and
+    the dialog refuses a scale that Stamp will not run rather than failing later at
+    the export.
+    """
+
+    def __init__(self, size, transform, *, units: str = "mm", parent=None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Scale part")
+        self._size = tuple(float(v) for v in size)
+        self._units = units
+        self._to_mm = TO_MM.get(units, 1.0)
+        self._updating = False
+        self._transform = transform
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(
+            QLabel(
+                "The whole part is scaled about its own centre on the way out. "
+                "Artwork scales with it, and so do fillet and chamfer sizes."
+            )
+        )
+
+        self.uniform = QCheckBox("Scale every axis by the same amount")
+        self.uniform.setChecked(transform.uniform)
+        layout.addWidget(self.uniform)
+
+        form = QFormLayout()
+        self.percent = QDoubleSpinBox()
+        self.percent.setSuffix(" %")
+        self.percent.setDecimals(3)
+        self.percent.setRange(MIN_PART_SCALE * 100.0, MAX_PART_SCALE * 100.0)
+        self.percent.setKeyboardTracking(False)
+        self.percent.setValue(transform.scale[0] * 100.0)
+        form.addRow("Scale:", self.percent)
+        layout.addLayout(form)
+
+        self.factors: list[QDoubleSpinBox] = []
+        self.sizes: list[QDoubleSpinBox] = []
+        axes = QFormLayout()
+        for i, axis in enumerate("XYZ"):
+            row = QHBoxLayout()
+            factor = QDoubleSpinBox()
+            factor.setSuffix(" x")
+            factor.setDecimals(4)
+            factor.setRange(MIN_PART_SCALE, MAX_PART_SCALE)
+            factor.setKeyboardTracking(False)
+            factor.setValue(transform.scale[i])
+            finished = QDoubleSpinBox()
+            finished.setSuffix(f" {units}")
+            finished.setDecimals(3)
+            finished.setRange(0.001, 1e6)
+            finished.setKeyboardTracking(False)
+            finished.setValue(self._size[i] * transform.scale[i] / self._to_mm)
+            row.addWidget(factor)
+            row.addWidget(QLabel("→"))
+            row.addWidget(finished)
+            axes.addRow(f"{axis}:", row)
+            self.factors.append(factor)
+            self.sizes.append(finished)
+        layout.addLayout(axes)
+
+        self.note = QLabel("")
+        self.note.setWordWrap(True)
+        layout.addWidget(self.note)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+        self.uniform.toggled.connect(self._on_uniform)
+        self.percent.valueChanged.connect(self._on_percent)
+        for i, widget in enumerate(self.factors):
+            widget.valueChanged.connect(lambda v, i=i: self._on_factor(i, v))
+        for i, widget in enumerate(self.sizes):
+            widget.valueChanged.connect(lambda v, i=i: self._on_size(i, v))
+        self._sync()
+
+    # ------------------------------------------------------------------- state
+
+    def factor_values(self) -> tuple[float, float, float]:
+        if self.uniform.isChecked():
+            one = self.percent.value() / 100.0
+            return (one, one, one)
+        return tuple(widget.value() for widget in self.factors)
+
+    def transform(self):
+        from dataclasses import replace
+
+        return replace(
+            self._transform,
+            scale=self.factor_values(),
+            uniform=self.uniform.isChecked(),
+        )
+
+    # ------------------------------------------------------------------ wiring
+
+    def _on_uniform(self, on: bool) -> None:
+        if on:
+            self._set_percent(self.factors[0].value() * 100.0)
+        self._sync()
+
+    def _on_percent(self, percent: float) -> None:
+        if self._updating:
+            return
+        factor = percent / 100.0
+        self._updating = True
+        try:
+            for i, widget in enumerate(self.factors):
+                widget.setValue(factor)
+                self.sizes[i].setValue(self._size[i] * factor / self._to_mm)
+        finally:
+            self._updating = False
+        self._sync()
+
+    def _on_factor(self, axis: int, value: float) -> None:
+        if self._updating:
+            return
+        self._updating = True
+        try:
+            self.sizes[axis].setValue(self._size[axis] * value / self._to_mm)
+            if self.uniform.isChecked():
+                self.percent.setValue(value * 100.0)
+        finally:
+            self._updating = False
+        self._sync()
+
+    def _on_size(self, axis: int, value: float) -> None:
+        if self._updating:
+            return
+        current = self._size[axis]
+        if current <= 0:
+            self.note.setText("That axis has no size, so there is nothing to scale.")
+            return
+        factor = (value * self._to_mm) / current
+        self._updating = True
+        try:
+            self.factors[axis].setValue(factor)
+            if self.uniform.isChecked():
+                self.percent.setValue(factor * 100.0)
+                for i, widget in enumerate(self.factors):
+                    widget.setValue(factor)
+                    if i != axis:
+                        self.sizes[i].setValue(self._size[i] * factor / self._to_mm)
+        finally:
+            self._updating = False
+        self._sync()
+
+    def _set_percent(self, percent: float) -> None:
+        self._updating = True
+        try:
+            self.percent.setValue(percent)
+        finally:
+            self._updating = False
+
+    def _sync(self) -> None:
+        uniform = self.uniform.isChecked()
+        self.percent.setEnabled(uniform)
+        for widget in self.factors:
+            widget.setEnabled(not uniform)
+        problems = self.transform().validate()
+        self.note.setText("\n".join(problems))
+        self.note.setStyleSheet("color: #c0392b;" if problems else "")
 
 
 ODA_DOWNLOAD_URL = "https://www.opendesign.com/guestfiles/oda_file_converter"

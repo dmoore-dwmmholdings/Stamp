@@ -15,6 +15,7 @@ from __future__ import annotations
 import math
 import tempfile
 import time
+from dataclasses import replace
 from pathlib import Path
 
 from PySide6.QtCore import QSettings, Qt, QTimer, QUrl, Signal
@@ -57,10 +58,12 @@ from stamp.core.document import (
     EdgeRole,
     EdgeSelector,
     Feature,
+    MirrorPlane,
     Modifier,
     ModifierKind,
     Operation,
     OperationKind,
+    PartTransform,
     Placement,
     ProfileRef,
     TextSpec,
@@ -77,7 +80,7 @@ from stamp.core.refs import (
     plane_from_face,
     resolve_face_ref,
 )
-from stamp.geom import mesh_regions
+from stamp.geom import mesh_regions, part_transform
 from stamp.geom.color_split import divides_by_color, effective_colors
 from stamp.geom.mesh_regions import DEFAULT_TOLERANCE_DEG
 from stamp.geom.tool_solid import component_footprints
@@ -131,6 +134,17 @@ CUT_COLOR = (0.82, 0.36, 0.32)
 STAMP_COLOR = (0.35, 0.55, 0.90)
 
 
+def user_settings() -> QSettings:
+    """Where Stamp keeps its preferences.
+
+    Behind a function so a test run can put them somewhere of its own: the real
+    ones are a registry key on this machine, so tests that read them depend on
+    whatever the person at the keyboard last chose, and tests that write them
+    change it.
+    """
+    return QSettings("Stamp", "Stamp")
+
+
 def _rgb(value: str) -> tuple[float, float, float] | None:
     """``#rrggbb`` as the 0-1 triple the viewport wants, or None."""
     text = str(value or "").strip().lstrip("#")
@@ -164,7 +178,7 @@ class MainWindow(QMainWindow):
         self.profiles = ProfileCache()
         self.engine = RebuildEngine(self.profiles.get)
         self.undo_stack = UndoStack()
-        self.settings = QSettings("Stamp", "Stamp")
+        self.settings = user_settings()
 
         diagnostics.error_reporter = self._report_uncaught
 
@@ -182,6 +196,10 @@ class MainWindow(QMainWindow):
         #: A part was just opened and is waiting for the rebuild to draw it.
         self._fit_after_display = False
         self._slow_offer_declined = False
+        #: Draw the part the way it will be exported.  Read-only: the artwork is
+        #: placed against the part as it came in, so a pick here would land on
+        #: the wrong face.
+        self._show_transformed = False
         self._busy_since = 0.0
         self._busy_step = ""
         self._mesh_pick_cache: dict | None = None
@@ -372,6 +390,15 @@ class MainWindow(QMainWindow):
         )
         self.action_preview.toggled.connect(self.set_preview_visible)
 
+        self.action_show_transformed = QAction("Show the export", self)
+        self.action_show_transformed.setCheckable(True)
+        self.action_show_transformed.setToolTip(
+            "Draw the part as it will be exported - mirrored and scaled. Faces "
+            "cannot be picked while this is on, because the artwork is placed "
+            "against the part as it came in."
+        )
+        self.action_show_transformed.toggled.connect(self.set_show_transformed)
+
         self.action_draft = QAction("Draft view", self)
         self.action_draft.setCheckable(True)
         self.action_draft.setToolTip(
@@ -491,6 +518,28 @@ class MainWindow(QMainWindow):
         self.action_batch = make("Batch stamp", self.batch_stamp)
         self.action_undo = make("Undo", self.undo, "Ctrl+Z")
         self.action_redo = make("Redo", self.redo, "Ctrl+Y")
+        # Mirror and scale act on the part rather than opening something, and
+        # the three planes are toggles, so they are built by hand rather than
+        # through make().
+        self.action_mirror_yz = QAction(MirrorPlane.YZ.label, self)
+        self.action_mirror_yz.setCheckable(True)
+        self.action_mirror_yz.triggered.connect(lambda: self.toggle_part_mirror(MirrorPlane.YZ))
+        self.addAction(self.action_mirror_yz)
+        self.action_mirror_xz = QAction(MirrorPlane.XZ.label, self)
+        self.action_mirror_xz.setCheckable(True)
+        self.action_mirror_xz.triggered.connect(lambda: self.toggle_part_mirror(MirrorPlane.XZ))
+        self.addAction(self.action_mirror_xz)
+        self.action_mirror_xy = QAction(MirrorPlane.XY.label, self)
+        self.action_mirror_xy.setCheckable(True)
+        self.action_mirror_xy.triggered.connect(lambda: self.toggle_part_mirror(MirrorPlane.XY))
+        self.addAction(self.action_mirror_xy)
+        self.action_mirror = QAction("Mirror the part", self)
+        self.action_mirror.setToolTip(
+            "Reflect the whole part across a plane on the way out. The stamps "
+            "go with it, so a left-hand part is the right-hand one mirrored."
+        )
+        self.action_scale_part = make("Scale part to size", self.scale_part_dialog)
+        self.action_reset_transform = make("Reset mirror and scale", self.reset_part_transform)
 
         self.units_box = QComboBox()
         self.units_box.addItem("Units: mm", "mm")
@@ -652,6 +701,23 @@ class MainWindow(QMainWindow):
         if self.action_collapse_ribbon.isChecked() != collapsed:
             self.action_collapse_ribbon.setChecked(collapsed)
 
+    def _mirror_menu(self):
+        """The three planes in one press.
+
+        They are toggles rather than commands - a part can be mirrored across
+        two planes at once - so the button holds them rather than being one of
+        them.
+        """
+        from PySide6.QtWidgets import QMenu
+
+        menu = QMenu(self)
+        menu.addAction(self.action_mirror_yz)
+        menu.addAction(self.action_mirror_xz)
+        menu.addAction(self.action_mirror_xy)
+        menu.addSeparator()
+        menu.addAction(self.action_reset_transform)
+        return menu
+
     def _views_menu(self):
         """Every standard view in one press, each with the key that also does it."""
         from PySide6.QtWidgets import QMenu
@@ -730,6 +796,18 @@ class MainWindow(QMainWindow):
         part.add_small_action(self.action_replace_part, "replace-part", "Replace part")
         part.add_small_action(self.action_relink, "relink", "Relink")
         part.add_small_action(self.action_inspection_limits, "limits", "Limits")
+
+        transform = place.add_group("Transform")
+        transform.add_menu_action(
+            self.action_mirror, "mirror", "Mirror", self._mirror_menu()
+        )
+        transform.add_action(self.action_scale_part, "scale-part", "Scale\nto size")
+        transform.add_small_action(
+            self.action_reset_transform, "reset-transform", "Reset"
+        )
+        transform.add_small_action(
+            self.action_show_transformed, "show-export", "Show the export"
+        )
 
         export = self.ribbon.add_tab("Export")
         files = export.add_group("Files")
@@ -817,6 +895,17 @@ class MainWindow(QMainWindow):
         ):
             export_menu.addAction(action)
 
+        part_menu = bar.addMenu("&Part")
+        for action in (
+            self.action_mirror_yz,
+            self.action_mirror_xz,
+            self.action_mirror_xy,
+        ):
+            part_menu.addAction(action)
+        part_menu.addSeparator()
+        part_menu.addAction(self.action_scale_part)
+        part_menu.addAction(self.action_reset_transform)
+
         view_menu = bar.addMenu("&View")
         orient = view_menu.addMenu("Orientation")
         for name, key in (
@@ -836,6 +925,7 @@ class MainWindow(QMainWindow):
         view_menu.addAction(self.action_roll_right)
         view_menu.addSeparator()
         view_menu.addAction(self.action_preview)
+        view_menu.addAction(self.action_show_transformed)
         view_menu.addAction(self.action_inspection)
         view_menu.addAction(self.action_draft)
         view_menu.addAction(self.action_collapse_ribbon)
@@ -1218,6 +1308,7 @@ class MainWindow(QMainWindow):
         )
         mesh = has_part and self.document.base.mode == "mesh"
         self.region_tolerance.setVisible(mesh)
+        self._refresh_transform_actions()
 
     def _refresh_tree(self) -> None:
         results = {}
@@ -1228,7 +1319,9 @@ class MainWindow(QMainWindow):
     def _refresh_properties(self) -> None:
         feature = self.selected_feature
         if feature is None:
-            self.properties.show_base(self.document.base, self.document.units)
+            self.properties.show_base(
+                self.document.base, self.document.units, document=self.document
+            )
             self.handles.set_feature(None, None)
             return
         size = self._native_size(feature)
@@ -1906,6 +1999,14 @@ class MainWindow(QMainWindow):
         from OCP.TopAbs import TopAbs_ShapeEnum
         from OCP.TopoDS import TopoDS
 
+        if self._show_transformed:
+            # What is on screen is the export, not the part the artwork is placed
+            # against, so a pick here would anchor to a face that does not exist in
+            # the document's own space.
+            self.statusBar().showMessage(
+                "Turn off View \u2192 Show the export to pick a face.", 4000
+            )
+            return
         if self.document.base is not None and self.document.base.mode == "mesh":
             self._on_mesh_picked()
             return
@@ -2580,7 +2681,25 @@ class MainWindow(QMainWindow):
             self._display_geometry(self.document.base.runtime, self.document.base.mode)
             self.viewport.fit_all()
 
+    def _transformed(self, geometry):
+        """The geometry as it would leave the exporter, when asked for.
+
+        "Show the export" previews the mirror and scale, so the same
+        transform the exporter applies has to run on the way to the screen.
+        A part that cannot be transformed is drawn untransformed with the
+        reason in the warning label - blanking the view explains nothing.
+        """
+        if not self._show_transformed or geometry is None:
+            return geometry
+        try:
+            return part_transform.for_export(self.document, geometry)
+        except part_transform.PartTransformError as exc:
+            self.warning_label.setText(str(exc))
+            self.warning_label.setStyleSheet("color: #c0453a;")
+            return geometry
+
     def _display_geometry(self, geometry, mode: str) -> None:
+        geometry = self._transformed(geometry)
         if self._display_parts(mode):
             return
         if mode == "solid":
@@ -2622,9 +2741,10 @@ class MainWindow(QMainWindow):
                 continue
             key = f"{RESULT_KEY}:{piece.index}"
             try:
+                piece_geometry = self._transformed(piece.geometry)
                 shape = (
-                    piece.geometry if mode == "solid"
-                    else self._mesh_display_shape(piece.geometry)
+                    piece_geometry if mode == "solid"
+                    else self._mesh_display_shape(piece_geometry)
                 )
             except Exception:  # noqa: BLE001 - one bad part must not blank the view
                 continue
@@ -2970,12 +3090,97 @@ class MainWindow(QMainWindow):
             return None
         return None
 
+    # -------------------------------------------------- part mirror and scale
+
+    def toggle_part_mirror(self, plane: MirrorPlane) -> None:
+        """Turn the mirror on across *plane*, or off if it is already that one."""
+        if self.document.base is None:
+            return
+        current = self.document.transform.mirror
+        wanted = MirrorPlane.NONE if current is plane else plane
+        self._push_undo("part mirror")
+        self.document.transform = replace(self.document.transform, mirror=wanted)
+        self._after_transform_changed()
+
+    def scale_part_dialog(self) -> None:
+        """Type a finished size or a percentage for the whole part."""
+        if self.document.base is None:
+            return
+        dialog = dialogs.PartScaleDialog(
+            self.document.base.size, self.document.transform, units=self.document.units,
+            parent=self,
+        )
+        if not self._ask(dialog):
+            return
+        transform = dialog.transform()
+        problems = transform.validate()
+        if problems:
+            self._notify("That scale will not work", "\n".join(problems))
+            return
+        self._push_undo("part scale")
+        self.document.transform = transform
+        self._after_transform_changed()
+
+    def reset_part_transform(self) -> None:
+        if self.document.base is None or self.document.transform.is_identity:
+            return
+        self._push_undo("part transform")
+        self.document.transform = PartTransform()
+        self._after_transform_changed()
+
+    def set_show_transformed(self, on: bool) -> None:
+        """Draw the part the way it will be exported, read-only."""
+        self._show_transformed = bool(on)
+        if self._last_result is not None and self._last_result.geometry is not None:
+            self._display_geometry(self._last_result.geometry, self._last_result.mode)
+        self._refresh_status()
+
+    def _after_transform_changed(self) -> None:
+        self._refresh_transform_actions()
+        self._refresh_properties()
+        if self._last_result is not None and self._last_result.geometry is not None:
+            self._display_geometry(self._last_result.geometry, self._last_result.mode)
+        self._refresh_status()
+
+    def _refresh_transform_actions(self) -> None:
+        mirror = self.document.transform.mirror
+        has_part = self.document.base is not None
+        for action, plane in (
+            (self.action_mirror_yz, MirrorPlane.YZ),
+            (self.action_mirror_xz, MirrorPlane.XZ),
+            (self.action_mirror_xy, MirrorPlane.XY),
+        ):
+            action.setChecked(mirror is plane)
+            action.setEnabled(has_part)
+        self.action_scale_part.setEnabled(has_part)
+        self.action_reset_transform.setEnabled(
+            has_part and not self.document.transform.is_identity
+        )
+        self.action_show_transformed.setEnabled(has_part)
+
     # ----------------------------------------------------------------- exports
 
     def _geometry(self):
+        """The rebuilt part, in its own untransformed space."""
         if self._last_result is not None and self._last_result.geometry is not None:
             return self._last_result.geometry
         return self.document.base.runtime if self.document.base else None
+
+    def _export_geometry(self):
+        """What an export writes: the rebuilt part with the part transform applied.
+
+        Returns ``None`` and says why when the transform cannot be applied, so an
+        export command can simply stop.
+        """
+        geometry = self._geometry()
+        try:
+            return part_transform.for_export(self.document, geometry)
+        except part_transform.PartTransformError as exc:
+            self._notify("Stamp could not apply the part transform", str(exc))
+            return None
+
+    def _export_suffix(self) -> str:
+        return self.document.transform.suffix()
 
     def export_step(self) -> None:
         if self.document.base is None:
@@ -2983,13 +3188,18 @@ class MainWindow(QMainWindow):
         if self.document.base.mode != "solid":
             self._notify("There is no STEP to write", export_io.MESH_MODE_NO_STEP)
             return
+        geometry = self._export_geometry()
+        if geometry is None:
+            return
         options = dialogs.StepExportDialog(self)
         if not self._ask(options):
             return
         schema = options.schema_name()
         merge = options.merge_faces()
 
-        suggested = export_io.default_filename(self.document.name, "step")
+        suggested = export_io.default_filename(
+            self.document.name, "step", suffix=self._export_suffix()
+        )
         path, _ = QFileDialog.getSaveFileName(
             self, "Export STEP", str(Path(self._last_dir("export")) / suggested),
             "STEP files (*.step *.stp)",
@@ -3006,13 +3216,13 @@ class MainWindow(QMainWindow):
             return
         try:
             result = export_io.export_step(
-                self._geometry(), path, schema=schema, simplify=merge
+                geometry, path, schema=schema, simplify=merge
             )
         except export_io.ExportError as exc:
             if not self._confirm("Export anyway?", f"{exc}\n\nWrite the file anyway?"):
                 return
             result = export_io.export_step(
-                self._geometry(), path, schema=schema, simplify=merge, allow_invalid=True
+                geometry, path, schema=schema, simplify=merge, allow_invalid=True
             )
         self._remember_dir("export", Path(path))
         result.warnings.extend(preflight.warnings)
@@ -3022,7 +3232,9 @@ class MainWindow(QMainWindow):
         if self.document.base is None:
             return
         mode = self.document.base.mode
-        geometry = self._geometry()
+        geometry = self._export_geometry()
+        if geometry is None:
+            return
 
         def counter(deflection: float) -> int:
             return export_io.triangle_count_for(geometry, mode, deflection)
@@ -3031,7 +3243,9 @@ class MainWindow(QMainWindow):
         if not self._ask(dialog):
             return
 
-        suggested = export_io.default_filename(self.document.name, "stl")
+        suggested = export_io.default_filename(
+            self.document.name, "stl", suffix=self._export_suffix()
+        )
         path, _ = QFileDialog.getSaveFileName(
             self, "Export STL", str(Path(self._last_dir("export")) / suggested),
             "STL files (*.stl)",
@@ -3093,7 +3307,9 @@ class MainWindow(QMainWindow):
         self.settings.setValue("3mf/feature_color", dialog.feature_color())
         self.settings.setValue("3mf/write_colors", dialog.write_colors())
 
-        suggested = export_io.default_filename(self.document.name, "3mf")
+        suggested = export_io.default_filename(
+            self.document.name, "3mf", suffix=self._export_suffix()
+        )
         path, _ = QFileDialog.getSaveFileName(
             self, "Export 3MF", str(Path(self._last_dir("export")) / suggested),
             "3MF files (*.3mf)",
@@ -3113,13 +3329,18 @@ class MainWindow(QMainWindow):
                 self.document, self._last_result, deflection=dialog.deflection_mm(),
                 part_index=dialog.part_index(),
             )
+            bodies = part_transform.transform_bodies(self.document, split.bodies)
             result = export_io.export_3mf(
-                split.bodies, path,
+                bodies, path,
                 base_color=dialog.base_color(),
                 feature_color=dialog.feature_color(),
                 write_colors=dialog.write_colors(),
             )
-        except (color_split.ColorSplitError, export_io.ExportError) as exc:
+        except (
+            color_split.ColorSplitError,
+            export_io.ExportError,
+            part_transform.PartTransformError,
+        ) as exc:
             self._notify("Stamp could not write the 3MF", str(exc))
             return
         result.warnings.extend(split.warnings)
@@ -3144,9 +3365,12 @@ class MainWindow(QMainWindow):
         )
         if not folder:
             return
+        geometry = self._export_geometry()
+        if geometry is None:
+            return
         try:
             written = export_io.export_for_quote(
-                self._geometry(), folder, self.document.name,
+                geometry, folder, self.document.name,
                 mode=self.document.base.mode,
                 screenshot=self._thumbnail(),
                 units=self.document.units,
@@ -3203,9 +3427,12 @@ class MainWindow(QMainWindow):
         )
         if not path:
             return
+        geometry = self._export_geometry()
+        if geometry is None:
+            return
         try:
             result = export_io.export_job_package(
-                self.document, self._geometry(), path, fmt=fmt,
+                self.document, geometry, path, fmt=fmt,
                 screenshot=self._thumbnail(), rebuild=self._last_result,
             )
         except Exception as exc:
