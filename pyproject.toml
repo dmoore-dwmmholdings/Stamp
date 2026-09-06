@@ -47,7 +47,14 @@ dev = [
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["tests"]
-addopts = "-q"
+# opens_email is deselected here rather than in CI, because the reason to skip it
+# is the developer sitting in front of the machine: it hands a real mailto: to
+# the desktop and a compose window steals focus.  Run it deliberately with
+#   uv run pytest -m opens_email
+addopts = "-q -m 'not opens_email'"
+markers = [
+    "opens_email: opens a real email in the desktop mail client; not run by default",
+]
 
 [tool.ruff]
 line-length = 96

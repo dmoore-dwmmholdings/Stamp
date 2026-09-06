@@ -99,10 +99,38 @@ class TestMailtoLink:
 
 
 class TestSend:
-    def test_send_writes_the_full_copy(self, started, qapp):
+    def test_send_writes_the_full_copy(self, started, qapp, monkeypatch):
+        """The file half of send(), with the mail client held shut.
+
+        send() ends in QDesktopServices.openUrl, which hands a real ``mailto:``
+        to the desktop and takes over the screen with a compose window.  That is
+        the point of the function and it is worth testing, but not on every run
+        of the suite - see the opens_email test below.  What this one is about is
+        the file that stands alone when the mail never opens, so the mail is
+        stubbed out and the file is checked.
+        """
+        opened = []
+        from PySide6.QtGui import QDesktopServices
+
+        monkeypatch.setattr(
+            QDesktopServices, "openUrl", lambda url: opened.append(url) or True
+        )
         result = reporting.send(reporting.Report(kind="bug", detail="hello"))
         assert result.path is not None and result.path.exists()
         assert "hello" in result.path.read_text(encoding="utf-8")
+        assert result.opened is True
+        assert opened and opened[0].toString().startswith("mailto:")
+
+    @pytest.mark.opens_email
+    def test_send_really_opens_the_mail_client(self, started, qapp):
+        """The whole path, including the compose window the user would see.
+
+        Deselected by default: it opens a real email.  Run it deliberately, on a
+        machine you are not sitting at or in a container - see README.
+        """
+        result = reporting.send(reporting.Report(kind="bug", detail="hello"))
+        assert result.path is not None and result.path.exists()
+        assert result.opened is True
 
 
 class TestReportFile:

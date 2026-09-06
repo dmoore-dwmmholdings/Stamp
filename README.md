@@ -532,9 +532,33 @@ uv run ruff check src tests
 uv run python tests/make_fixtures.py
 ```
 
+The fixtures under `tests/fixtures/` are generated and not in git, so
+`make_fixtures.py` is the first thing to run in a fresh clone — and again after
+pulling work that adds a fixture, since a missing one shows up as an error in an
+unrelated-looking test.
+
 Every push runs lint and the test suite on Windows and Linux via GitHub Actions
 (`.github/workflows/ci.yml`). Tests that need a real window and OpenGL are skipped
 there — the runners are headless.
+
+### Tests that take over the screen
+
+`uv run pytest` does not run the tests marked `opens_email`. There is one, and it
+hands a real `mailto:` to the desktop, which opens a compose window in front of
+whatever you were doing. Nothing is sent, but on a machine you are sitting at it
+is a window to close on every run, so it is deselected in `addopts` rather than
+left to be remembered.
+
+Run it deliberately, on a machine you are away from or in a container:
+
+```
+uv run pytest -m opens_email
+```
+
+What that test covers beyond the default suite is only the last step — that the
+desktop really accepts the link. Everything up to it, including the `mailto:`
+that gets built and the report file that stands alone when no mail client
+answers, is covered on every ordinary run with the mail client stubbed out.
 
 `PROGRESS.md` tracks milestone status and records the hard-won findings worth
 keeping.
