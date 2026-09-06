@@ -43,7 +43,11 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - runner: macos-13
+          # macos-13 was the last plain Intel image and GitHub has retired it:
+          # the job sat queued forever rather than failing, and the manifest
+          # job waits on it, so a release built its installers and then never
+          # published the update feed.  macos-15-intel is the Intel runner now.
+          - runner: macos-15-intel
             arch: x86_64
           - runner: macos-14
             arch: arm64
