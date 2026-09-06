@@ -13,6 +13,7 @@ triangle, and sewing that is quadratic (§2).  For *display* of a mesh part,
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -22,10 +23,11 @@ from OCP.BRepCheck import BRepCheck_Analyzer
 from OCP.BRepGProp import BRepGProp
 from OCP.GProp import GProp_GProps
 from OCP.TopAbs import TopAbs_ShapeEnum
-from OCP.TopExp import TopExp_Explorer
+from OCP.TopExp import TopExp, TopExp_Explorer
 from OCP.TopoDS import TopoDS, TopoDS_Shape
+from OCP.TopTools import TopTools_IndexedMapOfShape
 
-from stamp.core.document import BasePart
+from stamp.core.document import BasePart, PartBody
 from stamp.io.profile_import import file_hash
 
 SOLID_EXTS = {".step", ".stp", ".iges", ".igs", ".brep", ".brp"}
@@ -34,6 +36,12 @@ PART_EXTS = SOLID_EXTS | MESH_EXTS
 
 #: Above this triangle count the viewport gets a decimated copy (§5.2).
 DECIMATE_THRESHOLD = 1_000_000
+
+#: Above this face count a solid is one planar face per triangle - a mesh that
+#: has been run through a converter, not something anybody modelled.  The
+#: viewport draws those differently (see :mod:`stamp.ui.viewport`) and the
+#: importer says so, because opening the original mesh instead is far faster.
+DENSE_FACE_COUNT = 5_000
 
 
 class PartImportError(RuntimeError):
@@ -44,9 +52,15 @@ class PartImportError(RuntimeError):
 class PartImportResult:
     part: BasePart
     #: Present when the file held several solids and the user must choose (§5.1).
+    #: The import subprocess cannot hand shapes back, so it reports the two facts
+    #: the choice actually needs in the fields below instead.
     solids: list[TopoDS_Shape] = field(default_factory=list)
     #: True when the file carries no unit and the UI must prompt with a size preview.
     units_ambiguous: bool = False
+    #: How many solids the file held.  Zero or one means there was no choice.
+    solid_count: int = 0
+    #: Whether those solids are separate bodies, or None when it was not worked out.
+    solids_disjoint: bool | None = None
 
 
 def import_part(
@@ -55,13 +69,23 @@ def import_part(
     unit_scale: float | None = None,
     solid_index: int | None = None,
     repair: bool = True,
+    progress: Callable[[str], None] | None = None,
 ) -> PartImportResult:
+    """Read a part file.
+
+    *progress* is called with a short phase name as each stage begins.  Reading a
+    converted mesh takes a minute, all of it inside OpenCascade with the GIL
+    held, so the only way to say anything while it happens is from another
+    process - see :mod:`stamp.io.import_process`, which is what passes this in.
+    """
     path = Path(path)
     suffix = path.suffix.lower()
     if suffix in SOLID_EXTS:
-        return import_solid(path, solid_index=solid_index, repair=repair)
+        return import_solid(
+            path, solid_index=solid_index, repair=repair, progress=progress
+        )
     if suffix in MESH_EXTS:
-        return import_mesh(path, unit_scale=unit_scale)
+        return import_mesh(path, unit_scale=unit_scale, progress=progress)
     raise PartImportError(
         f"Stamp cannot read {suffix or 'this file'}. Open a STEP, IGES, BREP, STL, "
         f"3MF, or OBJ file."
@@ -81,17 +105,24 @@ def mode_for(path: str | Path) -> str:
 
 
 def import_solid(
-    path: Path, *, solid_index: int | None = None, repair: bool = True
+    path: Path,
+    *,
+    solid_index: int | None = None,
+    repair: bool = True,
+    progress: Callable[[str], None] | None = None,
 ) -> PartImportResult:
     suffix = path.suffix.lower()
     warnings: list[str] = []
+    say = progress or (lambda _phase: None)
 
     if suffix in (".step", ".stp"):
-        shape = _read_step(path)
+        shape = _read_step(path, progress=say)
     elif suffix in (".iges", ".igs"):
+        say("Reading the file")
         shape, iges_warnings = _read_iges(path)
         warnings.extend(iges_warnings)
     else:
+        say("Reading the file")
         shape = _read_brep(path)
 
     if shape is None or shape.IsNull():
@@ -103,10 +134,13 @@ def import_solid(
     solids = _solids_of(shape)
     if len(solids) > 1:
         if solid_index is None:
-            part = _describe_solid(shape, path, warnings, valid=True)
-            return PartImportResult(part=part, solids=solids)
+            part = _describe_solid(shape, path, warnings, valid=True, progress=say)
+            return PartImportResult(
+                part=part, solids=solids, solid_count=len(solids)
+            )
         shape = solids[solid_index]
 
+    say("Checking the part")
     valid = BRepCheck_Analyzer(shape).IsValid()
     if not valid and repair:
         # Most real STEP is slightly dirty and still workable.  Try once, then let
@@ -126,20 +160,26 @@ def import_solid(
                 "fail or give a wrong result. You can continue."
             )
 
-    part = _describe_solid(shape, path, warnings, valid=valid)
-    return PartImportResult(part=part)
+    part = _describe_solid(shape, path, warnings, valid=valid, progress=say)
+    return PartImportResult(part=part, solid_count=len(solids))
 
 
-def _read_step(path: Path) -> TopoDS_Shape | None:
+def _read_step(
+    path: Path, *, progress: Callable[[str], None] | None = None
+) -> TopoDS_Shape | None:
     from OCP.IFSelect import IFSelect_ReturnStatus
     from OCP.STEPControl import STEPControl_Reader
 
+    say = progress or (lambda _phase: None)
     reader = STEPControl_Reader()
+    say("Reading the file")
     status = reader.ReadFile(str(path))
     if status != IFSelect_ReturnStatus.IFSelect_RetDone:
         raise PartImportError(f"{path.name} is not a STEP file that Stamp can read.")
     # OpenCascade reads the header length unit and scales to the system unit, which
-    # is mm - so no explicit conversion is needed here.
+    # is mm - so no explicit conversion is needed here.  This is the long half of a
+    # STEP import: 35 s of the 57 s a converted mesh takes.
+    say("Building the geometry")
     reader.TransferRoots()
     return reader.OneShape()
 
@@ -189,6 +229,52 @@ def _read_brep(path: Path) -> TopoDS_Shape:
     return shape
 
 
+def display_drawer(draft: bool = False):
+    """A drawer with the deviation settings the viewport displays shapes with.
+
+    :func:`pretessellate` needs it: OpenCascade only reuses triangulation that
+    was built to the deflection the presentation goes on to ask for.  It lives
+    here rather than beside the viewport so the import subprocess can call it
+    without loading Qt or OpenGL.
+    """
+    from OCP.Prs3d import Prs3d_Drawer
+
+    drawer = Prs3d_Drawer()
+    drawer.SetDeviationCoefficient(0.01 if draft else 0.001)
+    drawer.SetDeviationAngle(0.5 if draft else 0.2)
+    return drawer
+
+
+def pretessellate(shape: TopoDS_Shape, draft: bool = False) -> None:
+    """Triangulate *shape* for display, before anything tries to draw it.
+
+    ``AIS_Shape`` meshes on first display - seven seconds for a converted mesh,
+    and OpenCascade holds the GIL throughout, so a thread cannot take that off
+    the window.  Only a separate process can, which is where this is called
+    from: :mod:`stamp.io.import_process` meshes the part it just read and ships
+    the triangulation across with it.  The same call the presentation makes,
+    with the same drawer, so what arrives is what it would have built.
+    """
+    from OCP.StdPrs import StdPrs_ToolTriangulatedShape
+
+    try:
+        StdPrs_ToolTriangulatedShape.Tessellate_s(shape, display_drawer(draft))
+    except Exception:  # noqa: BLE001 - a failed pre-pass must never stop an import
+        pass
+
+
+def face_count(shape: TopoDS_Shape) -> int:
+    """How many faces *shape* has.
+
+    Mapped in C++ rather than walked in Python: a converted mesh has hundreds of
+    thousands of faces, and merely listing them costs longer than everything
+    else the importer does to describe the part.
+    """
+    faces = TopTools_IndexedMapOfShape()
+    TopExp.MapShapes_s(shape, TopAbs_ShapeEnum.TopAbs_FACE, faces)
+    return faces.Extent()
+
+
 def _explore(shape: TopoDS_Shape, kind: TopAbs_ShapeEnum) -> list[TopoDS_Shape]:
     out: list[TopoDS_Shape] = []
     explorer = TopExp_Explorer(shape, kind)
@@ -229,9 +315,23 @@ def bounding_box(shape: TopoDS_Shape) -> tuple[float, float, float, float, float
 
 
 def _describe_solid(
-    shape: TopoDS_Shape, path: Path, warnings: list[str], *, valid: bool
+    shape: TopoDS_Shape,
+    path: Path,
+    warnings: list[str],
+    *,
+    valid: bool,
+    progress: Callable[[str], None] | None = None,
 ) -> BasePart:
-    faces = _explore(shape, TopAbs_ShapeEnum.TopAbs_FACE)
+    (progress or (lambda _phase: None))("Measuring the part")
+    faces = face_count(shape)
+    if faces > DENSE_FACE_COUNT:
+        warnings.append(
+            f"This STEP holds {faces:,} faces, which means it is a mesh somebody "
+            f"converted: one flat face per triangle. Stamp will open it, but every "
+            f"rebuild and every export has to work through all of them. If you "
+            f"still have the 3MF or STL it came from, open that instead - Stamp "
+            f"handles meshes natively and it will be far quicker."
+        )
     return BasePart(
         source_path=str(path),
         source_hash=file_hash(path),
@@ -239,7 +339,7 @@ def _describe_solid(
         unit_scale=1.0,
         bbox=bounding_box(shape),
         volume=_volume(shape),
-        face_count=len(faces),
+        face_count=faces,
         triangle_count=0,
         watertight=True,
         valid=valid,
@@ -251,13 +351,23 @@ def _describe_solid(
 # ------------------------------------------------------------------ mesh mode
 
 
-def import_mesh(path: Path, *, unit_scale: float | None = None) -> PartImportResult:
+def import_mesh(
+    path: Path,
+    *,
+    unit_scale: float | None = None,
+    progress: Callable[[str], None] | None = None,
+) -> PartImportResult:
     import trimesh
 
+    (progress or (lambda _phase: None))("Reading the mesh")
     # process=True merges the duplicated vertices that STL stores per triangle.
     # Without it no edge is ever shared and nothing is ever watertight.
     try:
-        loaded = trimesh.load(str(path), force="mesh", process=True)
+        # Deliberately not force="mesh".  That flattens a scene into one mesh
+        # before Stamp ever sees it, and a 3MF from a slicer is nearly always an
+        # assembly - a base, a lid, four copies of a clip.  The scene is kept and
+        # its parts named; the working mesh is still the whole thing.
+        loaded = trimesh.load(str(path), process=True)
     except ModuleNotFoundError as exc:
         # trimesh defers its per-format dependencies, thus a format it lists can
         # still fail here.  Say which package is absent, not "no module named".
@@ -267,6 +377,8 @@ def import_mesh(path: Path, *, unit_scale: float | None = None) -> PartImportRes
         ) from exc
     except Exception as exc:
         raise PartImportError(f"Stamp cannot read {path.name}. {exc}") from exc
+    pieces = _scene_parts(loaded)
+    loaded = _one_mesh(loaded, pieces)
     if not isinstance(loaded, trimesh.Trimesh) or loaded.faces.shape[0] == 0:
         raise PartImportError(
             f"{path.name} contains no triangles that Stamp can read."
@@ -297,8 +409,11 @@ def import_mesh(path: Path, *, unit_scale: float | None = None) -> PartImportRes
     scale = unit_scale if unit_scale is not None else 1.0
     if scale != 1.0:
         loaded.apply_scale(scale)
+        for piece in pieces:
+            piece.apply_scale(scale)
 
     manifold = _to_manifold(loaded)
+    parts = _describe_parts(pieces)
     lo, hi = loaded.bounds
     return PartImportResult(
         part=BasePart(
@@ -314,9 +429,80 @@ def import_mesh(path: Path, *, unit_scale: float | None = None) -> PartImportRes
             valid=watertight,
             warnings=warnings,
             runtime=manifold,
+            parts=parts,
         ),
         units_ambiguous=ambiguous,
     )
+
+
+def _scene_parts(loaded) -> list:
+    """The placed, named meshes a scene holds, or [] for a single mesh.
+
+    ``scene.dump()`` and not ``scene.geometry``: the second is the mesh library,
+    where four copies of one clip are one entry and none of them carry the
+    transform that puts them where they are.  Two instances of the same mesh
+    came out with identical bounding boxes, which is no use for telling them
+    apart or for saying which one a click landed on.
+    """
+    import trimesh
+
+    if not isinstance(loaded, trimesh.Scene):
+        return []
+    try:
+        dumped = list(loaded.dump())
+    except Exception:  # noqa: BLE001 - a scene Stamp cannot walk is still a mesh
+        return []
+    return [g for g in dumped if getattr(g, "faces", None) is not None and len(g.faces)]
+
+
+def _one_mesh(loaded, pieces):
+    """The whole assembly as one mesh, which is what the engine works on."""
+    import trimesh
+
+    if not isinstance(loaded, trimesh.Scene):
+        return loaded
+    if not pieces:
+        raise PartImportError("This file contains no triangles that Stamp can read.")
+    if len(pieces) == 1:
+        return pieces[0]
+    return trimesh.util.concatenate(pieces)
+
+
+def _describe_parts(pieces) -> list[PartBody]:
+    """Name and measure each part, and keep its geometry on its own.
+
+    The runtime is a manifold rather than the trimesh it came from, because that
+    is what the rebuild engine works on: a part with a stamp on it is rebuilt by
+    itself, and a part with nothing on it is not rebuilt at all.
+
+    One part is not an assembly, so it gets none.
+    """
+    if len(pieces) < 2:
+        return []
+    out: list[PartBody] = []
+    seen: dict[str, int] = {}
+    for index, piece in enumerate(pieces):
+        raw = str((getattr(piece, "metadata", None) or {}).get("name") or "").strip()
+        name = raw or f"Part {index + 1}"
+        # Slicers reuse one name for every copy of a part.  Two rows reading
+        # "clip" is not a list anybody can act on.
+        seen[name] = seen.get(name, 0) + 1
+        if seen[name] > 1:
+            name = f"{name} ({seen[name]})"
+        lo, hi = piece.bounds
+        out.append(
+            PartBody(
+                name=name,
+                index=index,
+                triangle_count=int(piece.faces.shape[0]),
+                bbox=(
+                    float(lo[0]), float(lo[1]), float(lo[2]),
+                    float(hi[0]), float(hi[1]), float(hi[2]),
+                ),
+                runtime=_to_manifold(piece),
+            )
+        )
+    return out
 
 
 def _to_manifold(mesh):
@@ -406,8 +592,11 @@ __all__ = [
     "PART_EXTS",
     "PartImportError",
     "PartImportResult",
+    "DENSE_FACE_COUNT",
     "SOLID_EXTS",
     "bounding_box",
+    "display_drawer",
+    "face_count",
     "import_mesh",
     "import_part",
     "import_solid",
@@ -415,6 +604,7 @@ __all__ = [
     "manifold_to_trimesh",
     "mesh_triangulation",
     "mode_for",
+    "pretessellate",
     "solids_intersect",
     "triangulation_to_shape",
     "trimesh_display_shape",

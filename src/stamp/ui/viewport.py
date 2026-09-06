@@ -8,9 +8,17 @@ platform window object (WNT_Window / Xw_Window / Cocoa_Window).
 from __future__ import annotations
 
 import ctypes
+import math
 import platform
 
-from OCP.AIS import AIS_DisplayMode, AIS_InteractiveContext, AIS_Shaded, AIS_Shape
+from OCP.AIS import (
+    AIS_AnimationCamera,
+    AIS_DisplayMode,
+    AIS_InteractiveContext,
+    AIS_Shaded,
+    AIS_Shape,
+    AIS_ViewCube,
+)
 from OCP.Aspect import (
     Aspect_DisplayConnection,
     Aspect_GradientFillMethod,
@@ -23,7 +31,10 @@ from OCP.Graphic3d import (
     Graphic3d_MaterialAspect,
     Graphic3d_NameOfMaterial_Aluminum,
     Graphic3d_NameOfMaterial_Plastered,
+    Graphic3d_TransformPers,
+    Graphic3d_TransModeFlags,
     Graphic3d_TypeOfShadingModel,
+    Graphic3d_Vec2i,
 )
 from OCP.OpenGl import OpenGl_GraphicDriver
 from OCP.Quantity import Quantity_Color, Quantity_TOC_RGB, Quantity_TOC_sRGB
@@ -35,11 +46,12 @@ from OCP.V3d import (
     V3d_TypeOfOrientation,
     V3d_Viewer,
 )
-from PySide6.QtCore import QPoint, Qt, QTimer, Signal
+from PySide6.QtCore import QElapsedTimer, QPoint, Qt, QTimer, Signal
 from PySide6.QtGui import QMouseEvent, QResizeEvent, QWheelEvent
-from PySide6.QtWidgets import QWidget
+from PySide6.QtWidgets import QApplication, QWidget
 
 from stamp import diagnostics
+from stamp.io.part_import import DENSE_FACE_COUNT, display_drawer, face_count
 
 #: Face boundary edges.  They are what makes a contour readable on a shaded solid.
 #: This one is sRGB, not the linear RGB the other colors here use: Quantity_TOC_RGB
@@ -80,6 +92,33 @@ SELECTION_MODES: dict[str, TopAbs_ShapeEnum] = {
     "edge": TopAbs_ShapeEnum.TopAbs_EDGE,
     "vertex": TopAbs_ShapeEnum.TopAbs_VERTEX,
 }
+
+#: Hover highlighting runs at most this often, in ms.  ``MoveTo`` walks the
+#: selection tree, so on a heavy part it is the one thing standing between the
+#: mouse and the screen.
+HOVER_INTERVAL_MS = 32
+
+#: A hover that costs longer than this, in ms, stops following the mouse and
+#: waits for it to settle instead.  A highlight nobody can outrun is worse than
+#: a highlight that arrives a moment late.
+HOVER_SETTLE_ABOVE_MS = 12.0
+
+#: How long the pointer must sit still before a settled hover is computed, in ms.
+HOVER_SETTLE_MS = 90
+
+#: One nudge of the arrow keys, in degrees.  Fifteen is what every CAD program
+#: uses, and it divides into ninety.
+ROTATE_STEP_DEG = 15.0
+
+#: A nudge with Shift held, in degrees - a quarter turn, straight to the next face.
+ROTATE_COARSE_DEG = 90.0
+
+#: The navigation cube, in pixels, and how far its centre sits from the corner.
+VIEW_CUBE_PX = 62.0
+VIEW_CUBE_MARGIN_PX = 88
+
+#: How long the cube takes to swing the camera to a new face, in seconds.
+VIEW_CUBE_SECONDS = 0.35
 
 
 class Viewport(QWidget):
@@ -124,8 +163,29 @@ class Viewport(QWidget):
         self._drag_start: QPoint | None = None
         self._drag_kind: str | None = None
         self._displayed: dict[str, AIS_Shape] = {}
+        #: What each key was last displayed with, so an unchanged shape is not
+        #: torn down and rebuilt.  See :meth:`display_shape`.
+        self._shown: dict[str, tuple] = {}
+        #: Keys whose selection has not been computed yet.  See :meth:`_activate_pending`.
+        self._pending_selection: set[str] = set()
+        #: Keys the viewport is drawing without boundary edges or face selection.
+        self._dense: set[str] = set()
         #: Where the last pick happened, so a caller can cast its own ray.
         self.last_pick_position: QPoint | None = None
+
+        self._hover_clock = QElapsedTimer()
+        self._hover_clock.start()
+        self._last_hover_ms = 0.0
+        self._hover_at: QPoint | None = None
+        self._hover_timer = QTimer(self)
+        self._hover_timer.setSingleShot(True)
+        self._hover_timer.timeout.connect(self._hover_now)
+
+        self._cube: AIS_ViewCube | None = None
+        self._camera_animation = None
+        self._cube_timer = QTimer(self)
+        self._cube_timer.setInterval(16)
+        self._cube_timer.timeout.connect(self._step_cube_animation)
 
         self._startup_fitted = False
         self.viewer: V3d_Viewer | None = None
@@ -233,6 +293,78 @@ class Viewport(QWidget):
             0.08,
         )
         self.view.SetProj(PRESET_VIEWS["iso"])
+        self._make_view_cube()
+
+    def _make_view_cube(self) -> None:
+        """The navigation cube in the top right corner.
+
+        One click on a face, edge or corner swings the camera there, which is the
+        quick way to a standard view - quicker than a menu and far quicker than
+        orbiting to it by hand.  OpenCascade draws and animates it; all this has
+        to do is place it, hand it a camera animation, and step that animation
+        while it runs.
+        """
+        assert self.view is not None and self.context is not None
+        from OCP.TCollection import TCollection_AsciiString
+
+        self._camera_animation = AIS_AnimationCamera(
+            TCollection_AsciiString("stamp_view"), self.view
+        )
+        cube = AIS_ViewCube()
+        cube.SetSize(VIEW_CUBE_PX)
+        cube.SetBoxTransparency(0.15)
+        cube.SetFontHeight(11.0)
+        cube.SetTextColor(Quantity_Color(0.92, 0.92, 0.94, Quantity_TOC_sRGB))
+        # No axis arrows on the cube: the triedron in the other corner already
+        # says which way is up, and two of them is one too many.
+        cube.SetDrawAxes(False)
+        cube.SetViewAnimation(self._camera_animation)
+        # Not a fixed loop: OCC would block inside its own animation loop and the
+        # window would stop answering for the length of every swing.  Driven from
+        # a timer instead, so the rest of the program keeps running.
+        cube.SetFixedAnimationLoop(False)
+        cube.SetAutoStartAnimation(True)
+        cube.SetDuration(VIEW_CUBE_SECONDS)
+        cube.SetTransformPersistence(
+            Graphic3d_TransformPers(
+                Graphic3d_TransModeFlags.Graphic3d_TMF_TriedronPers,
+                Aspect_TypeOfTriedronPosition.Aspect_TOTP_RIGHT_UPPER,
+                Graphic3d_Vec2i(VIEW_CUBE_MARGIN_PX, VIEW_CUBE_MARGIN_PX),
+            )
+        )
+        self.context.Display(cube, 0, 0, False)
+        self._cube = cube
+
+    def _step_cube_animation(self) -> None:
+        if self._cube is None:
+            self._cube_timer.stop()
+            return
+        if not self._cube.HasAnimation() or not self._cube.UpdateAnimation(False):
+            self._cube_timer.stop()
+        if self.view is not None:
+            self.view.Invalidate()
+            self.view.Redraw()
+        self.view_changed.emit()
+
+    def _clicked_the_cube(self) -> bool:
+        """Answer a click on the navigation cube, and say whether it was one.
+
+        A cube click is navigation, not selection: it must not reach the document
+        as a picked face.
+        """
+        if self._cube is None or self.context is None:
+            return False
+        if not self.context.HasDetected():
+            return False
+        detected = self.context.DetectedInteractive()
+        if detected is None or detected != self._cube:
+            return False
+        owner = self.context.DetectedOwner()
+        if owner is None:
+            return False
+        self._cube.HandleClick(owner)
+        self._cube_timer.start()
+        return True
 
     def _setup_lights(self) -> None:
         """Even light from every side, the way a CAD viewer lights a part.
@@ -308,11 +440,30 @@ class Viewport(QWidget):
         if self.context is None:
             return None
 
+        # Rebuilding a presentation costs a second or more on a heavy part, and
+        # a good deal of what the window does - switching selection mode,
+        # reselecting a feature, toggling the preview - hands back the very
+        # shape already on screen.  Redisplaying that is pure waste.
+        options = (color, transparency, material, matte, selectable)
+        previous = self._shown.get(key)
+        if previous is not None and previous[1] == options and shape.IsEqual(previous[0]):
+            if update:
+                self.context.UpdateCurrentViewer()
+            return self._displayed.get(key)
+
         self.erase(key, update=False)
+        # A converted mesh - one planar face per triangle.  Two of the things a
+        # viewport normally does are ruinous at that size.  Boundary edges
+        # outline every triangle, which costs seconds to build and draws the
+        # part as a black smudge.  Hover highlighting picks out one triangle,
+        # which tells the user nothing and needs the whole selection tree built
+        # to say it.  Both are dropped; picking itself is not (see
+        # :meth:`_activate_pending`).
+        dense = (material or selectable) and face_count(shape) > DENSE_FACE_COUNT
         ais = AIS_Shape(shape)
         if color is not None:
             ais.SetColor(Quantity_Color(*color, Quantity_TOC_RGB))
-        if material:
+        if material and not dense:
             ais.SetMaterial(Graphic3d_MaterialAspect(Graphic3d_NameOfMaterial_Aluminum))
             # A shaded face against a shaded face of the same color has no visible
             # border.  The boundary edges give the eye the contour.
@@ -328,9 +479,10 @@ class Viewport(QWidget):
             ais.SetPolygonOffsets(
                 int(Aspect_PolygonOffsetMode.Aspect_POM_Fill), 1.0, 1.0
             )
-        elif matte:
+        elif matte or dense:
             # OCC's implicit material is noticeably glossy.  A plaster finish
-            # gives imported triangulations readable, neutral shading.
+            # gives imported triangulations readable, neutral shading - and a
+            # converted mesh drawn without boundary edges is exactly that.
             ais.SetMaterial(
                 Graphic3d_MaterialAspect(Graphic3d_NameOfMaterial_Plastered)
             )
@@ -338,16 +490,24 @@ class Viewport(QWidget):
             ais.SetTransparency(transparency)
         self.context.Display(ais, AIS_Shaded, 0, False)
         self.context.Deactivate(ais)
-        if selectable:
-            self.context.Activate(
-                ais, AIS_Shape.SelectionMode_s(SELECTION_MODES[self._selection_mode])
-            )
         self._displayed[key] = ais
+        self._shown[key] = (shape, options)
+        self._dense.discard(key)
+        if dense:
+            self._dense.add(key)
+        if selectable:
+            # Deferred, not dropped: computing selection costs as much as drawing
+            # does, and most of what gets displayed is never picked on.  The
+            # first hover or click over the view pays for it, once.
+            self._pending_selection.add(key)
         if update:
             self.context.UpdateCurrentViewer()
         return ais
 
     def erase(self, key: str, *, update: bool = True) -> None:
+        self._shown.pop(key, None)
+        self._pending_selection.discard(key)
+        self._dense.discard(key)
         ais = self._displayed.pop(key, None)
         if ais is not None and self.context is not None:
             self.context.Remove(ais, False)
@@ -383,6 +543,43 @@ class Viewport(QWidget):
         self.view.SetProj(PRESET_VIEWS[name])
         self.fit_all()
 
+    def rotate_by(self, yaw_deg: float, pitch_deg: float) -> None:
+        """Orbit the camera about what the view is looking at.
+
+        The eye goes round the view's reference point, which is the middle of the
+        screen - so the part turns in front of the user.  Turning the eye instead
+        would be looking around from a fixed spot, which is not what an arrow key
+        means in a CAD program.
+        """
+        if self.view is None:
+            return
+        self.view.Rotate(
+            math.radians(yaw_deg), math.radians(pitch_deg), 0.0, True
+        )
+        self.view.Redraw()
+        self.view_changed.emit()
+
+    def roll_by(self, degrees: float) -> None:
+        """Spin the view about the direction it is looking - SolidWorks' roll."""
+        if self.view is None:
+            return
+        self.view.SetTwist(self.view.Twist() + math.radians(degrees))
+        self.view.Redraw()
+        self.view_changed.emit()
+
+    def look_along(self, normal: tuple[float, float, float]) -> None:
+        """Point the camera straight down *normal* - "normal to" a picked face."""
+        if self.view is None:
+            return
+        nx, ny, nz = normal
+        if math.sqrt(nx * nx + ny * ny + nz * nz) < 1e-9:
+            return
+        # SetProj takes the direction from the scene towards the eye, so looking
+        # *at* a face means projecting along its outward normal.
+        self.view.SetProj(nx, ny, nz)
+        self.view.Redraw()
+        self.view_changed.emit()
+
     def set_background(self, r1, g1, b1, r2, g2, b2) -> None:
         """Set the vertical gradient behind the part, from sRGB triples.
 
@@ -404,16 +601,50 @@ class Viewport(QWidget):
     # ---------------------------------------------------------------- selection
 
     def set_selection_mode(self, mode: str) -> None:
-        """Switch between face, edge, vertex and whole-shape picking."""
+        """Switch between face, edge, vertex and whole-shape picking.
+
+        Most callers set the mode they are already in - the window puts the view
+        back to face picking after nearly every action.  Recomputing selection
+        for that is a second of frozen window on a heavy part and changes
+        nothing, so an unchanged mode returns immediately, and a changed one only
+        marks the work: :meth:`_activate_pending` does it when the user reaches
+        for the view.
+        """
         if mode not in SELECTION_MODES:
             raise ValueError(f"Unknown selection mode {mode!r}")
+        if mode == self._selection_mode:
+            return
         self._selection_mode = mode
         if self.context is None:
             return
-        for ais in self._displayed.values():
+        for key, ais in self._displayed.items():
             self.context.Deactivate(ais)
-            self.context.Activate(ais, AIS_Shape.SelectionMode_s(SELECTION_MODES[mode]))
+            self._pending_selection.add(key)
         self.context.UpdateCurrentViewer()
+
+    def _activate_pending(self) -> None:
+        """Compute selection for everything displayed since the last interaction.
+
+        On a converted mesh this is a second of work, so it waits here for a
+        click rather than running on display.  The cursor says so: a pause the
+        user asked for by clicking reads as the machine working, where the same
+        pause on a mouse move reads as the machine broken.
+        """
+        if not self._pending_selection or self.context is None:
+            return
+        slow = bool(self._pending_selection & self._dense)
+        if slow:
+            QApplication.setOverrideCursor(Qt.CursorShape.BusyCursor)
+        try:
+            mode = AIS_Shape.SelectionMode_s(SELECTION_MODES[self._selection_mode])
+            for key in list(self._pending_selection):
+                ais = self._displayed.get(key)
+                if ais is not None:
+                    self.context.Activate(ais, mode)
+            self._pending_selection.clear()
+        finally:
+            if slow:
+                QApplication.restoreOverrideCursor()
 
     @property
     def selection_mode(self) -> str:
@@ -448,6 +679,7 @@ class Viewport(QWidget):
             return
         pos = event.position().toPoint()
         self._drag_start = pos
+        self._hover_timer.stop()
         buttons = event.buttons()
         mods = event.modifiers()
 
@@ -476,9 +708,48 @@ class Viewport(QWidget):
             self._drag_start = pos
             self.view_changed.emit()
         elif self._drag_kind is None:
-            self.context.MoveTo(
-                self.device_px(pos.x()), self.device_px(pos.y()), self.view, True
-            )
+            self._hover(pos)
+
+    def _hover(self, pos: QPoint) -> None:
+        """Highlight what is under the cursor, without chasing every mouse move.
+
+        ``MoveTo`` walks the selection tree, and on a converted mesh one call can
+        cost more than a frame.  Called straight from ``mouseMoveEvent`` that
+        turns the pointer to treacle: Qt queues a move for every pixel and each
+        one blocks.  So hovering is rate-limited, and once a single ``MoveTo``
+        has proven slow it stops following the pointer at all and waits for it to
+        settle.  The trailing timer is what makes either safe - the last position
+        the mouse was at is always the one that finally gets highlighted.
+        """
+        self._hover_at = QPoint(pos)
+        if self._last_hover_ms > HOVER_SETTLE_ABOVE_MS:
+            self._hover_timer.start(HOVER_SETTLE_MS)
+            return
+        waited = self._hover_clock.elapsed()
+        if waited < HOVER_INTERVAL_MS:
+            self._hover_timer.start(HOVER_INTERVAL_MS - waited)
+            return
+        self._hover_now()
+
+    def _hover_now(self) -> None:
+        if self.context is None or self.view is None or self._hover_at is None:
+            return
+        if self._drag_kind is not None:
+            return  # the pointer started a drag while the timer was waiting
+        if self._pending_selection & self._dense:
+            # Highlighting one triangle of a converted mesh tells the user
+            # nothing, and it is not worth a second of frozen mouse to compute
+            # the selection that would draw it.  The first click pays for that.
+            return
+        pos = self._hover_at
+        self._hover_timer.stop()
+        self._activate_pending()
+        started = self._hover_clock.nsecsElapsed()
+        self.context.MoveTo(
+            self.device_px(pos.x()), self.device_px(pos.y()), self.view, True
+        )
+        self._last_hover_ms = (self._hover_clock.nsecsElapsed() - started) / 1e6
+        self._hover_clock.restart()
 
     def mouseReleaseEvent(self, event: QMouseEvent) -> None:  # noqa: N802
         if self.view is None or self.context is None:
@@ -495,10 +766,17 @@ class Viewport(QWidget):
     def _do_pick(self, pos: QPoint, *, additive: bool) -> None:
         if self.context is None or self.view is None:
             return
+        self._hover_timer.stop()
+        self._activate_pending()
         self.last_pick_position = QPoint(pos)
         self.context.MoveTo(
             self.device_px(pos.x()), self.device_px(pos.y()), self.view, True
         )
+        # One MoveTo answers both questions.  The cube's own selection is always
+        # live, so the same detection says whether the click landed on it, and
+        # asking twice cost a second full pick on every click.
+        if self._clicked_the_cube():
+            return
         if additive:
             self.context.ShiftSelect(True)
         else:
@@ -525,6 +803,35 @@ class Viewport(QWidget):
         x, y, z = self.view.Convert(self.device_px(pos.x()), self.device_px(pos.y()))
         return gp_Pnt(x, y, z)
 
+    def keyPressEvent(self, event) -> None:  # noqa: N802
+        """Turn the part with the arrow keys, the way every CAD program does.
+
+        Arrows orbit a step, Shift takes a quarter turn straight to the next
+        face, and Alt with left or right rolls the view instead of orbiting it.
+        Anything else is passed on, so the window's own shortcuts still work.
+        """
+        key = event.key()
+        mods = event.modifiers()
+        step = (
+            ROTATE_COARSE_DEG
+            if mods & Qt.KeyboardModifier.ShiftModifier
+            else ROTATE_STEP_DEG
+        )
+        rolling = bool(mods & Qt.KeyboardModifier.AltModifier)
+
+        if key == Qt.Key.Key_Left:
+            self.roll_by(step) if rolling else self.rotate_by(-step, 0.0)
+        elif key == Qt.Key.Key_Right:
+            self.roll_by(-step) if rolling else self.rotate_by(step, 0.0)
+        elif key == Qt.Key.Key_Up:
+            self.rotate_by(0.0, step)
+        elif key == Qt.Key.Key_Down:
+            self.rotate_by(0.0, -step)
+        else:
+            super().keyPressEvent(event)
+            return
+        event.accept()
+
     def wheelEvent(self, event: QWheelEvent) -> None:  # noqa: N802
         if self.view is None:
             return
@@ -534,8 +841,8 @@ class Viewport(QWidget):
             return
         factor = 1.12 if delta > 0 else 1.0 / 1.12
         self.view.StartZoomAtPoint(self.device_px(pos.x()), self.device_px(pos.y()))
+        # SetZoom already redraws; a second Redraw here drew every wheel notch twice.
         self.view.SetZoom(factor, True)
-        self.view.Redraw()
         self.view_changed.emit()
 
     def ray_at(self, x: int, y: int):
@@ -562,6 +869,7 @@ class Viewport(QWidget):
         """
         if self.context is None or self.view is None:
             return None
+        self._activate_pending()
         self.context.MoveTo(self.device_px(x), self.device_px(y), self.view, True)
         if not self.context.HasDetected():
             return None
@@ -578,9 +886,10 @@ class Viewport(QWidget):
         """
         if self.context is None:
             return
+        reference = display_drawer(draft)
         drawer = self.context.DefaultDrawer()
-        drawer.SetDeviationCoefficient(0.01 if draft else 0.001)
-        drawer.SetDeviationAngle(0.5 if draft else 0.2)
+        drawer.SetDeviationCoefficient(reference.DeviationCoefficient())
+        drawer.SetDeviationAngle(reference.DeviationAngle())
         for key, ais in list(self._displayed.items()):
             if key in ("handles", "handle_frame", "snap_marker"):
                 continue

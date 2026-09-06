@@ -93,6 +93,55 @@ class Loop:
         return (min(xs), min(ys), max(xs), max(ys))
 
 
+#: The component key used when the source draws no distinction - a DXF, or an SVG
+#: in a single colour.  One component covering everything behaves exactly as the
+#: profile did before components existed.
+SINGLE_COMPONENT = "all"
+
+#: A component covering at least this much of the artwork's bounding box, with
+#: every other component inside it, is a background layer rather than a part of
+#: the drawing.  Well clear of a border or a backing plate, which leave the
+#: middle empty and so cover far less than their box.
+BACKGROUND_COVERAGE = 0.95
+
+#: A hole in a candidate backdrop counts towards its coverage when other
+#: components fill at least this much of it.  A backdrop the exporter carved the
+#: drawing out of has holes that *are* the drawing, so they come out near 1.0; a
+#: border's empty middle, with a small drawing floating in it, is nowhere near.
+FILLED_HOLE_SHARE = 0.75
+
+
+@dataclass
+class Component:
+    """One addressable piece of the artwork - spec §5.5, §9.
+
+    An SVG is grouped by fill colour: every black path is one component, every
+    red path another.  That is how artwork is drawn and how a two-colour print is
+    described, and it keeps the list short enough to pick from - a detailed logo
+    has hundreds of paths and three colours.
+
+    The key is the source colour, so it survives reopening the file and a
+    re-import after the artwork is edited.  What colour it is *printed* in is not
+    here: that is the user's choice, and it lives on the feature.
+    """
+
+    key: str = SINGLE_COMPONENT
+    #: The colour the source drew it in, as ``#rrggbb``.  Empty when the source
+    #: has no notion of colour.
+    color: str = ""
+    label: str = "Artwork"
+    element_count: int = 0
+    #: True when this was a filled backdrop the artwork sits on.  Those are
+    #: dropped on import; see :func:`detect_background`.
+    background: bool = False
+
+    def to_dict(self) -> dict:
+        return {
+            "key": self.key, "color": self.color, "label": self.label,
+            "element_count": self.element_count, "background": self.background,
+        }
+
+
 @dataclass
 class Profile:
     """Normalized artwork: nested loops, faced, centered on the origin."""
@@ -106,6 +155,17 @@ class Profile:
     issues: list[Issue] = field(default_factory=list)
     bbox: tuple[float, float, float, float] = (0.0, 0.0, 0.0, 0.0)
     source_units: str = "mm"
+    #: The pieces the artwork divides into, in the order the source paints them.
+    components: list[Component] = field(default_factory=list)
+    #: ``face_component[i]`` is the key of the component face *i* belongs to.
+    face_component: list[str] = field(default_factory=list)
+    #: ``loop_component[i]`` is the same, for loops.  The background detector
+    #: measures loops, because a component's area is its outlines, not its faces.
+    loop_component: list[str] = field(default_factory=list)
+    #: The backdrop the importer left out, kept here so the panel can name it and
+    #: offer to put it back.  It is not in :attr:`components` - it is not part of
+    #: the artwork any more.
+    dropped_background: Component | None = None
 
     @property
     def blocked(self) -> bool:
@@ -134,6 +194,39 @@ class Profile:
 
     def issues_of(self, kind: IssueKind) -> list[Issue]:
         return [i for i in self.issues if i.kind is kind]
+
+    def component(self, key: str) -> Component | None:
+        return next((c for c in self.components if c.key == key), None)
+
+    def component_keys(self) -> list[str]:
+        """The component keys, in paint order.  Never empty for a faced profile."""
+        return [c.key for c in self.components] or ([SINGLE_COMPONENT] if self.faces else [])
+
+    def faces_of(self, key: str) -> list[TopoDS_Face]:
+        """The faces belonging to one component.
+
+        An untagged profile - anything built before components, or from a source
+        with no colour - answers with all of its faces for the single key, so
+        callers need no special case.
+        """
+        if not self.face_component:
+            return list(self.faces) if key in (SINGLE_COMPONENT, "") else []
+        return [f for f, k in zip(self.faces, self.face_component, strict=False) if k == key]
+
+    def loop_keys(self) -> list[str]:
+        """The component key of every loop, one per loop."""
+        if len(self.loop_component) == len(self.loops):
+            return list(self.loop_component)
+        return [SINGLE_COMPONENT] * len(self.loops)
+
+    def compound_of(self, key: str) -> TopoDS_Compound:
+        """One component's faces as a compound, for building its own tool solid."""
+        comp = TopoDS_Compound()
+        builder = BRep_Builder()
+        builder.MakeCompound(comp)
+        for f in self.faces_of(key):
+            builder.Add(comp, f)
+        return comp
 
 
 # --------------------------------------------------------------------- flatten
@@ -253,6 +346,7 @@ def normalize_groups(
     center: bool = True,
     close_open_loops: bool = False,
     source_units: str = "mm",
+    group_components: Sequence[Component] | None = None,
 ) -> Profile:
     """Run the §5.5 pipeline, nesting each group independently.
 
@@ -263,10 +357,20 @@ def normalize_groups(
     alone decides holes, which is exactly what §5.5 step 3 describes.
 
     *issues* lets an importer pass in problems it already found (live text, ignored
-    gradients) so the caller gets one list.
+    gradients) so the caller gets one list.  *group_components* says which piece of
+    the artwork each group belongs to, one entry per group; without it the whole
+    profile is one component.
     """
-    cleaned = [[e for e in group if not e.IsNull()] for group in groups]
-    cleaned = [g for g in cleaned if g]
+    paired = list(zip(groups, group_components or [], strict=False))
+    if group_components is None:
+        paired = [(group, None) for group in groups]
+    cleaned: list[list[TopoDS_Edge]] = []
+    kept_components: list[Component | None] = []
+    for group, component in paired:
+        edges = [e for e in group if not e.IsNull()]
+        if edges:
+            cleaned.append(edges)
+            kept_components.append(component)
     if not cleaned:
         profile = Profile(issues=list(issues or []), source_units=source_units)
         profile.issues.append(
@@ -282,6 +386,7 @@ def normalize_groups(
         center=center,
         close_open_loops=close_open_loops,
         source_units=source_units,
+        group_components=None if group_components is None else kept_components,
     )
 
 
@@ -294,6 +399,7 @@ def normalize_wire_groups(
     close_open_loops: bool = False,
     source_units: str = "mm",
     resolve_overlaps: bool = True,
+    group_components: Sequence[Component | None] | None = None,
 ) -> Profile:
     """The back half of the pipeline, for callers that already have closed wires.
 
@@ -302,12 +408,18 @@ def normalize_wire_groups(
     edge-connecting step entirely.
     """
     profile = Profile(issues=list(issues or []), source_units=source_units)
+    loop_component: list[str] = []
 
-    for wires in groups:
+    for index, wires in enumerate(groups):
         start = len(profile.loops)
         loops = _make_loops(list(wires), join_tolerance, profile, close_open_loops, start)
         _nest(profile, loops, offset=start)
         profile.loops.extend(loops)
+        component = None if group_components is None else group_components[index]
+        key = component.key if component is not None else SINGLE_COMPONENT
+        loop_component.extend([key] * len(loops))
+        if component is not None and profile.component(key) is None:
+            profile.components.append(component)
 
     if not profile.loops:
         profile.issues.append(
@@ -315,9 +427,16 @@ def normalize_wire_groups(
         )
         return profile
 
-    _faceify(profile)
+    profile.loop_component = list(loop_component)
+    _faceify(profile, loop_component)
+    # Before resolving, not after.  Resolving carves the artwork out of whatever
+    # is under it, so by then a backdrop has become a thin frame and no longer
+    # looks like one.
+    background = detect_background(profile)
+    if background is not None:
+        background.background = True
     if resolve_overlaps:
-        profile = _resolve_overlaps(profile)
+        profile = _resolve_overlaps(profile, loop_component)
     if center:
         _center(profile)
     _bbox(profile)
@@ -538,7 +657,7 @@ def _nest(profile: Profile, loops: list[Loop], offset: int) -> None:
     profile.depth.extend(depth)
 
 
-def _faceify(profile: Profile) -> None:
+def _faceify(profile: Profile, loop_component: Sequence[str] | None = None) -> None:
     """Outer wires become faces; their direct children become holes (§5.5 step 4)."""
     loops = profile.loops
     children: dict[int, list[int]] = {i: [] for i in range(len(loops))}
@@ -547,6 +666,7 @@ def _faceify(profile: Profile) -> None:
             children[p].append(i)
 
     faces: list[TopoDS_Face] = []
+    face_component: list[str] = []
     for i, loop in enumerate(loops):
         if profile.depth[i] % 2 != 0 or not loop.closed or not loop.valid:
             continue  # a hole, something that never closed, or a reported crossing
@@ -583,7 +703,10 @@ def _faceify(profile: Profile) -> None:
                 )
             continue
         faces.append(face)
+        if loop_component is not None and i < len(loop_component):
+            face_component.append(loop_component[i])
     profile.faces = faces
+    profile.face_component = face_component if len(face_component) == len(faces) else []
 
 
 def _oriented(wire: TopoDS_Wire, *, ccw: bool) -> TopoDS_Wire:
@@ -671,41 +794,216 @@ def _faces_overlap(profile: Profile) -> bool:
     return False
 
 
-def _resolve_overlaps(profile: Profile) -> Profile:
-    """Union faces that cover the same ground, in 2D.
+def _contours_of(profile: Profile, keys: Sequence[str] | None = None):
+    """Loop polylines wound the way the non-zero fill rule wants them.
 
-    Artwork overlaps all the time: a filled circle drawn on top of a filled
-    rectangle covers ground the rectangle already covers.  Extruding the two
-    separately would leave a seam where the circle meets the rectangle - a flat to
-    flat join with no real edge, which then shows up in the "top edges" fillet
-    selection and cannot be rounded.
-
-    Resolving it here, in 2D, gives one clean silhouette instead.  The non-zero fill
-    rule does the work: outer loops wind counter-clockwise and holes clockwise, so a
-    hole covered by another element correctly becomes material again.
+    Outer loops counter-clockwise, holes clockwise, so a hole covered by another
+    element correctly becomes material again.
     """
-    if len(profile.faces) < 2 or not _faces_overlap(profile):
-        return profile
-
-    from manifold3d import CrossSection, FillRule
-
     contours: list[list[tuple[float, float]]] = []
     for i, loop in enumerate(profile.loops):
         if not loop.closed or not loop.valid or len(loop.polyline) < 3:
+            continue
+        if keys is not None and (i >= len(keys) or keys[i] is None):
             continue
         want_ccw = profile.depth[i] % 2 == 0
         poly = list(loop.polyline)
         if (polygon_area(poly) >= 0) != want_ccw:
             poly.reverse()
         contours.append(poly)
-    if not contours:
+    return contours
+
+
+def _resolve_overlaps(profile: Profile, loop_component: Sequence[str] | None = None) -> Profile:
+    """Resolve artwork that covers the same ground, in 2D.
+
+    Extruding two overlapping elements separately leaves a seam where they meet -
+    a flat-to-flat join with no real edge, which then turns up in the "top edges"
+    fillet selection and cannot be rounded.  Resolving it here gives one clean
+    silhouette per component instead.
+
+    Within a component that is a union.  *Between* components it is the painter's
+    rule: whatever the source draws later is on top, and is taken out of
+    everything under it.  Doing this with a single union across the whole profile
+    is what made a filled backdrop swallow the drawing - the artwork and the
+    backdrop wind the same way, so the union of the two is just the backdrop, and
+    a logo imported as a plain rectangle the size of its own page.
+    """
+    if len(profile.faces) < 2 or not _faces_overlap(profile):
         return profile
 
-    section = CrossSection(contours, FillRule.NonZero).simplify(1e-6)
-    merged = _profile_from_cross_section(section, profile.issues, profile.source_units)
-    if not merged.faces:
+    from manifold3d import CrossSection, FillRule
+
+    order = [c.key for c in profile.components]
+    if loop_component is None or len(order) < 2:
+        contours = _contours_of(profile)
+        if not contours:
+            return profile
+        section = CrossSection(contours, FillRule.NonZero).simplify(1e-6)
+        merged = _profile_from_cross_section(section, profile.issues, profile.source_units)
+        if not merged.faces:
+            return profile
+        merged.components = list(profile.components)
+        merged.face_component = [_only_key(profile)] * len(merged.faces)
+        merged.loop_component = [_only_key(profile)] * len(merged.loops)
+        return merged
+
+    sections = {}
+    for key in order:
+        keys = [k if k == key else None for k in loop_component]
+        contours = _contours_of(profile, keys)
+        sections[key] = (
+            CrossSection(contours, FillRule.NonZero).simplify(1e-6) if contours else None
+        )
+
+    parts: list[tuple[Component, Profile]] = []
+    for index, key in enumerate(order):
+        area = sections[key]
+        if area is None:
+            continue
+        for later in order[index + 1:]:
+            on_top = sections[later]
+            if on_top is not None:
+                area = area - on_top
+        piece = _profile_from_cross_section(
+            area, [], profile.source_units, center=False
+        )
+        if piece.faces:
+            component = profile.component(key)
+            parts.append((component, piece))
+
+    if not parts:
         return profile
+    return _merge_components(parts, profile.issues, profile.source_units)
+
+
+def _only_key(profile: Profile) -> str:
+    return profile.components[0].key if profile.components else SINGLE_COMPONENT
+
+
+def _merge_components(
+    parts: Sequence[tuple[Component, Profile]], issues: list[Issue], units: str
+) -> Profile:
+    """Stitch the separately resolved components back into one profile.
+
+    Loop indices are local to each part, so ``parent`` is shifted as the loops
+    are appended; everything downstream reads those as one flat list.
+    """
+    merged = Profile(
+        issues=[i for i in issues if i.kind is not IssueKind.SELF_INTERSECTION],
+        source_units=units,
+    )
+    for component, piece in parts:
+        offset = len(merged.loops)
+        merged.loops.extend(piece.loops)
+        merged.parent.extend(p + offset if p >= 0 else -1 for p in piece.parent)
+        merged.depth.extend(piece.depth)
+        merged.faces.extend(piece.faces)
+        merged.face_component.extend([component.key] * len(piece.faces))
+        merged.loop_component.extend([component.key] * len(piece.loops))
+        merged.components.append(component)
     return merged
+
+
+def detect_background(profile: Profile) -> Component | None:
+    """The component that is a filled backdrop rather than part of the drawing.
+
+    Exporters put one in constantly - a white page rect under the logo - and it
+    is the single most common reason an SVG arrives looking like a plain
+    rectangle.  It is recognised by shape, not by colour or by position in the
+    file: something that covers nearly the whole of its own bounding box, with
+    every other component sitting inside it.  A border or a backing plate leaves
+    the middle empty and so covers far less than its box, and survives.
+
+    "Covers" has to allow for the backdrop already having the drawing cut out of
+    it.  Plenty of exporters write the page as one path with the artwork as
+    evenodd subpaths, so its material is the page *minus* the drawing - well
+    under the coverage a backdrop is recognised by, and it used to survive as a
+    solid slab the size of the whole image.  A hole another component fills is
+    counted back in; see :func:`_knocked_out`.
+    """
+    if len(profile.components) < 2:
+        return None
+
+    keys = profile.loop_keys()
+    boxes: dict[str, tuple[float, float, float, float]] = {}
+    areas: dict[str, float] = {}
+    material: dict[str, list[list[tuple[float, float]]]] = {}
+    holes: dict[str, list[list[tuple[float, float]]]] = {}
+    for component in profile.components:
+        polys: list[tuple[list[tuple[float, float]], bool]] = []
+        for index, (loop, key) in enumerate(zip(profile.loops, keys, strict=False)):
+            if key != component.key or not loop.closed or len(loop.polyline) < 3:
+                continue
+            solid = index >= len(profile.depth) or profile.depth[index] % 2 == 0
+            polys.append((loop.polyline, solid))
+        if not polys:
+            continue
+        xs = [x for poly, _m in polys for x, _ in poly]
+        ys = [y for poly, _m in polys for _, y in poly]
+        boxes[component.key] = (min(xs), min(ys), max(xs), max(ys))
+        # Holes come off, they do not add.  A border is an outer loop with the
+        # middle cut out: its bounding box contains the whole drawing and its
+        # outlines add up to more than the box, but the material it covers is a
+        # thin frame.  Counting the hole as area called every border a backdrop.
+        areas[component.key] = sum(
+            abs(polygon_area(poly)) * (1 if solid else -1) for poly, solid in polys
+        )
+        material[component.key] = [poly for poly, solid in polys if solid]
+        holes[component.key] = [poly for poly, solid in polys if not solid]
+
+    for component in profile.components:
+        box = boxes.get(component.key)
+        if box is None:
+            continue
+        x0, y0, x1, y1 = box
+        box_area = (x1 - x0) * (y1 - y0)
+        if box_area <= 0:
+            continue
+        others = [k for k in boxes if k != component.key]
+        if not others:
+            continue
+        covered = areas[component.key] + _knocked_out(
+            holes.get(component.key, []), material, others
+        )
+        if covered < BACKGROUND_COVERAGE * box_area:
+            continue
+        if all(
+            x0 <= boxes[k][0] + 1e-6 and y0 <= boxes[k][1] + 1e-6
+            and x1 >= boxes[k][2] - 1e-6 and y1 >= boxes[k][3] - 1e-6
+            for k in others
+        ):
+            return component
+    return None
+
+
+def _knocked_out(
+    holes: Sequence[Sequence[tuple[float, float]]],
+    material: dict[str, list[list[tuple[float, float]]]],
+    others: Sequence[str],
+) -> float:
+    """How much of a candidate backdrop's holes are the drawing itself.
+
+    A hole another component sits in is not really a hole in the backdrop - it
+    is where the drawing was cut out of it, and the backdrop still covers the
+    page.  A border's hole is an empty middle with something small floating in
+    it, which is the case this has to go on telling apart, so a hole only counts
+    when what sits in it very nearly fills it.
+    """
+    total = 0.0
+    for hole in holes:
+        hole_area = abs(polygon_area(hole))
+        if hole_area <= 0:
+            continue
+        filled = sum(
+            abs(polygon_area(poly))
+            for key in others
+            for poly in material.get(key, ())
+            if point_in_polygon(representative_point(poly), hole)
+        )
+        if filled >= FILLED_HOLE_SHARE * hole_area:
+            total += hole_area
+    return total
 
 
 # ------------------------------------------------------- 2D repair helpers (§10)
@@ -808,7 +1106,9 @@ def _disc(center, radius: float, segments: int = STROKE_CAP_SEGMENTS) -> list[tu
     ]
 
 
-def _profile_from_cross_section(section, issues: list[Issue], units: str) -> Profile:
+def _profile_from_cross_section(
+    section, issues: list[Issue], units: str, *, center: bool = True
+) -> Profile:
     """Convert a manifold3d CrossSection back into OCC wires and faces.
 
     Every contour becomes one wire and they are nested as a single group, so an
@@ -832,5 +1132,5 @@ def _profile_from_cross_section(section, issues: list[Issue], units: str) -> Pro
     # The cross section is already a resolved region, so re-running the overlap pass
     # on it would only recurse back into this function.
     return normalize_wire_groups(
-        [wires], issues=kept, source_units=units, resolve_overlaps=False
+        [wires], issues=kept, source_units=units, resolve_overlaps=False, center=center
     )
