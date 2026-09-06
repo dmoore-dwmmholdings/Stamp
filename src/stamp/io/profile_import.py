@@ -26,6 +26,7 @@ from OCP.TopoDS import TopoDS, TopoDS_Edge, TopoDS_Shape
 
 from stamp.io.normalize import (
     DEFAULT_JOIN_TOLERANCE,
+    Component,
     Issue,
     IssueKind,
     Profile,
@@ -67,6 +68,10 @@ class ImportOptions:
     layers: list[str] | None = None  # DXF only
     unit_override: str | None = None  # "mm" | "in" | ... when the file does not say
     extra_scale: float = 1.0
+    #: Keep a filled backdrop that would otherwise be dropped.  Stamp drops one by
+    #: default because it is nearly always an exporter's white page rect and it
+    #: covers the artwork; this is how the user says it was deliberate.
+    keep_background: bool = False
 
 
 @dataclass
@@ -80,6 +85,8 @@ class ImportResult:
     units_ambiguous: bool = False
     #: Raw stroke polylines, kept so "outline strokes" can run without a re-read.
     stroke_polylines: list[list[tuple[float, float]]] = field(default_factory=list)
+    #: The backdrop that was dropped, when one was.  The UI offers to keep it.
+    dropped_background: Component | None = None
 
     @property
     def issues(self) -> list[Issue]:
@@ -205,9 +212,16 @@ def import_svg(path: Path, options: ImportOptions) -> ImportResult:
         ambiguous = False
     scale *= options.extra_scale
 
-    items = list(import_svg_document(path, flip_y=True))
-    faces = [it for it in items if it.ShapeType() == TopAbs_ShapeEnum.TopAbs_FACE]
-    wires = [it for it in items if it.ShapeType() == TopAbs_ShapeEnum.TopAbs_WIRE]
+    from ocpsvg import ColorAndLabel
+
+    items = list(import_svg_document(path, flip_y=True, metadata=ColorAndLabel))
+    faces = [it for it, _meta in items if it.ShapeType() == TopAbs_ShapeEnum.TopAbs_FACE]
+    face_colors = [
+        _hex_color(meta.color_for(it))
+        for it, meta in items
+        if it.ShapeType() == TopAbs_ShapeEnum.TopAbs_FACE
+    ]
+    wires = [it for it, _meta in items if it.ShapeType() == TopAbs_ShapeEnum.TopAbs_WIRE]
 
     stroke_polylines = _polylines_of(wires, scale)
 
@@ -250,13 +264,36 @@ def import_svg(path: Path, options: ImportOptions) -> ImportResult:
     # One group per SVG element: its own fill rule already decided its holes, so a
     # filled circle sitting inside a filled rectangle stays material (§5.3).
     groups = [_edges_of([f], scale) for f in faces]
+    components = _components_by_color(face_colors)
     profile = normalize_groups(
         groups,
         join_tolerance=options.join_tolerance,
         issues=issues,
         close_open_loops=options.close_open_loops,
         source_units=declared_unit,
+        group_components=[components[c] for c in face_colors],
     )
+
+    dropped = None
+    background = next((c for c in profile.components if c.background), None)
+    if background is not None:
+        if options.keep_background:
+            profile.issues.append(
+                Issue(
+                    IssueKind.UNSUPPORTED_ELEMENT,
+                    f"The {background.label.lower()} backdrop in this file is being "
+                    f"kept, so the artwork sits on a filled panel.",
+                    blocking=False,
+                    detail={"component": background.key},
+                )
+            )
+        else:
+            dropped = background
+            profile = _without_component(
+                profile, background, groups, face_colors, components, options,
+                issues, declared_unit,
+            )
+
     if options.union_overlapping and profile.issues_of(IssueKind.SELF_INTERSECTION):
         profile = union_overlapping(profile)
 
@@ -267,7 +304,87 @@ def import_svg(path: Path, options: ImportOptions) -> ImportResult:
         source_hash=file_hash(path),
         units_ambiguous=ambiguous,
         stroke_polylines=stroke_polylines,
+        dropped_background=dropped,
     )
+
+
+def _hex_color(rgba) -> str:
+    """An ocpsvg colour tuple as ``#rrggbb``.  Alpha is not a component key."""
+    if not rgba:
+        return "#000000"
+    r, g, b = (max(0, min(255, int(round(v * 255)))) for v in rgba[:3])
+    return f"#{r:02x}{g:02x}{b:02x}"
+
+
+#: Colours close enough to these get the name rather than the hex, because
+#: "Black" and "Red" are what the user calls them.
+_COLOR_NAMES = {
+    "#000000": "Black", "#ffffff": "White", "#ff0000": "Red", "#00ff00": "Green",
+    "#0000ff": "Blue", "#ffff00": "Yellow", "#00ffff": "Cyan", "#ff00ff": "Magenta",
+    "#808080": "Grey", "#c0c0c0": "Silver", "#ffa500": "Orange",
+}
+
+
+def _components_by_color(face_colors: Sequence[str]) -> dict[str, Component]:
+    """One component per fill colour, in the order the document paints them.
+
+    Grouping by colour rather than by element is what keeps this usable: a
+    detailed logo has hundreds of paths and three colours, and it is the three
+    the user wants to pick from.
+    """
+    components: dict[str, Component] = {}
+    for color in face_colors:
+        component = components.get(color)
+        if component is None:
+            components[color] = component = Component(
+                key=color,
+                color=color,
+                label=_COLOR_NAMES.get(color.lower(), color.upper()),
+            )
+        component.element_count += 1
+    return components
+
+
+def _without_component(
+    profile: Profile,
+    background: Component,
+    groups, face_colors, components, options, issues, declared_unit,
+) -> Profile:
+    """Re-normalize with the backdrop left out, and say so.
+
+    Re-run rather than subtracted: the remaining components have to be nested and
+    resolved against each other as though the backdrop had never been in the
+    file, and centring and the bounding box have to follow the artwork rather
+    than the page it was drawn on.
+    """
+    keep = [
+        (group, components[color])
+        for group, color in zip(groups, face_colors, strict=False)
+        if color != background.key
+    ]
+    if not keep:
+        return profile  # the backdrop was all there was; better a rectangle than nothing
+    reduced = normalize_groups(
+        [group for group, _c in keep],
+        join_tolerance=options.join_tolerance,
+        issues=list(issues),
+        close_open_loops=options.close_open_loops,
+        source_units=declared_unit,
+        group_components=[component for _g, component in keep],
+    )
+    reduced.issues.append(
+        Issue(
+            IssueKind.UNSUPPORTED_ELEMENT,
+            f"This file has a filled {background.label.lower()} backdrop behind the "
+            f"artwork, covering all of it. Stamp left it out - kept, it would be "
+            f"the only thing that stamped. Turn on \"Keep the background layer\" "
+            f"if it was meant to be there.",
+            blocking=False,
+            detail={"component": background.key, "background": True},
+        )
+    )
+    reduced.dropped_background = background
+    return reduced
 
 
 def _guess_stroke_width(path: Path) -> float | None:
