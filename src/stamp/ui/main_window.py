@@ -1,18 +1,30 @@
 """The single window - spec §7.
 
-No modes, no ribbon, no floating palettes.  Feature tree on the left, viewport in
-the middle, properties on the right, a status line underneath the viewport, and one
-toolbar along the bottom.
+No modes, no floating palettes.  A command ribbon across the top, feature tree on
+the left, viewport in the middle, properties on the right, and a status line
+underneath the viewport.
+
+The ribbon replaced a single toolbar along the bottom.  Thirty commands do not
+fit on one bar at any ordinary window size, and Qt's answer - moving the overflow
+into a chevron menu that shuts again at every layout pass - left the last third
+of them with no working path at all.  See :mod:`stamp.ui.ribbon`.
 """
 
 from __future__ import annotations
 
 import math
+import tempfile
 import time
 from pathlib import Path
 
-from PySide6.QtCore import QSettings, Qt, QTimer, Signal
-from PySide6.QtGui import QAction, QDragEnterEvent, QDropEvent, QKeySequence
+from PySide6.QtCore import QSettings, Qt, QTimer, QUrl, Signal
+from PySide6.QtGui import (
+    QAction,
+    QDesktopServices,
+    QDragEnterEvent,
+    QDropEvent,
+    QKeySequence,
+)
 from PySide6.QtWidgets import (
     QComboBox,
     QDoubleSpinBox,
@@ -32,7 +44,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from stamp import __version__, diagnostics, reporting
+from stamp import __version__, diagnostics, reporting, update
 from stamp.batch import BatchError, run_batch, simulate_batch
 from stamp.core import replace_part as replace_part_io
 from stamp.core import snapping
@@ -66,7 +78,9 @@ from stamp.core.refs import (
     resolve_face_ref,
 )
 from stamp.geom import mesh_regions
+from stamp.geom.color_split import divides_by_color, effective_colors
 from stamp.geom.mesh_regions import DEFAULT_TOLERANCE_DEG
+from stamp.geom.tool_solid import component_footprints
 from stamp.io import export as export_io
 from stamp.io import project as project_io
 from stamp.io.normalize import IssueKind
@@ -74,7 +88,7 @@ from stamp.io.part_import import (
     DECIMATE_THRESHOLD,
     PART_EXTS,
     PartImportError,
-    import_part,
+    PartImportResult,
     manifold_display_shape,
     solids_intersect,
     trimesh_display_shape,
@@ -91,8 +105,12 @@ from stamp.io.profile_import import (
 from stamp.ui import dialogs
 from stamp.ui.feature_tree import FeatureTree
 from stamp.ui.handles import HandleOverlay
+from stamp.ui.import_worker import ImportCancelled, import_part_for_ui
 from stamp.ui.properties import PropertiesPanel
 from stamp.ui.rebuild_worker import PROGRESS_AFTER_MS, RebuildController
+from stamp.ui.ribbon import Ribbon, header_stylesheet
+from stamp.ui.update_bar import UpdateBar
+from stamp.ui.update_worker import UpdateController
 from stamp.ui.viewport import Viewport
 
 BASE_KEY = "base"
@@ -111,6 +129,19 @@ CUT_COLOR = (0.82, 0.36, 0.32)
 #: A colour stamp neither adds nor removes anything you can feel, so it gets its
 #: own preview colour rather than borrowing the cut's red.
 STAMP_COLOR = (0.35, 0.55, 0.90)
+
+
+def _rgb(value: str) -> tuple[float, float, float] | None:
+    """``#rrggbb`` as the 0-1 triple the viewport wants, or None."""
+    text = str(value or "").strip().lstrip("#")
+    if len(text) == 3:
+        text = "".join(c * 2 for c in text)
+    if len(text) != 6:
+        return None
+    try:
+        return tuple(int(text[i:i + 2], 16) / 255.0 for i in (0, 2, 4))  # type: ignore[return-value]
+    except ValueError:
+        return None
 PART_COLOR = (0.62, 0.66, 0.72)
 REGION_COLOR = (0.36, 0.62, 0.92)
 DIMENSIONS_COLOR = (0.25, 0.78, 0.94)
@@ -148,6 +179,8 @@ class MainWindow(QMainWindow):
         self._picking_hole_center = False
         self._dirty = False
         self._draft_display = False
+        #: A part was just opened and is waiting for the rebuild to draw it.
+        self._fit_after_display = False
         self._slow_offer_declined = False
         self._busy_since = 0.0
         self._busy_step = ""
@@ -157,6 +190,21 @@ class MainWindow(QMainWindow):
         self._mesh_region = None
         #: Why the 3D view could not start, or None while it is fine.
         self._viewport_error: str | None = None
+        #: The per-component decals currently on screen, to erase next time.
+        self._component_footprint_keys: list[str] = []
+        #: The per-part shapes currently on screen, same reason.
+        self._part_shape_keys: list[str] = []
+
+        #: The newer release that was found, the installer once it has been
+        #: fetched and hash-checked, and whether the user asked to have it put
+        #: on at the end rather than now.
+        self._update_release = None
+        self._update_installer: Path | None = None
+        self._install_on_quit = False
+        self._installing_update = False
+        #: Whether this check was asked for.  An automatic one that fails says
+        #: nothing; one the user asked for owes them an answer either way.
+        self._update_announce = False
         self._undo_baseline = self.document.snapshot()
 
         #: When False, every dialog answers itself with its default and every
@@ -202,7 +250,18 @@ class MainWindow(QMainWindow):
         splitter.setStretchFactor(1, 1)
         splitter.setStretchFactor(2, 0)
         splitter.setSizes([230, 760, 450])
-        self.setCentralWidget(splitter)
+
+        # The update bar spans the window above the splitter rather than living
+        # in the status strip, because the status strip belongs to the viewport
+        # page and there is nothing to see there before a part is opened.
+        self.update_bar = UpdateBar()
+        page = QWidget()
+        stack = QVBoxLayout(page)
+        stack.setContentsMargins(0, 0, 0, 0)
+        stack.setSpacing(0)
+        stack.addWidget(self.update_bar)
+        stack.addWidget(splitter, 1)
+        self.setCentralWidget(page)
 
         self.setStatusBar(QStatusBar())
         self.statusBar().showMessage("Open a part to begin.")
@@ -327,6 +386,53 @@ class MainWindow(QMainWindow):
         )
         self.action_inspection.toggled.connect(self.set_inspection_visible)
 
+        self.action_fit = QAction("Fit to window", self)
+        self.action_fit.setToolTip("Frame the whole part in the view (F).")
+        self.action_fit.triggered.connect(self.viewport.fit_all)
+
+        self.action_views = QAction("Standard views", self)
+        self.action_views.setToolTip(
+            "Snap the camera to a standard view. The cube in the corner of the "
+            "3D view does the same in one click, and 1-7 do it from the keyboard."
+        )
+
+        self.action_view_normal = QAction("Normal to face", self)
+        self.action_view_normal.setToolTip(
+            "Look straight down the selected stamp's face (Ctrl+8)."
+        )
+        self.action_view_normal.triggered.connect(self.view_normal_to_face)
+
+        self.action_roll_left = QAction("Roll left", self)
+        self.action_roll_left.setToolTip(
+            "Spin the view anticlockwise, 15° a press (Alt+Left)."
+        )
+        self.action_roll_left.triggered.connect(lambda: self.viewport.roll_by(15.0))
+
+        self.action_roll_right = QAction("Roll right", self)
+        self.action_roll_right.setToolTip(
+            "Spin the view clockwise, 15° a press (Alt+Right)."
+        )
+        self.action_roll_right.triggered.connect(lambda: self.viewport.roll_by(-15.0))
+
+        self.action_collapse_ribbon = QAction("Collapse the ribbon", self)
+        self.action_collapse_ribbon.setCheckable(True)
+        self.action_collapse_ribbon.setToolTip(
+            "Give the height back to the 3D view. Double-clicking a ribbon tab "
+            "does the same (Ctrl+F1)."
+        )
+        self.action_collapse_ribbon.setShortcut(QKeySequence("Ctrl+F1"))
+        self.action_collapse_ribbon.toggled.connect(self._set_ribbon_collapsed)
+        self.addAction(self.action_collapse_ribbon)
+
+        self.action_large_ribbon = QAction("Large ribbon buttons", self)
+        self.action_large_ribbon.setCheckable(True)
+        self.action_large_ribbon.setToolTip(
+            "Labels under the icons, in captioned groups. It is about twice as "
+            "tall as the compact ribbon, and that height comes off the 3D view."
+        )
+        self.action_large_ribbon.toggled.connect(self._set_large_ribbon)
+        self.addAction(self.action_large_ribbon)
+
         layout.addWidget(self.status_label)
         layout.addSpacing(16)
         layout.addWidget(self.warning_label, 1)
@@ -341,51 +447,55 @@ class MainWindow(QMainWindow):
         return strip
 
     def _build_actions(self) -> None:
-        bar = QToolBar("Main")
-        bar.setMovable(False)
-        self.addToolBar(Qt.ToolBarArea.BottomToolBarArea, bar)
+        """Build every command, and lay the ribbon out over them.
 
-        def add(text: str, slot, shortcut: str | None = None) -> QAction:
+        The actions are created first and placed second, because they are shared:
+        the menus in :meth:`_build_menus` hold the same objects, so enabling a
+        command enables it everywhere it appears.
+        """
+        self.ribbon = Ribbon()
+        self.ribbon.collapsed_changed.connect(self._on_ribbon_collapsed)
+        self.addToolBar(Qt.ToolBarArea.TopToolBarArea, self._ribbon_holder())
+
+        def make(text: str, slot, shortcut: str | None = None) -> QAction:
             action = QAction(text, self)
             action.triggered.connect(slot)
             if shortcut:
                 action.setShortcut(QKeySequence(shortcut))
-            bar.addAction(action)
+                action.setToolTip(f"{text} ({QKeySequence(shortcut).toString()})")
             self.addAction(action)
             return action
 
-        self.action_open_part = add("Open part", self.open_part_dialog, "Ctrl+O")
-        self.action_open_project = add("Open project", self.open_project_dialog)
-        self.action_save = add("Save", self.save_project, "Ctrl+S")
-        self.action_replace_part = add("Replace part", self.replace_part_dialog)
-        self.action_relink = add("Relink", self.relink_sources)
-        bar.addSeparator()
-        self.action_add_profile = add("+ Add profile", self.add_profile_dialog, "Ctrl+I")
-        self.action_add_text = add("+ Add text", self.add_text_dialog, "Ctrl+T")
-        self.action_add_code = add("+ Add code", self.add_code_dialog)
-        self.action_save_preset = add("Save stamp preset", self.save_preset)
-        self.action_insert_preset = add("Insert stamp preset", self.insert_preset)
-        self.action_align_edge = add("Align stamp to edge", self.pick_alignment_edge)
-        self.action_origin_vertex = add("Set stamp origin to vertex", self.pick_origin_vertex)
-        self.action_origin_hole = add("Set stamp origin to hole", self.pick_origin_hole)
-        self.action_create_datum = add("Create datum from stamp", self.create_datum_from_feature)
-        self.action_place_datum = add("Place stamp on datum", self.place_on_datum)
-        self.action_inspection_limits = add("Manufacturing limits", self.edit_inspection_limits)
-        bar.addSeparator()
-        self.action_export_step = add("Export STEP", self.export_step)
-        self.action_export_stl = add("Export STL", self.export_stl)
-        self.action_export_3mf = add("Export 3MF", self.export_3mf)
-        self.action_export_quote = add("Export for quote", self.export_for_quote)
-        self.action_export_proof = add("Export production proof", self.export_proof_sheet)
-        self.action_export_package = add("Export job package", self.export_job_package)
-        self.action_batch = add("Batch stamp", self.batch_stamp)
-        bar.addSeparator()
+        self.action_open_part = make("Open part", self.open_part_dialog, "Ctrl+O")
+        self.action_open_project = make("Open project", self.open_project_dialog)
+        self.action_save = make("Save", self.save_project, "Ctrl+S")
+        self.action_replace_part = make("Replace part", self.replace_part_dialog)
+        self.action_relink = make("Relink", self.relink_sources)
+        self.action_add_profile = make("Add profile", self.add_profile_dialog, "Ctrl+I")
+        self.action_add_text = make("Add text", self.add_text_dialog, "Ctrl+T")
+        self.action_add_code = make("Add code", self.add_code_dialog)
+        self.action_save_preset = make("Save stamp preset", self.save_preset)
+        self.action_insert_preset = make("Insert stamp preset", self.insert_preset)
+        self.action_align_edge = make("Align stamp to edge", self.pick_alignment_edge)
+        self.action_origin_vertex = make("Set stamp origin to vertex", self.pick_origin_vertex)
+        self.action_origin_hole = make("Set stamp origin to hole", self.pick_origin_hole)
+        self.action_create_datum = make("Create datum from stamp", self.create_datum_from_feature)
+        self.action_place_datum = make("Place stamp on datum", self.place_on_datum)
+        self.action_inspection_limits = make("Manufacturing limits", self.edit_inspection_limits)
+        self.action_export_step = make("Export STEP", self.export_step)
+        self.action_export_stl = make("Export STL", self.export_stl)
+        self.action_export_3mf = make("Export 3MF", self.export_3mf)
+        self.action_export_quote = make("Export for quote", self.export_for_quote)
+        self.action_export_proof = make("Export production proof", self.export_proof_sheet)
+        self.action_export_package = make("Export job package", self.export_job_package)
+        self.action_batch = make("Batch stamp", self.batch_stamp)
+        self.action_undo = make("Undo", self.undo, "Ctrl+Z")
+        self.action_redo = make("Redo", self.redo, "Ctrl+Y")
 
         self.units_box = QComboBox()
         self.units_box.addItem("Units: mm", "mm")
         self.units_box.addItem("Units: in", "in")
         self.units_box.currentIndexChanged.connect(self._on_units_changed)
-        bar.addWidget(self.units_box)
 
         self.view_box = QComboBox()
         for caption, key in (
@@ -397,7 +507,6 @@ class MainWindow(QMainWindow):
         self.view_box.currentIndexChanged.connect(
             lambda: self.viewport.set_preset_view(self.view_box.currentData())
         )
-        bar.addWidget(self.view_box)
 
         self.region_tolerance = QDoubleSpinBox()
         self.region_tolerance.setPrefix("Flat within: ")
@@ -427,7 +536,6 @@ class MainWindow(QMainWindow):
             "Set a density to show the mass in the status line. Aluminium is 2.70."
         )
         self.density_field.valueChanged.connect(lambda _v: self._refresh_status())
-        bar.addWidget(self.density_field)
 
         self.selection_box = QComboBox()
         self.selection_box.addItem("Select: faces", "face")
@@ -436,32 +544,40 @@ class MainWindow(QMainWindow):
         self.selection_box.currentIndexChanged.connect(
             lambda: self.viewport.set_selection_mode(self.selection_box.currentData())
         )
-        bar.addWidget(self.selection_box)
 
-        spacer = QWidget()
-        spacer.setSizePolicy(spacer.sizePolicy().horizontalPolicy().Expanding,
-                             spacer.sizePolicy().verticalPolicy().Preferred)
-        bar.addWidget(spacer)
-
-        # The view toggles live under the viewport, in the status strip.  The
-        # toolbar is full, and what does not fit there goes into an overflow menu
-        # that shuts again at each layout pass.
         self.action_preview.setShortcut(QKeySequence("Space"))
         self.addAction(self.action_preview)
         self.addAction(self.action_draft)
 
-        self.action_undo = add("Undo", self.undo, "Ctrl+Z")
-        self.action_redo = add("Redo", self.redo, "Ctrl+Y")
-
-        # The report commands do NOT go on this toolbar.  The bar runs out of room
-        # and moves whatever is last into an overflow menu, and that menu shuts
-        # again at each layout pass.  The status bar has room and never moves.
+        # The report commands stay off the ribbon and live in the status bar,
+        # where they are out of the way of the work but never move.
         self.action_report_bug = QAction("Report a bug", self)
         self.action_report_bug.setToolTip(
             "Write an email about a problem, with the log already in it."
         )
         self.action_report_bug.triggered.connect(self.report_bug)
         self.addAction(self.action_report_bug)
+
+        self.action_check_updates = QAction("Check for updates", self)
+        self.action_check_updates.setToolTip(
+            "Ask github.com whether there is a newer Stamp."
+        )
+        self.action_check_updates.triggered.connect(self.check_for_updates)
+        self.addAction(self.action_check_updates)
+
+        self.action_auto_updates = QAction("Check for updates at startup", self)
+        self.action_auto_updates.setCheckable(True)
+        self.action_auto_updates.setChecked(
+            self.settings.value("update/check_automatically", False, type=bool)
+        )
+        self.action_auto_updates.setToolTip(
+            "Read one small file from github.com when Stamp starts, at most once "
+            "a day. Nothing about you or your parts is sent."
+        )
+        self.action_auto_updates.toggled.connect(
+            lambda on: self.settings.setValue("update/check_automatically", bool(on))
+        )
+        self.addAction(self.action_auto_updates)
 
         self.action_report_crash = QAction("Report a crash", self)
         self.action_report_crash.setToolTip(
@@ -475,12 +591,181 @@ class MainWindow(QMainWindow):
         self._hidden_action("Duplicate feature", self.duplicate_selected_feature, "Ctrl+D")
         self._hidden_action("Frame selection", self.viewport.fit_all, "F")
         for index, name in enumerate(
-            ["front", "back", "left", "right", "top", "bottom"], start=1
+            ["front", "back", "left", "right", "top", "bottom", "iso"], start=1
         ):
             self._hidden_action(
                 f"View {name}", lambda _=False, n=name: self.viewport.set_preset_view(n), str(index)
             )
+        # Rolling and "normal to" from the window rather than the 3D view, so they
+        # answer wherever the keyboard focus happens to be.  Orbiting with the
+        # arrows stays on the viewport: the arrows belong to whatever is focused,
+        # and taking them window-wide would break every spin box in the panel.
+        self.action_roll_left.setShortcut(QKeySequence("Alt+Left"))
+        self.action_roll_right.setShortcut(QKeySequence("Alt+Right"))
+        self.action_view_normal.setShortcut(QKeySequence("Ctrl+8"))
+        for action in (
+            self.action_roll_left, self.action_roll_right, self.action_view_normal
+        ):
+            self.addAction(action)
         self._hidden_action("Cancel", self._cancel_pending, "Esc")
+        self._lay_out_ribbon()
+
+    def _ribbon_holder(self) -> QToolBar:
+        """A toolbar whose only job is to carry the ribbon.
+
+        QMainWindow reserves the top strip for toolbars, so putting the ribbon in
+        one keeps the menu bar, the ribbon and the central splitter stacking the
+        way they should without a second layout of our own.
+        """
+        holder = QToolBar("Ribbon")
+        holder.setObjectName("ribbonHolder")
+        holder.setMovable(False)
+        holder.setFloatable(False)
+        holder.setContentsMargins(0, 0, 0, 0)
+        holder.addWidget(self.ribbon)
+        self._ribbon_holder_bar = holder
+        return holder
+
+    def _apply_header_theme(self) -> None:
+        """Give the menu bar and the ribbon's strip one surface.
+
+        A menu bar in the desktop's style sitting on top of a ribbon in its own
+        reads as two programs stacked.  Both are painted from the same mix, so
+        the whole top of the window is one piece of chrome - and both follow a
+        light or a dark desktop, because the mix comes from the palette.
+        """
+        sheet = header_stylesheet(self.ribbon.theme)
+        self.menuBar().setStyleSheet(sheet)
+        self._ribbon_holder_bar.setStyleSheet(sheet)
+        self.update_bar.apply_theme(self.ribbon.theme)
+
+    def _set_ribbon_collapsed(self, collapsed: bool) -> None:
+        self.ribbon.set_collapsed(collapsed)
+
+    def _set_large_ribbon(self, large: bool) -> None:
+        """The ribbon opens compact; this is for anyone who wants it roomy."""
+        self.ribbon.set_dense(not large)
+        self.settings.setValue("ui/large_ribbon", bool(large))
+
+    def _on_ribbon_collapsed(self, collapsed: bool) -> None:
+        """Keep the menu item in step when the ribbon is collapsed by other means."""
+        if self.action_collapse_ribbon.isChecked() != collapsed:
+            self.action_collapse_ribbon.setChecked(collapsed)
+
+    def _views_menu(self):
+        """Every standard view in one press, each with the key that also does it."""
+        from PySide6.QtWidgets import QMenu
+
+        menu = QMenu(self)
+        for name, key in (
+            ("Isometric", "7"), ("Front", "1"), ("Back", "2"), ("Left", "3"),
+            ("Right", "4"), ("Top", "5"), ("Bottom", "6"),
+        ):
+            view = name.lower().replace("isometric", "iso")
+            action = menu.addAction(f"{name}	{key}")
+            action.triggered.connect(
+                lambda _checked=False, v=view: self.viewport.set_preset_view(v)
+            )
+        menu.addSeparator()
+        menu.addAction(self.action_view_normal)
+        menu.addAction(self.action_fit)
+        return menu
+
+    def view_normal_to_face(self) -> None:
+        """Look straight down the face the selected stamp sits on.
+
+        The face is the one the feature is anchored to, which is the face the
+        user picked; without a selection there is nothing to be normal to, and
+        saying so is more use than turning the camera somewhere arbitrary.
+        """
+        feature = self.selected_feature
+        anchor = feature.placement.anchor if feature is not None else None
+        face_ref = getattr(anchor, "face_ref", None) if anchor else None
+        if face_ref is None:
+            self.statusBar().showMessage(
+                "Select a stamp first - 'Normal to face' looks down the face it is on.",
+                6000,
+            )
+            return
+        self.viewport.look_along(face_ref.normal)
+
+    def _lay_out_ribbon(self) -> None:
+        """Put every command on a tab, in a group named for what it is for.
+
+        The short caption is given here rather than derived from the command
+        name: a button is narrower than most of these names, and a name left to
+        elide reads as "Save ...reset".  The full name stays on the action, for
+        the tooltip and for the menus.
+        """
+        home = self.ribbon.add_tab("Home")
+        project = home.add_group("Project")
+        project.add_action(self.action_open_part, "open-part", "Open\npart")
+        project.add_small_action(self.action_open_project, "open-project", "Open project")
+        project.add_small_action(self.action_save, "save", "Save")
+
+        artwork = home.add_group("Artwork")
+        artwork.add_action(self.action_add_profile, "add-profile", "Add\nprofile")
+        artwork.add_action(self.action_add_text, "add-text", "Add\ntext")
+        artwork.add_action(self.action_add_code, "add-code", "Add\ncode")
+
+        edit = home.add_group("Edit")
+        edit.add_small_action(self.action_undo, "undo", "Undo")
+        edit.add_small_action(self.action_redo, "redo", "Redo")
+
+        presets = home.add_group("Presets")
+        presets.add_action(self.action_insert_preset, "insert-preset", "Insert\npreset")
+        presets.add_small_action(self.action_save_preset, "save-preset", "Save preset")
+
+        place = self.ribbon.add_tab("Place")
+        align = place.add_group("Align")
+        align.add_action(self.action_align_edge, "align-edge", "Align\nto edge")
+        align.add_small_action(self.action_origin_vertex, "origin-vertex", "Origin: vertex")
+        align.add_small_action(self.action_origin_hole, "origin-hole", "Origin: hole")
+
+        datums = place.add_group("Datums")
+        datums.add_action(self.action_create_datum, "datum-new", "New\ndatum")
+        datums.add_action(self.action_place_datum, "datum-place", "On\ndatum")
+
+        part = place.add_group("Part")
+        part.add_small_action(self.action_replace_part, "replace-part", "Replace part")
+        part.add_small_action(self.action_relink, "relink", "Relink")
+        part.add_small_action(self.action_inspection_limits, "limits", "Limits")
+
+        export = self.ribbon.add_tab("Export")
+        files = export.add_group("Files")
+        files.add_action(self.action_export_step, "export-step", "STEP")
+        files.add_action(self.action_export_stl, "export-stl", "STL")
+        files.add_action(self.action_export_3mf, "export-3mf", "3MF")
+
+        packages = export.add_group("For other people")
+        packages.add_action(self.action_export_package, "export-package", "Job\npackage")
+        packages.add_small_action(self.action_export_quote, "export-quote", "For quote")
+        packages.add_small_action(self.action_export_proof, "export-proof", "Proof sheet")
+
+        production = export.add_group("Production")
+        production.add_action(self.action_batch, "batch", "Batch")
+
+        view = self.ribbon.add_tab("View")
+        cameras = view.add_group("Orient")
+        cameras.add_menu_action(self.action_views, "views", "Views", self._views_menu())
+        cameras.add_action(self.action_view_normal, "view-normal", "Normal\nto face")
+        cameras.add_action(self.action_fit, "fit", "Fit to\nwindow")
+        cameras.add_stack([self.view_box])
+
+        turning = view.add_group("Turn")
+        turning.add_small_action(self.action_roll_left, "roll-left", "Roll left")
+        turning.add_small_action(self.action_roll_right, "roll-right", "Roll right")
+
+        showing = view.add_group("Showing")
+        showing.add_action(self.action_preview, "preview", "Preview")
+        showing.add_action(self.action_draft, "draft", "Draft\nview")
+        showing.add_action(self.action_inspection, "inspect", "Inspect")
+
+        picking = view.add_group("Picking")
+        picking.add_stack([self.selection_box])
+
+        measure = view.add_group("Measurement")
+        measure.add_stack([self.units_box, self.density_field])
 
     def _build_menus(self) -> None:
         """Put every command somewhere it can be found and clicked.
@@ -533,15 +818,53 @@ class MainWindow(QMainWindow):
             export_menu.addAction(action)
 
         view_menu = bar.addMenu("&View")
+        orient = view_menu.addMenu("Orientation")
+        for name, key in (
+            ("Isometric", "7"), ("Front", "1"), ("Back", "2"), ("Left", "3"),
+            ("Right", "4"), ("Top", "5"), ("Bottom", "6"),
+        ):
+            preset = name.lower().replace("isometric", "iso")
+            entry = orient.addAction(name)
+            entry.setShortcut(QKeySequence(key))
+            entry.triggered.connect(
+                lambda _checked=False, v=preset: self.viewport.set_preset_view(v)
+            )
+        view_menu.addAction(self.action_view_normal)
+        view_menu.addAction(self.action_fit)
+        view_menu.addSeparator()
+        view_menu.addAction(self.action_roll_left)
+        view_menu.addAction(self.action_roll_right)
+        view_menu.addSeparator()
         view_menu.addAction(self.action_preview)
         view_menu.addAction(self.action_inspection)
         view_menu.addAction(self.action_draft)
+        view_menu.addAction(self.action_collapse_ribbon)
+        view_menu.addAction(self.action_large_ribbon)
         view_menu.addSeparator()
         view_menu.addAction(self.action_inspection_limits)
 
         help_menu = bar.addMenu("&Help")
+        help_menu.addAction(self.action_check_updates)
+        help_menu.addAction(self.action_auto_updates)
+        help_menu.addSeparator()
         help_menu.addAction(self.action_report_bug)
         help_menu.addAction(self.action_report_crash)
+
+        # Save, undo and redo are wanted from whichever tab you happen to be on,
+        # so they also sit level with the menus, the way Word and SolidWorks both
+        # keep a quick-access bar up there.  Same actions - a ribbon shows one
+        # command in more than one place on purpose.
+        self.quick_access = self.ribbon.quick_access_bar()
+        self.quick_access.add_action(self.action_save, "save")
+        self.quick_access.add_action(self.action_undo, "undo")
+        self.quick_access.add_action(self.action_redo, "redo")
+        bar.setCornerWidget(self.quick_access, Qt.Corner.TopRightCorner)
+
+        self._apply_header_theme()
+
+        # Last, because the ribbon has to be built before it can change size.
+        if self.settings.value("ui/large_ribbon", False, type=bool):
+            self.action_large_ribbon.setChecked(True)
 
     def _hidden_action(self, text: str, slot, shortcut: str) -> QAction:
         action = QAction(text, self)
@@ -552,6 +875,20 @@ class MainWindow(QMainWindow):
         return action
 
     def _wire(self) -> None:
+        self.updater = UpdateController(self)
+        self.updater.found.connect(self._on_update_found)
+        self.updater.up_to_date.connect(self._on_update_absent)
+        self.updater.failed.connect(self._on_update_failed)
+        self.updater.progress.connect(self.update_bar.advance)
+        self.updater.ready.connect(self._on_update_ready)
+
+        self.update_bar.install_requested.connect(self._on_update_install)
+        self.update_bar.later_requested.connect(self._on_update_later)
+        self.update_bar.notes_requested.connect(self._on_update_notes)
+        self.update_bar.skip_requested.connect(self._on_update_skip)
+        self.update_bar.cancel_requested.connect(self._on_update_cancel)
+        self.update_bar.dismissed.connect(self.update_bar.hide_bar)
+
         self.rebuilder = RebuildController(self.engine, self)
         self.rebuilder.finished.connect(self._on_rebuild_finished)
         self.rebuilder.failed.connect(self._on_rebuild_failed)
@@ -578,6 +915,8 @@ class MainWindow(QMainWindow):
         self.tree.duplicate_requested.connect(self._duplicate_feature)
         self.tree.delete_requested.connect(self._delete_feature)
         self.tree.mirror_requested.connect(self._mirror_feature)
+        self.tree.part_visibility_toggled.connect(self.set_part_visible)
+        self.tree.part_isolate_requested.connect(self.isolate_part)
         self.tree.delete_modifier_requested.connect(self._delete_modifier)
 
         self.properties.changed.connect(self._on_property_changed)
@@ -665,6 +1004,159 @@ class MainWindow(QMainWindow):
             )
 
 
+    # ------------------------------------------------------------------ updates
+
+    def begin_update_check(self) -> None:
+        """Ask about a newer Stamp, if the user has ever agreed to that.
+
+        Called from the entry point once the window is up, never from __init__:
+        a test builds a window, and a test must not make a network call.  The
+        first run asks before anything is fetched - Stamp already promises that
+        a crash report is never sent without being looked at, and a version
+        check is the same kind of promise about the same kind of machine.
+        """
+        if not self.interactive or not update.is_configured():
+            return
+        decided = self.settings.contains("update/check_automatically")
+        if not decided:
+            wanted = dialogs.confirm(
+                self,
+                "Check for updates?",
+                "May Stamp check github.com for a new version when it starts?\n\n"
+                "It sends nothing about you or your parts - it reads one small "
+                "file. You can change this later in Help.",
+            )
+            self.settings.setValue("update/check_automatically", bool(wanted))
+        if not self.settings.value("update/check_automatically", False, type=bool):
+            return
+        # Once a day is plenty for a program somebody opens to do a job.
+        last = int(self.settings.value("update/last_check", 0, type=int))
+        if time.time() - last < 20 * 60 * 60:
+            return
+        self._check_for_updates(announce=False)
+
+    def check_for_updates(self) -> None:
+        """Help -> Check for updates. Always asks, and always says what it found."""
+        if not update.is_configured():
+            self._notify(
+                "Updates are switched off",
+                "This build of Stamp has no release key compiled into it, so it "
+                "cannot tell a real update from a fake one and will not look.",
+            )
+            return
+        self._check_for_updates(announce=True)
+
+    def _check_for_updates(self, announce: bool) -> None:
+        self._update_announce = announce
+        self.settings.setValue("update/last_check", int(time.time()))
+        if announce:
+            self.statusBar().showMessage("Checking for a newer Stamp…")
+        # Three seconds in when it is automatic: a start is the one moment the
+        # user is waiting on, and nothing about this is urgent.
+        self.updater.check(__version__, after_ms=0 if announce else 3000)
+
+    def _on_update_found(self, release) -> None:
+        self._update_release = release
+        if not self._update_announce and self.settings.value(
+            "update/skipped_version", "", type=str
+        ) == release.version and not release.urgent:
+            return
+        self.update_bar.offer(
+            release.version,
+            urgent=release.urgent,
+            installable=update.can_install() and release.artifact is not None,
+        )
+
+    def _on_update_absent(self) -> None:
+        if self._update_announce:
+            self.statusBar().showMessage(f"Stamp {__version__} is the newest version.")
+
+    def _on_update_failed(self, reason: str) -> None:
+        # A failed check is not the user's problem unless they asked for one.
+        # Stamp is a program for putting artwork on parts; it does not owe
+        # anybody a red banner because a laptop is on a train.
+        if self._update_announce:
+            self.update_bar.trouble(reason)
+        else:
+            diagnostics.breadcrumb("update check failed: %s", reason)
+
+    def _on_update_install(self) -> None:
+        if self._update_installer is not None:
+            self._apply_update(now=True)
+            return
+        release = self._update_release
+        if release is None or release.artifact is None:
+            return
+        self._update_announce = True
+        self.update_bar.downloading(release.version)
+        self.updater.fetch(release, Path(tempfile.gettempdir()) / "stamp-update")
+
+    def _on_update_ready(self, path: str) -> None:
+        self._update_installer = Path(path)
+        version = self._update_release.version if self._update_release else ""
+        self.update_bar.ready(version)
+
+    def _on_update_later(self) -> None:
+        """Install on the way out, which is when nobody is waiting for it."""
+        self._install_on_quit = True
+        self.update_bar.hide_bar()
+        self.statusBar().showMessage("Stamp will install the update when you close it.")
+
+    def _on_update_notes(self) -> None:
+        release = self._update_release
+        url = (release.notes_url if release else "") or (
+            "https://github.com/dmoore-dwmmholdings/Stamp/releases/latest"
+        )
+        QDesktopServices.openUrl(QUrl(url))
+
+    def _on_update_skip(self) -> None:
+        if self._update_release is not None:
+            self.settings.setValue(
+                "update/skipped_version", self._update_release.version
+            )
+        self.update_bar.hide_bar()
+
+    def _on_update_cancel(self) -> None:
+        self.updater.cancel()
+        self.update_bar.hide_bar()
+
+    def _apply_update(self, now: bool) -> None:
+        """Start the installer and close, in that order and only in that order.
+
+        Never over unsaved work: the installer closes Stamp behind us, and a
+        program that throws away somebody's part to install a newer copy of
+        itself has failed at the only thing that matters.
+        """
+        if self._update_installer is None:
+            return
+        if now and self._dirty and self.document.base is not None:
+            if not self._confirm(
+                "Save first?",
+                "This project has changes that are not saved, and Stamp has to "
+                "close to install. Install anyway?",
+            ):
+                return
+        if now and self.rebuilder.busy:
+            self._notify(
+                "Stamp is busy",
+                "Wait for the rebuild to finish, then install the update.",
+            )
+            return
+        # Set before the installer starts, not after.  Closing asks about
+        # unsaved work, and the question has already been asked here - being
+        # asked it twice, with an installer already running behind the window,
+        # is how somebody ends up answering "no" to a close that happens anyway.
+        self._installing_update = True
+        try:
+            update.install(self._update_installer)
+        except update.UpdateError as exc:
+            self._installing_update = False
+            self._update_announce = True
+            self.update_bar.trouble(str(exc))
+            return
+        if now:
+            self.close()
+
     def _notify(self, title: str, message: str) -> None:
         if self.interactive:
             dialogs.warn(self, title, message)
@@ -743,9 +1235,21 @@ class MainWindow(QMainWindow):
         self.properties.show_feature(
             self.document, feature, size,
             mesh_mode=self.document.base is not None and self.document.base.mode == "mesh",
+            profile=self._profile_of(feature),
         )
         self._refresh_snap_targets(feature)
         self.handles.set_feature(feature, size)
+
+    def _profile_of(self, feature: Feature):
+        """The normalized artwork behind a feature, or None while it cannot be read.
+
+        Only the colour list wants it, and a missing source is already reported
+        as a broken feature, so this stays quiet.
+        """
+        try:
+            return self.profiles.get(feature.profile)
+        except Exception:  # noqa: BLE001
+            return None
 
     def _native_size(self, feature: Feature) -> tuple[float, float]:
         if feature.profile.native_size_mm != (0.0, 0.0):
@@ -892,11 +1396,36 @@ class MainWindow(QMainWindow):
         if path:
             self.open_part(Path(path))
 
-    def open_part(self, path: Path) -> None:
+    def _import_part(self, path: Path, **options) -> PartImportResult | None:
+        """Read a part with the window still alive, or report why it could not.
+
+        Returns None when the import failed or the user stopped it; both are
+        "leave everything as it was", and the message has already been shown.
+        """
         try:
-            result = import_part(path)
+            return import_part_for_ui(self, path, draft=self._draft_display, **options)
+        except ImportCancelled:
+            self.statusBar().showMessage(f"Opening {path.name} was stopped.", 5000)
+            return None
         except PartImportError as exc:
             self._notify("Stamp cannot open this part", str(exc))
+            return None
+
+    @staticmethod
+    def _solids_disjoint(result) -> bool:
+        """Whether the file's solids are separate bodies.
+
+        The import subprocess works this out while it has the shapes, because it
+        is a boolean per pair and the dialog asking the question cannot wait for
+        that.  In process, the shapes are still here, so it is worked out now.
+        """
+        if result.solids_disjoint is not None:
+            return result.solids_disjoint
+        return not solids_intersect(result.solids)
+
+    def open_part(self, path: Path) -> None:
+        result = self._import_part(path)
+        if result is None:
             return
 
         if result.units_ambiguous:
@@ -912,17 +1441,21 @@ class MainWindow(QMainWindow):
             if not self._ask(dialog):
                 return
             if dialog.scale() != 1.0:
-                result = import_part(path, unit_scale=dialog.scale())
+                result = self._import_part(path, unit_scale=dialog.scale())
+                if result is None:
+                    return
 
-        if result.solids:
+        if result.solid_count > 1:
             choice = dialogs.SolidChoiceDialog(
-                len(result.solids), disjoint=not solids_intersect(result.solids), parent=self
+                result.solid_count, disjoint=self._solids_disjoint(result), parent=self
             )
             if not self._ask(choice):
                 return
             index = choice.solid_index()
             if index is not None:
-                result = import_part(path, solid_index=index)
+                result = self._import_part(path, solid_index=index)
+                if result is None:
+                    return
 
         self.document = Document(base=result.part, name=path.stem)
         self.profiles.clear()
@@ -941,13 +1474,14 @@ class MainWindow(QMainWindow):
 
         self._show_viewport()
         self.viewport.clear()
-        self._display_geometry(result.part.runtime, result.part.mode)
-        self.viewport.fit_all()
+        self._fit_after_display = True
         self._refresh_tree()
         self._refresh_properties()
         self._update_enabled_state()
         self._update_title()
-        # Run the (empty) rebuild so the status line has a volume from the start.
+        # The rebuild both puts the part on screen and gives the status line a
+        # volume.  Displaying it here as well builds the same presentation twice,
+        # which on a converted mesh is a second and a half thrown away.
         self.request_rebuild(immediate=True)
         self.statusBar().showMessage(f"Opened {path.name}. Add a profile to place artwork on it.")
 
@@ -971,10 +1505,8 @@ class MainWindow(QMainWindow):
             self._notify("There is no part to replace", "Open a part first.")
             return
 
-        try:
-            result = import_part(path)
-        except PartImportError as exc:
-            self._notify("Stamp cannot open this part", str(exc))
+        result = self._import_part(path)
+        if result is None:
             return
 
         if result.units_ambiguous:
@@ -990,7 +1522,9 @@ class MainWindow(QMainWindow):
             if not self._ask(dialog):
                 return
             if dialog.scale() != 1.0:
-                result = import_part(path, unit_scale=dialog.scale())
+                result = self._import_part(path, unit_scale=dialog.scale())
+                if result is None:
+                    return
 
         if result.part.mode != self.document.base.mode:
             if not self._confirm(
@@ -1026,8 +1560,7 @@ class MainWindow(QMainWindow):
         if result.part.warnings:
             self._notify("Note about this part", "\n\n".join(result.part.warnings))
 
-        self._display_geometry(result.part.runtime, result.part.mode)
-        self.viewport.fit_all()
+        self._fit_after_display = True
         self._refresh_tree()
         self._refresh_properties()
         self._update_enabled_state()
@@ -1633,6 +2166,14 @@ class MainWindow(QMainWindow):
             )
             self.request_rebuild(immediate=True)
 
+    def _part_index_at(self, point) -> int:
+        """Which part a click landed on, or -1 when the file is one part."""
+        base = self.document.base
+        if base is None or not base.parts:
+            return -1
+        part = base.part_at(tuple(point))
+        return part.index if part is not None else -1
+
     def _create_mesh_feature(self, ref: ProfileRef, region) -> None:
         if ref.is_text:
             first = (ref.text.text.strip().splitlines() or ["Text"])[0]
@@ -1642,6 +2183,7 @@ class MainWindow(QMainWindow):
         feature = Feature(
             name=name,
             profile=ref,
+            part_index=self._part_index_at(region.point),
             placement=Placement(
                 anchor=Anchor(
                     kind=AnchorKind.MESH_REGION,
@@ -1929,6 +2471,9 @@ class MainWindow(QMainWindow):
         self._last_result = result
         if result.geometry is not None:
             self._display_geometry(result.geometry, result.mode)
+            if self._fit_after_display:
+                self._fit_after_display = False
+                self.viewport.fit_all()
 
         self._refresh_status()
         # Correct a value that will not build *before* anything that can open a
@@ -2028,8 +2573,16 @@ class MainWindow(QMainWindow):
     def _on_rebuild_failed(self, message: str) -> None:
         self.warning_label.setText(message)
         self.warning_label.setStyleSheet("color: #c0453a;")
+        if self._fit_after_display and self.document.base is not None:
+            # The rebuild that was going to put a freshly opened part on screen
+            # did not get there.  Show the part itself rather than an empty view.
+            self._fit_after_display = False
+            self._display_geometry(self.document.base.runtime, self.document.base.mode)
+            self.viewport.fit_all()
 
     def _display_geometry(self, geometry, mode: str) -> None:
+        if self._display_parts(mode):
+            return
         if mode == "solid":
             self.viewport.display_shape(RESULT_KEY, geometry, color=PART_COLOR)
         else:
@@ -2045,6 +2598,87 @@ class MainWindow(QMainWindow):
             self.viewport.display_shape(
                 RESULT_KEY, shape, color=PART_COLOR, material=False, matte=True
             )
+
+    def _display_parts(self, mode: str) -> bool:
+        """Draw an assembly one part at a time, leaving out the hidden ones.
+
+        One shape per part rather than one for the whole thing, because that is
+        the only way a part can be hidden: what reaches the screen has to be
+        divided the same way the file was.  Returns False when there is nothing
+        to divide, so the caller draws the single shape it always did.
+        """
+        base = self.document.base
+        result = self._last_result
+        if base is None or len(base.parts) < 2 or result is None or not result.parts:
+            self._clear_part_shapes()
+            return False
+
+        wanted: list[str] = []
+        for piece in result.parts:
+            part = next((p for p in base.parts if p.index == piece.index), None)
+            if part is not None and not part.visible:
+                continue
+            if piece.geometry is None:
+                continue
+            key = f"{RESULT_KEY}:{piece.index}"
+            try:
+                shape = (
+                    piece.geometry if mode == "solid"
+                    else self._mesh_display_shape(piece.geometry)
+                )
+            except Exception:  # noqa: BLE001 - one bad part must not blank the view
+                continue
+            self.viewport.display_shape(
+                key, shape, color=PART_COLOR,
+                material=mode == "solid", matte=mode != "solid", update=False,
+            )
+            wanted.append(key)
+
+        for key in self._part_shape_keys:
+            if key not in wanted:
+                self.viewport.erase(key, update=False)
+        self._part_shape_keys = wanted
+        # The single-shape view and the per-part view cannot both be up.
+        self.viewport.erase(RESULT_KEY, update=False)
+        if self.viewport.context:
+            self.viewport.context.UpdateCurrentViewer()
+        return True
+
+    def _clear_part_shapes(self) -> None:
+        for key in self._part_shape_keys:
+            self.viewport.erase(key, update=False)
+        self._part_shape_keys = []
+
+    def set_part_visible(self, index: int, visible: bool) -> None:
+        """Show or hide one part of an assembly."""
+        base = self.document.base
+        part = next((p for p in (base.parts if base else []) if p.index == index), None)
+        if part is None or part.visible == visible:
+            return
+        part.visible = bool(visible)
+        self._display_geometry(
+            self._last_result.geometry if self._last_result else None,
+            base.mode,
+        )
+        self._refresh_tree()
+
+    def isolate_part(self, index: int) -> None:
+        """Show one part alone, or -1 to show them all again."""
+        base = self.document.base
+        if base is None or not base.parts:
+            return
+        for part in base.parts:
+            part.visible = index < 0 or part.index == index
+        self._display_geometry(
+            self._last_result.geometry if self._last_result else None, base.mode
+        )
+        self._refresh_tree()
+        if index >= 0:
+            named = next((p for p in base.parts if p.index == index), None)
+            if named is not None:
+                self.statusBar().showMessage(
+                    f"Showing {named.name} on its own. Right-click a part to show them all."
+                )
 
     def _mesh_display_shape(self, manifold):
         """Draw a very large mesh from a reduced copy, keeping the full one (§5.2).
@@ -2083,6 +2717,9 @@ class MainWindow(QMainWindow):
         """The translucent tool solid, green for add and red for cut (§6.3)."""
         self.viewport.erase(PREVIEW_KEY, update=False)
         self.viewport.erase(FOOTPRINT_KEY, update=False)
+        for key in self._component_footprint_keys:
+            self.viewport.erase(key, update=False)
+        self._component_footprint_keys.clear()
         self._show_inspection_overlay(update=False)
 
         feature = self.selected_feature
@@ -2102,15 +2739,54 @@ class MainWindow(QMainWindow):
             PREVIEW_KEY, result.tool.shape, color=color, transparency=0.65,
             material=False, selectable=False, update=False,
         )
-        self.viewport.display_shape(
-            FOOTPRINT_KEY, result.tool.footprint, color=color, transparency=0.25,
-            material=False, selectable=False, update=True,
-        )
+        if not self._show_component_footprints(feature, result):
+            self.viewport.display_shape(
+                FOOTPRINT_KEY, result.tool.footprint, color=color, transparency=0.25,
+                material=False, selectable=False, update=False,
+            )
+        if self.viewport.context:
+            self.viewport.context.UpdateCurrentViewer()
         if feature.placement.mode.value == "wrap":
             self.statusBar().showMessage(
                 "Curved-face proof: the translucent stamp follows the selected cylindrical or conical face.",
                 5000,
             )
+
+    def _show_component_footprints(self, feature: Feature, result) -> bool:
+        """Draw the decal in the colours it will print in, one shape per part.
+
+        A colour stamp is only a layer or two deep, so the translucent solid
+        above it is nearly flat against the face and says very little about
+        where the artwork actually is.  In its own colours it says it at a
+        glance - and they are the colours the export will use, because both come
+        from :func:`effective_colors`.
+
+        Returns False when there is nothing to divide, so the caller draws the
+        single-colour decal it always did.
+        """
+        profile = self._profile_of(feature)
+        if profile is None or not divides_by_color(profile, feature):
+            return False
+        try:
+            footprints = component_footprints(profile, feature.placement, result.tool)
+        except Exception:  # noqa: BLE001 - a preview must never stop a rebuild
+            return False
+        if len(footprints) < 2:
+            return False
+
+        wanted = effective_colors(profile, feature)
+        drawn = 0
+        for key, shape in footprints.items():
+            rgb = _rgb(wanted.get(key, ""))
+            if rgb is None:
+                continue
+            self.viewport.display_shape(
+                f"{FOOTPRINT_KEY}:{key}", shape, color=rgb, transparency=0.15,
+                material=False, selectable=False, update=False,
+            )
+            self._component_footprint_keys.append(f"{FOOTPRINT_KEY}:{key}")
+            drawn += 1
+        return drawn >= 2
 
     def set_inspection_visible(self, on: bool) -> None:
         """Toggle the selected tool's manufacturing measurement overlay."""
@@ -2217,8 +2893,12 @@ class MainWindow(QMainWindow):
         if document.base is None:
             self._notify("This project has no part", "The project records no base part.")
             return
+        source = Path(document.base.source_path)
         try:
-            reloaded = import_part(document.base.source_path)
+            reloaded = import_part_for_ui(self, source, draft=self._draft_display)
+        except ImportCancelled:
+            self.statusBar().showMessage(f"Opening {path.name} was stopped.", 5000)
+            return
         except PartImportError as exc:
             self._notify("The part could not be reloaded", str(exc))
             return
@@ -2243,8 +2923,7 @@ class MainWindow(QMainWindow):
 
         self._show_viewport()
         self.viewport.clear()
-        self._display_geometry(document.base.runtime, document.base.mode)
-        self.viewport.fit_all()
+        self._fit_after_display = True
         self.units_box.setCurrentIndex(self.units_box.findData(document.units))
         self._refresh_tree()
         self._refresh_properties()
@@ -2404,6 +3083,8 @@ class MainWindow(QMainWindow):
             base_color=self.settings.value("3mf/base_color", type=str) or None,
             feature_color=self.settings.value("3mf/feature_color", type=str) or None,
             write_colors=self.settings.value("3mf/write_colors", True, type=bool),
+            parts=self.document.base.parts,
+            features_on=[f.part_index for f in self.document.features if f.enabled],
             parent=self,
         )
         if not self._ask(dialog):
@@ -2429,7 +3110,8 @@ class MainWindow(QMainWindow):
             return
         try:
             split = color_split.split_for_color(
-                self.document, self._last_result, deflection=dialog.deflection_mm()
+                self.document, self._last_result, deflection=dialog.deflection_mm(),
+                part_index=dialog.part_index(),
             )
             result = export_io.export_3mf(
                 split.bodies, path,
@@ -2677,13 +3359,18 @@ class MainWindow(QMainWindow):
         return TopoDS.Face_s(shape), (point.X(), point.Y(), point.Z())
 
     def closeEvent(self, event) -> None:  # noqa: N802
-        if self._dirty and self.document.base is not None:
+        if self._dirty and self.document.base is not None and not self._installing_update:
             if not self._confirm(
                 "Close without saving?",
                 "This project has changes that are not saved. Close it anyway?",
             ):
                 event.ignore()
                 return
+        # After the save question and before anything is torn down: the user
+        # agreed to close, and this is the moment nobody is waiting on Stamp.
+        if self._install_on_quit and not self._installing_update:
+            self._apply_update(now=False)
+        self.updater.shutdown()
         self.rebuilder.shutdown()
         # This run ended because the user closed it, thus the next start must not
         # report a crash.

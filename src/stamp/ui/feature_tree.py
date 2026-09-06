@@ -23,12 +23,14 @@ from stamp.core.document import Document, Feature, ModifierKind, OperationKind
 ADD_ICON = "↗"  # north east arrow - material added
 CUT_ICON = "↘"  # south east arrow - material removed
 STAMP_ICON = "◈"  # a filled shape inside an outline - a colour inlay, flush
+PART_ICON = "▣"  # one piece of a multi-part file
 WARN_ICON = "⚠"
 BROKEN_ICON = "✖"
 
 ROLE_FEATURE_ID = Qt.ItemDataRole.UserRole + 1
 ROLE_MODIFIER_ID = Qt.ItemDataRole.UserRole + 2
 ROLE_KIND = Qt.ItemDataRole.UserRole + 3
+ROLE_PART_INDEX = Qt.ItemDataRole.UserRole + 4
 
 WARN_COLOR = QColor("#c58a2a")
 BROKEN_COLOR = QColor("#c0453a")
@@ -47,6 +49,8 @@ class FeatureTree(QTreeWidget):
     delete_requested = Signal(str)
     mirror_requested = Signal(str)
     delete_modifier_requested = Signal(str, str)
+    part_visibility_toggled = Signal(int, bool)   # part index, visible
+    part_isolate_requested = Signal(int)          # show this part and no other
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
@@ -81,7 +85,8 @@ class FeatureTree(QTreeWidget):
         self._updating = True
         self.clear()
         if document is not None:
-            self._add_base_item(document)
+            base_item = self._add_base_item(document)
+            self._add_part_items(document, base_item)
             for feature in document.features:
                 self._add_feature_item(feature)
         self._updating = False
@@ -107,6 +112,40 @@ class FeatureTree(QTreeWidget):
         item.setData(0, ROLE_FEATURE_ID, "")
         item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
         return item
+
+    def _add_part_items(self, document: Document, parent: QTreeWidgetItem) -> None:
+        """List the parts of an assembly under the part item, each with a tick.
+
+        Only for a file that arrived as more than one - a single part is not a
+        choice, and a row that always says the same thing is noise.
+        """
+        base = document.base
+        if base is None or len(base.parts) < 2:
+            return
+        for part in base.parts:
+            item = QTreeWidgetItem(parent)
+            count = sum(1 for f in document.features if f.part_index == part.index)
+            label = f"{PART_ICON}  {part.name}"
+            if count:
+                label += f"   ({count} on it)"
+            item.setText(0, label)
+            item.setData(0, ROLE_KIND, "part")
+            item.setData(0, ROLE_PART_INDEX, part.index)
+            item.setData(0, ROLE_FEATURE_ID, "")
+            item.setToolTip(
+                0,
+                f"{part.triangle_count:,} triangles. Untick to hide it, or "
+                f"right-click to show it on its own.",
+            )
+            item.setFlags(
+                Qt.ItemFlag.ItemIsEnabled
+                | Qt.ItemFlag.ItemIsSelectable
+                | Qt.ItemFlag.ItemIsUserCheckable
+            )
+            item.setCheckState(
+                0,
+                Qt.CheckState.Checked if part.visible else Qt.CheckState.Unchecked,
+            )
 
     def _add_feature_item(self, feature: Feature) -> QTreeWidgetItem:
         item = QTreeWidgetItem(self)
@@ -191,7 +230,15 @@ class FeatureTree(QTreeWidget):
     # ------------------------------------------------------------------- edits
 
     def _on_item_changed(self, item: QTreeWidgetItem, column: int) -> None:
-        if self._updating or item.data(0, ROLE_KIND) != "feature":
+        if self._updating:
+            return
+        if item.data(0, ROLE_KIND) == "part":
+            self.part_visibility_toggled.emit(
+                int(item.data(0, ROLE_PART_INDEX)),
+                item.checkState(0) == Qt.CheckState.Checked,
+            )
+            return
+        if item.data(0, ROLE_KIND) != "feature":
             return
         feature_id = item.data(0, ROLE_FEATURE_ID)
 
@@ -230,6 +277,17 @@ class FeatureTree(QTreeWidget):
             return
         kind = item.data(0, ROLE_KIND)
         feature_id = item.data(0, ROLE_FEATURE_ID)
+        if kind == "part":
+            index = int(item.data(0, ROLE_PART_INDEX))
+            menu = QMenu(self)
+            alone = QAction("Show this part on its own", menu)
+            alone.triggered.connect(lambda: self.part_isolate_requested.emit(index))
+            menu.addAction(alone)
+            every = QAction("Show every part", menu)
+            every.triggered.connect(lambda: self.part_isolate_requested.emit(-1))
+            menu.addAction(every)
+            menu.exec(self.viewport().mapToGlobal(position))
+            return
         if not feature_id:
             return
 

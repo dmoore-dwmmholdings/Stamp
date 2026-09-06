@@ -15,7 +15,7 @@ import pytest
 
 pytest.importorskip("PySide6")
 
-from PySide6.QtCore import Qt  # noqa: E402
+from PySide6.QtCore import QPoint, Qt  # noqa: E402
 
 from stamp.core.document import (  # noqa: E402
     Anchor,
@@ -175,6 +175,819 @@ class TestViewportWindowBinding:
 
         assert moves == [(150, 300)]
         assert widget.logical_px(150) == pytest.approx(100)
+
+
+class TestTheRibbon:
+    """The command ribbon - spec §7.
+
+    The bottom toolbar held thirty commands, overflowed at any ordinary window
+    size, and moved the overflow into a chevron menu that shut again at every
+    layout pass.  These cover what the ribbon has to promise instead: every
+    command reachable, and one enabled state shared with the menus.
+    """
+
+    @pytest.fixture
+    def window(self, qtbot):
+        from stamp.ui.main_window import MainWindow
+
+        win = MainWindow()
+        win.interactive = False
+        qtbot.addWidget(win)
+        return win
+
+    def _buttons(self, window):
+        return window.ribbon.command_buttons()
+
+    def test_every_command_is_on_a_tab(self, window):
+        """The old bar could not promise this; that is why the menus exist."""
+        for action in (
+            window.action_open_part, window.action_save, window.action_add_profile,
+            window.action_export_step, window.action_export_3mf,
+            window.action_export_package, window.action_batch,
+            window.action_align_edge, window.action_create_datum,
+            window.action_undo, window.action_redo,
+        ):
+            assert window.ribbon.button_for(action) is not None, action.text()
+
+    def test_the_tabs_are_named_for_what_they_hold(self, window):
+        names = [window.ribbon.tabText(i) for i in range(window.ribbon.count())]
+        assert names == ["Home", "Place", "Export", "View"]
+
+    def test_a_button_carries_a_short_caption_and_the_full_name(self, window):
+        """A button is narrower than most command names.  Left to elide, "Insert
+        stamp preset" reads as "Insert ...reset"."""
+        button = self._button_for(window, window.action_insert_preset)
+        assert button.text() == "Insert preset"
+        assert "Insert stamp preset" in button.toolTip()
+        window.ribbon.set_dense(False)
+        assert button.text() == "Insert\npreset"
+
+    def test_a_tooltip_leads_with_the_name_and_the_shortcut(self, window):
+        """A tooltip that repeats the caption teaches nothing."""
+        tip = self._button_for(window, window.action_save).toolTip()
+        assert tip.startswith("<b>Save</b>")
+        assert "Ctrl+S" in tip
+
+    def test_every_button_has_an_icon_that_was_drawn(self, window):
+        """Emoji were the old stand-in: some render in colour, some as a box, and
+        the grey they fell back to was invisible on a light desktop theme."""
+        buttons = self._buttons(window)
+        assert buttons
+        for button in buttons:
+            assert not button.icon().isNull(), button.text()
+
+    def test_the_secondary_commands_are_small_buttons_when_it_is_roomy(self, window):
+        """A group whose commands are all one size has no shape."""
+        from stamp.ui.ribbon import BUTTON_H, DENSE_H, SMALL_H
+
+        undo = self._button_for(window, window.action_undo)
+        add_text = self._button_for(window, window.action_add_text)
+        assert undo.height() == add_text.height() == DENSE_H  # compact: one size
+
+        window.ribbon.set_dense(False)
+        assert undo.height() == SMALL_H
+        assert add_text.height() == BUTTON_H
+
+    def test_save_undo_and_redo_are_also_on_the_quick_access_bar(self, window):
+        """They are wanted from whichever tab you are on."""
+        from PySide6.QtWidgets import QToolButton
+
+        quick = window.quick_access.findChildren(QToolButton)
+        assert len(quick) == 3
+        fired = []
+        window.action_redo.triggered.connect(lambda: fired.append(1))
+        window.action_redo.setEnabled(True)
+        quick[2].click()
+        assert fired == [1]
+
+    def test_the_buttons_survive_a_change_of_size(self, window, qtbot):
+        """Re-parenting a widget hides it, and a button hidden that way stays
+        hidden however tidy the new layout is."""
+        window.show()
+        qtbot.waitExposed(window)
+        button = self._button_for(window, window.action_add_text)
+        for dense in (False, True):
+            window.ribbon.set_dense(dense)
+            assert button.isVisible(), f"lost the button at dense={dense}"
+            assert button.icon().isNull() is False
+
+    def test_the_view_menu_offers_the_roomy_layout(self, window):
+        assert not window.action_large_ribbon.isChecked()
+        assert window.ribbon.dense
+
+    def test_disabling_the_command_disables_its_button(self, window):
+        """One command, two views.  The window enables actions, not buttons."""
+        button = self._button_for(window, window.action_export_step)
+        window.action_export_step.setEnabled(False)
+        assert not button.isEnabled()
+        window.action_export_step.setEnabled(True)
+        assert button.isEnabled()
+
+    def test_a_checkable_command_and_its_button_agree(self, window):
+        button = self._button_for(window, window.action_draft)
+        assert button.isCheckable()
+        window.action_draft.setChecked(True)
+        assert button.isChecked()
+        button.setChecked(False)
+        assert not window.action_draft.isChecked()
+
+    def test_clicking_a_button_runs_the_command(self, window, qtbot):
+        """Deliberately not Batch: its first line is a QFileDialog, which is
+        modal, does not consult `interactive`, and under Xvfb never comes back -
+        so a test that clicks it wedges the whole container run rather than
+        failing.  Fit to window is a real command that only touches the camera."""
+        fired = []
+        window.action_fit.triggered.connect(lambda: fired.append(1))
+        self._button_for(window, window.action_fit).click()
+        assert fired == [1]
+
+    def test_a_narrow_window_hides_nothing(self, window, qtbot):
+        """The old bar's answer to a small window was to take commands away."""
+        window.resize(900, 700)
+        window.show()
+        qtbot.waitExposed(window)
+        assert len(self._buttons(window)) >= 20
+
+    @staticmethod
+    def _button_for(window, action):
+        button = window.ribbon.button_for(action)
+        if button is None:
+            raise AssertionError(f"no ribbon button for {action.text()!r}")
+        return button
+
+
+class TestViewControl:
+    """Getting the camera where you want it - spec §7.
+
+    A combo box is two clicks to a standard view and nothing at all to a rotation.
+    These cover the four ways round that: the navigation cube, the arrow keys,
+    roll, and looking straight down a face.
+    """
+
+    @pytest.fixture
+    def view(self, qtbot):
+        from stamp.ui.viewport import Viewport
+
+        widget = Viewport()
+        qtbot.addWidget(widget)
+        widget.show()
+        qtbot.waitExposed(widget)
+        if widget.view is None:  # pragma: no cover - no GL on this machine
+            pytest.skip("no GL context available")
+        return widget
+
+    def test_the_cube_is_there_to_click(self, view):
+        assert view._cube is not None
+
+    def test_an_arrow_key_turns_the_part(self, view):
+        from PySide6.QtCore import Qt as QtNs
+        from PySide6.QtGui import QKeyEvent
+
+        before = tuple(view.view.Proj())
+        view.keyPressEvent(
+            QKeyEvent(QKeyEvent.Type.KeyPress, QtNs.Key.Key_Right,
+                      QtNs.KeyboardModifier.NoModifier)
+        )
+        after = tuple(view.view.Proj())
+        assert any(abs(a - b) > 1e-3 for a, b in zip(before, after, strict=True))
+
+    def test_shift_takes_a_quarter_turn(self, view):
+        """Fifteen degrees a press is for aiming; ninety is for getting there."""
+        from PySide6.QtCore import Qt as QtNs
+        from PySide6.QtGui import QKeyEvent
+
+        def turn(mods):
+            view.set_preset_view("front")
+            before = tuple(view.view.Proj())
+            view.keyPressEvent(
+                QKeyEvent(QKeyEvent.Type.KeyPress, QtNs.Key.Key_Right, mods)
+            )
+            after = tuple(view.view.Proj())
+            return sum((a - b) ** 2 for a, b in zip(before, after, strict=True)) ** 0.5
+
+        small = turn(QtNs.KeyboardModifier.NoModifier)
+        large = turn(QtNs.KeyboardModifier.ShiftModifier)
+        assert large > small
+
+    def test_roll_spins_the_view_about_what_it_looks_at(self, view):
+        import math
+
+        before = view.view.Twist()
+        view.roll_by(15.0)
+        assert math.degrees(view.view.Twist() - before) == pytest.approx(15.0, abs=0.01)
+
+    def test_alt_and_an_arrow_rolls_instead_of_turning(self, view):
+        from PySide6.QtCore import Qt as QtNs
+        from PySide6.QtGui import QKeyEvent
+
+        before = view.view.Twist()
+        view.keyPressEvent(
+            QKeyEvent(QKeyEvent.Type.KeyPress, QtNs.Key.Key_Left,
+                      QtNs.KeyboardModifier.AltModifier)
+        )
+        assert view.view.Twist() != before
+
+    def test_looking_along_a_normal_points_the_camera_down_it(self, view):
+        view.look_along((0.0, 0.0, 1.0))
+        assert tuple(round(v, 3) for v in view.view.Proj()) == (0.0, 0.0, 1.0)
+
+    def test_a_normal_of_nothing_is_ignored(self, view):
+        """A face reference that never resolved must not send the camera nowhere."""
+        before = tuple(view.view.Proj())
+        view.look_along((0.0, 0.0, 0.0))
+        assert tuple(view.view.Proj()) == before
+
+
+class TestTheRibbonCollapses:
+    """The ribbon's height is height the 3D view does not get."""
+
+    @pytest.fixture
+    def ribbon(self, qtbot):
+        from PySide6.QtGui import QAction
+
+        from stamp.ui.ribbon import Ribbon
+
+        widget = Ribbon()
+        tab = widget.add_tab("Home")
+        group = tab.add_group("Project")
+        group.add_action(QAction("Open part", widget), "open-part", "Open\npart")
+        group.add_small_action(QAction("Save", widget), "save")
+        qtbot.addWidget(widget)
+        return widget
+
+    def test_it_starts_open(self, ribbon):
+        assert not ribbon.collapsed
+        assert ribbon.height() == ribbon.expanded_height()
+
+    def test_collapsing_leaves_only_the_tab_strip(self, ribbon):
+        from stamp.ui.ribbon import COLLAPSED_H
+
+        ribbon.set_collapsed(True)
+        assert ribbon.collapsed
+        assert ribbon.height() == COLLAPSED_H
+
+    def test_double_clicking_a_tab_toggles_it(self, ribbon):
+        ribbon.tabBarDoubleClicked.emit(0)
+        assert ribbon.collapsed
+        ribbon.tabBarDoubleClicked.emit(0)
+        assert not ribbon.collapsed
+
+    def test_it_says_when_it_changed(self, ribbon):
+        seen = []
+        ribbon.collapsed_changed.connect(seen.append)
+        ribbon.set_collapsed(True)
+        ribbon.set_collapsed(True)  # already there; not a change
+        assert seen == [True]
+
+    def test_the_open_ribbon_is_shorter_than_it_used_to_be(self, ribbon):
+        """126 px of chrome for thirty commands was the complaint, twice over.
+
+        The answer the second time was to open compact: one row of small
+        buttons, no captions.  Everything is still on a tab; it is the labels
+        under the icons that go, and they come back from the View menu."""
+        assert ribbon.dense
+        assert ribbon.expanded_height() <= 60
+
+    def test_the_roomy_layout_is_there_for_anyone_who_wants_it(self, ribbon):
+        ribbon.set_dense(False)
+        assert ribbon.expanded_height() > 90
+        assert ribbon.height() == ribbon.expanded_height()
+        ribbon.set_dense(True)
+        assert ribbon.height() == ribbon.expanded_height() <= 60
+
+    def test_changing_size_says_so(self, ribbon):
+        seen = []
+        ribbon.dense_changed.connect(seen.append)
+        ribbon.set_dense(False)
+        ribbon.set_dense(False)  # already there; not a change
+        assert seen == [False]
+
+    def test_a_collapsed_ribbon_stays_collapsed_when_the_size_changes(self, ribbon):
+        from stamp.ui.ribbon import COLLAPSED_H
+
+        ribbon.set_collapsed(True)
+        ribbon.set_dense(False)
+        assert ribbon.height() == COLLAPSED_H
+
+
+class TestTheColourPreview:
+    """A colour stamp is only a layer or two deep, so the translucent solid over
+    it is nearly flat against the face and says very little about where the
+    artwork is.  In its own colours it says it at a glance.
+
+    The engine is driven directly rather than through the window: the window's
+    rebuild is asynchronous, and what is under test here is the drawing, not the
+    plumbing that gets a result to it.
+    """
+
+    @pytest.fixture
+    def window(self, qtbot):
+        from stamp.ui.main_window import MainWindow
+
+        win = MainWindow()
+        win.interactive = False
+        qtbot.addWidget(win)
+        return win
+
+    @pytest.fixture
+    def part(self, fixtures):
+        """A part of this test's own, not the session-scoped one.
+
+        Closing a window releases its geometry - ``closeEvent`` sets
+        ``document.base.runtime`` to None to keep nanobind quiet about leaks on
+        exit - so handing the shared fixture to a window that qtbot will close
+        empties it for every test that runs afterwards.
+        """
+        from stamp.io.part_import import import_part
+
+        return import_part(fixtures / "bracket.step").part
+
+    def _stamped(self, window, bracket_step, art):
+        from stamp.core.document import (
+            Anchor,
+            AnchorKind,
+            DepthMode,
+            Direction,
+            Feature,
+            Operation,
+            OperationKind,
+            Placement,
+            ProfileRef,
+        )
+        from stamp.core.rebuild import RebuildEngine
+        from stamp.core.refs import FaceRef
+        from stamp.io.profile_import import file_hash
+
+        window.document.base = bracket_step
+        feature = Feature(
+            name="Logo",
+            profile=ProfileRef(source_path=str(art), source_hash=file_hash(art)),
+            placement=Placement(anchor=Anchor(kind=AnchorKind.FACE, face_ref=FaceRef(
+                point=(40.0, 20.0, 14.0), normal=(0.0, 0.0, 1.0), surface_type="plane"))),
+            operation=Operation(kind=OperationKind.COLOR, depth_mode=DepthMode.BLIND,
+                                depth=0.2, direction=Direction.INTO),
+        )
+        window.document.add_feature(feature)
+        result = RebuildEngine(window.profiles.get).rebuild(window.document)
+        assert result.ok
+        row = result.result_for(feature.id)
+        assert row is not None and row.tool is not None
+        return feature, row
+
+    def test_a_two_colour_stamp_previews_in_two_colours(self, window, fixtures, part):
+        feature, row = self._stamped(window, part, fixtures / "two_color.svg")
+        assert window._show_component_footprints(feature, row) is True
+        assert len(window._component_footprint_keys) == 2
+
+    def test_one_colour_keeps_the_single_decal(self, window, fixtures, part):
+        """The usual case must stay exactly as cheap as it was."""
+        feature, row = self._stamped(window, part, fixtures / "logo.svg")
+        assert window._show_component_footprints(feature, row) is False
+        assert window._component_footprint_keys == []
+
+
+class TestTheUpdateBar:
+    """Telling somebody a new Stamp exists - see :mod:`stamp.update`.
+
+    A bar rather than a dialog, because an update is never urgent enough to
+    interrupt somebody halfway through placing a stamp on a face.  These cover
+    the rules that matter: it is silent until there is something to say, it
+    never installs over unsaved work, and building a window never touches the
+    network.
+
+    These ask isHidden() rather than isVisible() where the window itself is
+    not shown: a widget in a hidden window is not visible however loudly it
+    asked to be, and the question here is whether the bar put itself up.
+    """
+
+    @pytest.fixture
+    def window(self, qtbot):
+        from stamp.ui.main_window import MainWindow
+
+        win = MainWindow()
+        win.interactive = False
+        qtbot.addWidget(win)
+        return win
+
+    @staticmethod
+    def _release(version="9.9.9", urgent=False, artifact=None):
+        from stamp.update import Release
+
+        return Release(
+            version=version,
+            notes_url="https://example.invalid/notes",
+            artifact=artifact,
+            urgent=urgent,
+        )
+
+    def test_it_says_nothing_until_there_is_something_to_say(self, window):
+        assert window.update_bar.isHidden()
+
+    def test_building_a_window_checks_nothing(self, window, monkeypatch):
+        """A test builds a window.  A test must not make a network call."""
+        called = []
+        monkeypatch.setattr(
+            "stamp.update.check", lambda *a, **k: called.append(1) or None
+        )
+        window.begin_update_check()  # interactive is False
+        assert called == []
+
+    def test_no_thread_is_started_until_something_asks_for_one(self, window):
+        """Every test builds a window, and a thread nobody asked for is one that
+        has to be shut down correctly on a path nobody exercises."""
+        assert not window.updater.running
+
+    def test_a_found_release_is_offered(self, window, qtbot):
+        window.show()
+        qtbot.waitExposed(window)
+        window._on_update_found(self._release())
+        assert window.update_bar.isVisible()
+        assert "9.9.9" in window.update_bar.message.text()
+
+    def test_a_skipped_version_is_not_offered_again(self, window):
+        window._update_announce = False
+        window.settings.setValue("update/skipped_version", "9.9.9")
+        try:
+            window._on_update_found(self._release())
+            assert window.update_bar.isHidden()
+        finally:
+            window.settings.remove("update/skipped_version")
+
+    def test_a_withdrawn_version_is_offered_even_if_skipped(self, window):
+        """Skipping is a preference; being told to stop using a build is not."""
+        window._update_announce = False
+        window.settings.setValue("update/skipped_version", "9.9.9")
+        try:
+            window._on_update_found(self._release(urgent=True))
+            assert not window.update_bar.isHidden()
+        finally:
+            window.settings.remove("update/skipped_version")
+
+    def test_a_quiet_check_that_fails_stays_quiet(self, window):
+        """A laptop on a train is not the user's problem to be told about."""
+        window._update_announce = False
+        window._on_update_failed("no route to host")
+        assert window.update_bar.isHidden()
+
+    def test_a_check_the_user_asked_for_reports_a_failure(self, window):
+        window._update_announce = True
+        window._on_update_failed("no route to host")
+        assert not window.update_bar.isHidden()
+        assert "no route to host" in window.update_bar.message.text()
+
+    def test_it_will_not_install_over_unsaved_work(self, window, monkeypatch):
+        """Closing to install and losing the part is the one unforgivable bug."""
+        started = []
+        monkeypatch.setattr("stamp.update.install", lambda *a, **k: started.append(1))
+        monkeypatch.setattr(window, "_confirm", lambda *a: False)
+        window._update_installer = Path("nowhere.exe")
+        window._dirty = True
+        window.document.base = object()
+        try:
+            window._apply_update(now=True)
+        finally:
+            window.document.base = None
+        assert started == []
+
+    def test_install_when_i_quit_waits_for_the_quit(self, window, monkeypatch):
+        started = []
+        monkeypatch.setattr("stamp.update.install", lambda *a, **k: started.append(1))
+        window._update_installer = Path("nowhere.exe")
+        window._on_update_later()
+        assert window.update_bar.isHidden()
+        assert started == []
+        window.close()
+        assert started == [1]
+
+    def test_the_menu_switch_is_remembered(self, window):
+        before = window.settings.value("update/check_automatically", False, type=bool)
+        try:
+            window.action_auto_updates.setChecked(True)
+            assert window.settings.value(
+                "update/check_automatically", False, type=bool
+            )
+        finally:
+            window.settings.setValue("update/check_automatically", before)
+
+
+class TestTheIcons:
+    """The drawn icon set - see :mod:`stamp.ui.icons`.
+
+    The set replaced emoji, which rendered in colour on one machine and as a box
+    with a hex number in it on the next, and whose grey fallback was white on
+    white against a light desktop theme.  These check the two things that made
+    that fail: that something is actually drawn, and that it is drawn in the
+    colours it was asked for rather than a colour baked into the code.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _app(self, qtbot):
+        return qtbot
+
+    def test_every_icon_draws_something(self):
+        from PySide6.QtGui import QColor
+
+        from stamp.ui import icons
+
+        for name in icons.names():
+            image = icons.pixmap(
+                name, 24, QColor("#202020"), QColor("#1a73e8"), ratio=2
+            ).toImage()
+            painted = sum(
+                1
+                for y in range(image.height())
+                for x in range(image.width())
+                if image.pixelColor(x, y).alpha() > 40
+            )
+            assert painted > 60, f"{name} is all but blank"
+
+    def test_an_icon_is_drawn_in_the_colour_it_is_given(self):
+        """The old fallback painted a fixed light grey, so on a light desktop
+        theme the ribbon's icons were white on white."""
+        from PySide6.QtGui import QColor
+
+        from stamp.ui import icons
+
+        image = icons.pixmap(
+            "save", 24, QColor("#c81e2d"), QColor("#c81e2d"), ratio=2
+        ).toImage()
+        hues = {
+            image.pixelColor(x, y).hue()
+            for y in range(image.height())
+            for x in range(image.width())
+            if image.pixelColor(x, y).alpha() > 200
+        }
+        assert hues and all(abs(hue - 355) < 12 for hue in hues if hue >= 0)
+
+    def test_a_light_theme_and_a_dark_one_get_different_ink(self):
+        from PySide6.QtGui import QColor, QPalette
+
+        from stamp.ui.ribbon import Theme
+
+        light = QPalette()
+        light.setColor(QPalette.ColorRole.Window, QColor("#f0f0f0"))
+        light.setColor(QPalette.ColorRole.WindowText, QColor("#101010"))
+        dark = QPalette()
+        dark.setColor(QPalette.ColorRole.Window, QColor("#2b2b2b"))
+        dark.setColor(QPalette.ColorRole.WindowText, QColor("#e8e8e8"))
+
+        assert not Theme(light).dark
+        assert Theme(dark).dark
+        # The ink has to stand off the ribbon's own ground at both ends.
+        for palette in (light, dark):
+            theme = Theme(palette)
+            contrast = abs(
+                (0.299 * theme.icon.red() + 0.587 * theme.icon.green()
+                 + 0.114 * theme.icon.blue())
+                - (0.299 * theme.body.red() + 0.587 * theme.body.green()
+                   + 0.114 * theme.body.blue())
+            )
+            assert contrast > 100
+
+
+class TestArtworkColours:
+    """Per-component colour on the properties panel - spec §9."""
+
+    @pytest.fixture
+    def panel(self, qtbot):
+        from stamp.ui.properties import PropertiesPanel
+
+        widget = PropertiesPanel()
+        qtbot.addWidget(widget)
+        return widget
+
+    def _two_color(self, fixtures):
+        from stamp.io.profile_import import import_profile
+
+        return import_profile(fixtures / "two_color.svg").profile
+
+    def test_one_component_shows_no_colour_list(self, panel, fixtures):
+        """A single swatch that changes nothing is worse than no box at all."""
+        from stamp.io.profile_import import import_profile
+
+        feature = a_feature()
+        panel.show_feature(
+            Document(), feature, (36.0, 16.0),
+            profile=import_profile(fixtures / "logo.svg").profile,
+        )
+        assert not panel._components.isVisible()
+
+    def test_several_components_are_listed(self, panel, fixtures, qtbot):
+        from PySide6.QtWidgets import QLabel
+
+        feature = a_feature()
+        panel.show_feature(Document(), feature, (28.0, 12.0), profile=self._two_color(fixtures))
+        labels = [
+            w.text() for w in panel._component_rows.findChildren(QLabel)
+        ]
+        assert "Black" in labels
+        assert "Red" in labels
+
+    def test_setting_one_colour_leaves_the_others_alone(self, panel, fixtures):
+        feature = a_feature()
+        panel.show_feature(Document(), feature, (28.0, 12.0), profile=self._two_color(fixtures))
+        feature.component_colors["#ff0000"] = "#e4002b"
+        assert feature.color_for("#ff0000", "#111111") == "#e4002b"
+        assert feature.color_for("#000000", "#111111") == "#111111"
+
+    def test_resetting_puts_it_all_back_to_one_colour(self, panel, fixtures):
+        feature = a_feature()
+        feature.component_colors = {"#ff0000": "#e4002b"}
+        panel.show_feature(Document(), feature, (28.0, 12.0), profile=self._two_color(fixtures))
+        changes = []
+        panel.changed.connect(changes.append)
+
+        panel._on_components_reset()
+        assert feature.component_colors == {}
+        assert changes == ["artwork colour"]
+
+    def test_the_dropped_backdrop_is_named_with_an_offer_to_keep_it(
+        self, panel, fixtures
+    ):
+        from stamp.io.profile_import import import_profile
+
+        result = import_profile(fixtures / "background.svg")
+        feature = a_feature()
+        panel.show_feature(Document(), feature, (28.0, 12.0), profile=result.profile)
+
+        assert panel.keep_background.isVisible() or not panel.isVisible()
+        assert "backdrop" in panel.background_note.text()
+        assert not panel.keep_background.isChecked()
+
+    def test_keeping_the_backdrop_asks_for_a_reimport(self, panel, fixtures):
+        from stamp.io.profile_import import import_profile
+
+        feature = a_feature()
+        panel.show_feature(
+            Document(), feature, (28.0, 12.0),
+            profile=import_profile(fixtures / "background.svg").profile,
+        )
+        changes = []
+        panel.changed.connect(changes.append)
+
+        panel.keep_background.setChecked(True)
+        assert feature.profile.keep_background is True
+        assert changes == ["background layer"]
+
+
+class TestHeavyPartDisplay:
+    """A converted mesh reaches Stamp as one planar face per triangle (§5.2).
+
+    Nothing in the viewport is wrong at ten faces and ruinous at eighty thousand
+    except how often it is done and how much of it there is, so these cover the
+    work that is now skipped, deferred, or reused rather than repeated.
+    """
+
+    @pytest.fixture
+    def box(self):
+        from OCP.BRepPrimAPI import BRepPrimAPI_MakeBox
+
+        return BRepPrimAPI_MakeBox(10.0, 10.0, 10.0).Shape()
+
+    @pytest.fixture
+    def widget(self, qtbot):
+        from stamp.ui.viewport import Viewport
+
+        view = Viewport()
+        qtbot.addWidget(view)
+        view.context = _RecordingContext()
+        view.view = object()
+        return view
+
+    def test_face_count_counts_faces(self, box):
+        from stamp.io.part_import import face_count
+
+        assert face_count(box) == 6
+
+    def test_an_ordinary_part_keeps_its_boundary_edges(self, widget, box):
+        ais = widget.display_shape("part", box)
+        assert ais.Attributes().FaceBoundaryDraw()
+
+    def test_a_converted_mesh_is_drawn_without_them(self, widget, box, monkeypatch):
+        """Outlining every triangle costs a second and draws the part as a smudge."""
+        from stamp.ui import viewport as viewport_module
+
+        monkeypatch.setattr(viewport_module, "face_count", lambda _shape: 200_000)
+        ais = widget.display_shape("part", box)
+        assert not ais.Attributes().FaceBoundaryDraw()
+
+    def test_selection_waits_for_the_user_to_reach_for_it(self, widget, box):
+        """Computing it costs as much as drawing, and most displays are never picked."""
+        widget.display_shape("part", box)
+        assert widget.context.activated == []
+
+        widget._do_pick(QPoint(10, 10), additive=False)
+        assert len(widget.context.activated) == 1
+
+    def test_redisplaying_the_same_shape_does_not_rebuild_it(self, widget, box):
+        first = widget.display_shape("part", box)
+        second = widget.display_shape("part", box)
+        assert second is first
+        assert widget.context.display_calls == 1
+
+    def test_a_changed_colour_does_rebuild_it(self, widget, box):
+        widget.display_shape("part", box, color=(0.1, 0.2, 0.3))
+        widget.display_shape("part", box, color=(0.9, 0.2, 0.3))
+        assert widget.context.display_calls == 2
+
+    def test_setting_the_mode_it_is_already_in_does_nothing(self, widget, box):
+        """The window puts the view back to face picking after nearly every action."""
+        widget.display_shape("part", box)
+        widget._do_pick(QPoint(10, 10), additive=False)
+        widget.context.activated.clear()
+        widget.context.deactivated.clear()
+
+        widget.set_selection_mode("face")
+        assert widget.context.activated == []
+        assert widget.context.deactivated == []
+
+    def test_changing_the_mode_defers_the_work_to_the_next_pick(self, widget, box):
+        widget.display_shape("part", box)
+        widget._do_pick(QPoint(10, 10), additive=False)
+        widget.context.activated.clear()
+
+        widget.set_selection_mode("edge")
+        assert widget.context.activated == []
+        widget._do_pick(QPoint(10, 10), additive=False)
+        assert len(widget.context.activated) == 1
+
+    def test_hover_does_not_chase_the_pointer_over_a_converted_mesh(
+        self, widget, box, monkeypatch
+    ):
+        """Highlighting one triangle is not worth a second of frozen mouse."""
+        from stamp.ui import viewport as viewport_module
+
+        monkeypatch.setattr(viewport_module, "face_count", lambda _shape: 200_000)
+        widget.display_shape("part", box)
+        widget.mouseMoveEvent(_a_move(40, 40))
+        assert widget.context.moves == []
+
+    def test_pretessellate_leaves_triangulation_the_display_reuses(self, box):
+        """Same call the presentation makes, so AIS_Shape finds the mesh already there."""
+        from OCP.StdPrs import StdPrs_ToolTriangulatedShape
+
+        from stamp.io.part_import import display_drawer, pretessellate
+
+        assert not StdPrs_ToolTriangulatedShape.IsTriangulated_s(box)
+        pretessellate(box)
+        assert StdPrs_ToolTriangulatedShape.IsTriangulated_s(box)
+        assert display_drawer(draft=True).DeviationCoefficient() > (
+            display_drawer().DeviationCoefficient()
+        )
+
+
+class _RecordingContext:
+    """Enough of ``AIS_InteractiveContext`` to see what the viewport asked for."""
+
+    def __init__(self) -> None:
+        self.displayed: list[object] = []
+        self.activated: list[object] = []
+        self.deactivated: list[object] = []
+        self.moves: list[tuple[int, int]] = []
+        self.display_calls = 0
+
+    def Display(self, ais, _mode, _sel, _update):  # noqa: N802 - OCC naming
+        self.displayed.append(ais)
+        self.display_calls += 1
+
+    def Remove(self, ais, _update):  # noqa: N802
+        if ais in self.displayed:
+            self.displayed.remove(ais)
+
+    def Activate(self, ais, _mode):  # noqa: N802
+        self.activated.append(ais)
+
+    def Deactivate(self, ais):  # noqa: N802
+        self.deactivated.append(ais)
+
+    def MoveTo(self, x, y, _view, _update):  # noqa: N802
+        self.moves.append((x, y))
+
+    def Select(self, _update):  # noqa: N802
+        pass
+
+    def ShiftSelect(self, _update):  # noqa: N802
+        pass
+
+    def HasDetected(self):  # noqa: N802
+        return False
+
+    def UpdateCurrentViewer(self):  # noqa: N802
+        pass
+
+
+def _a_move(x: int, y: int):
+    from PySide6.QtCore import QPointF
+    from PySide6.QtGui import QMouseEvent
+
+    return QMouseEvent(
+        QMouseEvent.Type.MouseMove,
+        QPointF(x, y),
+        QPointF(x, y),
+        Qt.MouseButton.NoButton,
+        Qt.MouseButton.NoButton,
+        Qt.KeyboardModifier.NoModifier,
+    )
 
 
 class TestColorStampMode:
