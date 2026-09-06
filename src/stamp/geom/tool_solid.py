@@ -242,6 +242,79 @@ def build_tool_solid(
     )
 
 
+def component_footprints(
+    profile: Profile,
+    placement: Placement,
+    tool: ToolSolid,
+) -> dict[str, TopoDS_Shape]:
+    """The placed but un-extruded outline of each artwork component.
+
+    The flat decal of :attr:`ToolSolid.footprint`, one per component instead of
+    all in one piece, so the preview can draw a two-colour logo in two colours.
+    Deliberately no extrusion and no boolean: this runs every time the preview is
+    redrawn, and what it has to show is where the artwork lands, which the 2D
+    footprint already says.
+    """
+    keys = [c.key for c in profile.components]
+    if len(keys) < 2:
+        return {}
+
+    sx, sy = placement.scale
+    if placement.mirror_u:
+        sx = -sx
+    if placement.mirror_v:
+        sy = -sy
+
+    out: dict[str, TopoDS_Shape] = {}
+    for key in keys:
+        if not profile.faces_of(key):
+            continue
+        shape = _scale_shape(profile.compound_of(key), sx, sy)
+        out[key] = BRepBuilderAPI_Transform(shape, tool.transform, True).Shape()
+    return out
+
+
+def component_prisms(
+    profile: Profile,
+    placement: Placement,
+    tool: ToolSolid,
+    *,
+    reach: float,
+) -> dict[str, TopoDS_Shape]:
+    """A tall prism per artwork component, for dividing a built body between them.
+
+    Not the tool solid over again.  This only has to *cover* the body, so it is
+    swept far past both ends instead of to the feature's exact depth - what
+    decides the split is the 2D footprint, which is the only thing the components
+    differ in.  Sweeping generously means none of the depth arithmetic (start
+    offset, contact overlap, draft) has to be replayed and kept in step.
+    """
+    keys = [c.key for c in profile.components]
+    if len(keys) < 2:
+        return {}
+
+    sx, sy = placement.scale
+    if placement.mirror_u:
+        sx = -sx
+    if placement.mirror_v:
+        sy = -sy
+
+    direction = gp_Vec(*tool.direction)
+    if direction.Magnitude() < 1e-12:
+        return {}
+    direction.Normalize()
+
+    prisms: dict[str, TopoDS_Shape] = {}
+    for key, footprint in component_footprints(profile, placement, tool).items():
+        shift = gp_Trsf()
+        shift.SetTranslation(direction.Multiplied(-reach / 2.0))
+        footprint = BRepBuilderAPI_Transform(footprint, shift, True).Shape()
+        maker = BRepPrimAPI_MakePrism(footprint, direction.Multiplied(reach), False, True)
+        if maker.IsDone():
+            prisms[key] = fuse_overlapping(maker.Shape())
+    return prisms
+
+
 def _placed_footprint(profile: Profile, placement: Placement, plane: Plane) -> TopoDS_Shape:
     """Apply the shared 2D placement transform without constructing an extrusion."""
     sx, sy = placement.scale

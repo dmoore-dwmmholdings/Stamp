@@ -41,6 +41,7 @@ class ProfileCache:
             outline_stroke_width=ref.outline_strokes,
             layers=ref.layers,
             extra_scale=ref.unit_scale,
+            keep_background=ref.keep_background,
         )
 
     def path_for(self, ref: ProfileRef) -> Path:

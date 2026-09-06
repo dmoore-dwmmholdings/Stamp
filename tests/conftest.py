@@ -16,6 +16,27 @@ def ensure_fixtures():
     return FIXTURES
 
 
+@pytest.fixture(scope="session", autouse=True)
+def scratch_settings(tmp_path_factory):
+    """Give the window its own settings rather than the developer's.
+
+    ``QSettings("Stamp", "Stamp")`` is the real registry key, so without this a
+    run both reads whatever preferences the machine happens to hold - a ribbon
+    left on large buttons fails three tests that ask for the default - and
+    writes the test's choices back into them.  Pointing the user scope at a
+    temporary directory keeps the run to itself.
+    """
+    from PySide6.QtCore import QSettings
+
+    from stamp.ui import main_window
+
+    path = tmp_path_factory.mktemp("settings") / "stamp.ini"
+    main_window.user_settings = lambda: QSettings(
+        str(path), QSettings.Format.IniFormat
+    )
+    return path
+
+
 @pytest.fixture
 def fixtures() -> Path:
     return FIXTURES

@@ -624,10 +624,13 @@ def export_3mf(
 
     With *write_colors* every triangle points at one entry of a colour group, and
     Bambu Studio and Orca offer to map those groups to filament slots on import,
-    in the order written here: the base first, the features second.  A slicer
-    makes a new filament for every colour it does not already have, so colours
-    that do not match the ones loaded arrive as extra entries the user has to
-    undo - which is why the caller asks rather than assuming.
+    in the order written here: the base first, then the features.  A body that
+    names its own colour - one artwork component the user singled out - gets its
+    own entry in that group, so a three-colour logo arrives as three filaments to
+    assign rather than one.  A slicer makes a new filament for every colour it
+    does not already have, so colours that do not match the ones loaded arrive as
+    extra entries the user has to undo - which is why the caller asks rather than
+    assuming.
 
     Without it the file carries no colour at all.  The parts are still separate
     and still named, so a filament can be given to each by hand, and nothing is
@@ -653,6 +656,25 @@ def export_3mf(
             raise ExportError(f"{value!r} is not a colour Stamp can write.")
         return "#" + text
 
+    # One entry per colour actually used, in the order a slicer will list them:
+    # the base first, then each feature colour as it is first met.  A body that
+    # names its own colour is an artwork component the user singled out, and gets
+    # a slot of its own.  Colours nothing uses are left out - every spare entry
+    # is a filament the user has to dismiss on the way in.
+    palette: list[str] = [color(base_color)]
+    slot: dict[int, int] = {}
+    for body in bodies:
+        if body.role == "base":
+            slot[id(body)] = 0
+            continue
+        wanted = color(body.color) if getattr(body, "color", "") else color(feature_color)
+        if wanted not in palette:
+            palette.append(wanted)
+        slot[id(body)] = palette.index(wanted)
+
+    def color_index(body) -> int:
+        return slot.get(id(body), 0)
+
     if write_colors:
         header = (
             '<?xml version="1.0" encoding="UTF-8"?>\n'
@@ -661,9 +683,8 @@ def export_3mf(
             f' xmlns:m="{MATERIAL_NS}">\n'
             " <resources>\n"
             '  <m:colorgroup id="1">\n'
-            f'   <m:color color="{color(base_color)}"/>\n'
-            f'   <m:color color="{color(feature_color)}"/>\n'
-            "  </m:colorgroup>\n"
+            + "".join(f'   <m:color color="{c}"/>\n' for c in palette)
+            + "  </m:colorgroup>\n"
         )
     else:
         # No colour group at all: nothing for a slicer to ask about on the way in.
@@ -677,7 +698,7 @@ def export_3mf(
     parts: list[str] = [header]
     for index, body in enumerate(bodies):
         object_id = index + 2
-        pindex = 0 if body.role == "base" else 1
+        pindex = color_index(body)
         colored = f' pid="1" pindex="{pindex}"' if write_colors else ""
         parts.append(
             f'  <object id="{object_id}" type="model" name={quoteattr(body.name)}'

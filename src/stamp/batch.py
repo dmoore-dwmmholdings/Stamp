@@ -157,7 +157,8 @@ def run_batch(template: str | Path, csv_path: str | Path, output_dir: str | Path
                 replaced = replace_part(document, part)
                 if not replaced.ok:
                     raise BatchError(replaced.summary())
-                engine = RebuildEngine(ProfileCache().get)
+                profiles = ProfileCache()
+                engine = RebuildEngine(profiles.get)
                 rebuilt = engine.rebuild(document)
                 output = output_dir / output_name
                 # A CSV is data, not permission to write outside the selected folder.
@@ -173,7 +174,12 @@ def run_batch(template: str | Path, csv_path: str | Path, output_dir: str | Path
                 elif fmt == "stl":
                     result = export_io.export_stl(geometry, output, mode=document.base.mode)
                 else:
-                    split = color_split.split_for_color(document, rebuilt)
+                    # The same cache the rebuild used: the per-colour split needs
+                    # to see the artwork again, and re-reading it per row is the
+                    # one cost a batch of a hundred parts cannot afford.
+                    split = color_split.split_for_color(
+                        document, rebuilt, profiles=profiles
+                    )
                     bodies = part_transform.transform_bodies(document, split.bodies)
                     result = export_io.export_3mf(bodies, output)
                     preflight.warnings.extend(split.warnings)

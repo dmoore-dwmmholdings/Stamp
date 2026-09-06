@@ -71,6 +71,21 @@ are presented as warnings so you can make the final call.
 
 ## The workflow
 
+Commands live on a ribbon across the top, in four tabs: **Home** for opening,
+saving and adding artwork, **Place** for aligning and datums, **Export** for
+every kind of output, and **View** for the camera and what is drawn. Each tab
+scrolls sideways rather than hiding anything, so a small window costs you a
+scroll and never a command. Save, undo and redo also sit at the right-hand end
+of the menu bar, where they are one click away from any tab. Everything is in
+the menu bar too.
+
+The ribbon is deliberately small — one row of labelled buttons, 56 px with the
+tab strip. **View → Large ribbon buttons** gives you labels under the icons in
+captioned groups instead, at about twice the height, and Stamp remembers which
+you chose. Double-click a tab (or Ctrl+F1) to collapse it to the tab strip
+altogether and give all of that back to the 3D view. It takes its colours from
+your desktop theme, light or dark.
+
 1. Open a part.
 2. Add a profile.
 3. Click the face it belongs on.
@@ -78,6 +93,26 @@ are presented as warnings so you can make the final call.
 5. Pick the depth and the operation.
 6. Add a fillet or chamfer if you want one.
 7. Export.
+
+## Moving the view
+
+A **navigation cube** sits in the top right of the 3D view. Click a face, edge or
+corner and the camera swings there. That is the quick way to a standard view.
+
+| | |
+|---|---|
+| Orbit | Middle-drag, or the arrow keys (15° a press) |
+| Quarter turn | Shift + an arrow key (90°, straight to the next face) |
+| Roll | Alt + Left / Right, or the Roll buttons on the View tab |
+| Pan | Right-drag, or Shift + middle-drag |
+| Zoom | Scroll wheel, at the cursor |
+| Standard views | The cube, keys 1–7, or the Views button |
+| Normal to a face | Ctrl+8 — looks straight down the selected stamp's face |
+| Fit | F |
+
+Keys 1–6 are front, back, left, right, top and bottom; 7 is isometric. The arrow
+keys act on the 3D view, so click in it first; roll and Normal to face work
+wherever the focus is.
 
 ## Wrap and patterns
 
@@ -216,6 +251,32 @@ feature. Raised artwork becomes its own solid, and engraved artwork becomes an
 inlay that fills the pocket flush with the surface — so a color printer can put
 the artwork in a second filament. Through cuts stay open.
 
+### Giving a piece of the artwork its own color
+
+A logo is rarely one color. Stamp reads an SVG's fill colors and groups it into
+components — every black path is one component, every red path another — and the
+Artwork colours panel lists them. Everything prints in the feature's color until
+you say otherwise; click a component's swatch and pick a color and that piece
+exports as its own body, in its own filament slot.
+
+A three-color logo therefore arrives in the slicer as three parts to assign
+rather than one. Colors nothing uses aren't written, so there is nothing spare to
+dismiss on the way in. "Print it all in one colour" undoes the lot.
+
+DXF and generated artwork (text, codes) are one component, so the panel doesn't
+appear for them.
+
+### Artwork that imports as a plain rectangle
+
+If an SVG comes in looking like a featureless slab the size of the whole drawing,
+it has a filled background layer — the white page rectangle most exporters put
+behind everything. Stamp detects one and leaves it out, because kept, it covers
+the artwork and is the only thing that would stamp. The panel says which color it
+dropped, and **Keep the background layer** puts it back if it was deliberate.
+
+A border is not a background: it surrounds the artwork but leaves the middle
+empty, so it survives.
+
 ### Color stamps
 
 A **color stamp** is the third operation, next to Add and Cut, for artwork that
@@ -246,7 +307,7 @@ When colors are on, the file is a standard 3MF. Each body carries its color on e
 through the 3MF materials extension — which is what Bambu Studio's color parser
 actually reads. Open it in Bambu Studio or Orca and a color parsing window
 appears; the colors map to filament slots in the order they are written, the
-base first and the artwork second. Other slicers see a plain multi-object 3MF
+base first and then each artwork color as it is met. Other slicers see a plain multi-object 3MF
 and let you assign a material per body.
 
 Bambu Studio reports "The 3mf file has invalid config, load geometry data only"
@@ -314,6 +375,50 @@ A `.stamp` project is a plain zip archive: a manifest, a copy of the part, a cop
 each profile, and a thumbnail. No geometry is stored — everything rebuilds from the
 sources. Any unzip tool can open one.
 
+## Files with several parts
+
+A 3MF from a slicer is usually an assembly. Stamp keeps the parts apart: they are
+listed under the part in the tree, each with a tick box. Untick one to hide it,
+or right-click for **Show this part on its own**.
+
+Click a face and the stamp goes on whichever part you clicked — the tree says how
+many are on each. Only that part is rebuilt, so stamping one bracket of a
+four-part file does not recompute the other three.
+
+When you export a 3MF, the dialog offers **Just <part>** as well as every part,
+so the lid you put the logo on is the only thing that goes to the printer.
+
+## Colours
+
+Artwork drawn in more than one colour prints in those colours without you doing
+anything: a green-and-black logo exports as a green body and a black body, each
+on its own filament slot. Pick different colours per piece in the properties
+panel if you want something else. The preview shows the same colours, so you can
+see where the artwork lands while you move it.
+
+## Updates
+
+Stamp can tell you when there is a newer version. It asks the first time it
+starts whether that is alright, and reads one small file from github.com at most
+once a day — nothing about you or your parts is sent. **Help → Check for
+updates** looks any time, and **Check for updates at startup** turns the
+automatic one on or off.
+
+When there is one, a bar appears under the ribbon. You can install it, install it
+when you next quit, read what changed, or skip that version. Stamp never
+installs over unsaved work and never restarts without being told to.
+
+On Windows, Stamp downloads the installer and runs it, then opens again by
+itself — the install is per-user, so there is no administrator prompt. On macOS
+and Linux the bar links to the release page instead.
+
+Every release is described by `latest.json`, which is signed with a key that
+lives only in the release workflow. Stamp verifies that signature before it will
+even read the file, and checks the installer's SHA-256 against it before running
+anything; a download that does not match is deleted. A build with no key
+compiled in does not check for updates at all rather than trusting whatever it
+is handed. To set that up, see `packaging/make_release_key.py`.
+
 ## Logs and crash reports
 
 Stamp writes a log on every start. On Windows it lives at
@@ -363,6 +468,61 @@ uv run pyinstaller packaging/stamp.spec --noconfirm --distpath build/dist --work
 
 Tagged releases build and attach the Windows installer plus macOS DMG and PKG
 installers for Intel and Apple silicon.
+
+### Signing releases, once
+
+Stamp will not offer an update it cannot prove came from you, so a release key
+has to exist before the update feed does. Generate one:
+
+```
+uv run python packaging/make_release_key.py
+```
+
+It prints two halves and saves neither. Paste the public half into
+`RELEASE_PUBLIC_KEY` in `src/stamp/update.py` and commit it; put the private
+half in the `STAMP_RELEASE_KEY` repository secret (Settings → Secrets and
+variables → Actions). The release workflow then writes and signs `latest.json`
+after the installers are built, and attaches it to the release.
+
+Without the secret the workflow skips the feed with a warning and everything
+else still builds — nobody is offered the release automatically, which is the
+safe way round. Keep the private half as carefully as a signing certificate:
+anyone holding it can publish something Stamp will install.
+
+## Running the tests
+
+```
+uv run pytest
+```
+
+Sixteen of the tests build a real window and two of those build the OpenCascade
+viewport, so a local run puts windows on your screen and takes focus while it
+goes. Qt's `offscreen` platform is not a way round it: the viewport tests hang on
+it, because OpenCascade needs a genuine GL surface, and its empty font database
+breaks the text tests as well.
+
+To run them without a desktop, run them in the container, which gives them an
+Xvfb display and Mesa's software renderer of their own:
+
+```
+docker/test.sh                    # the whole suite
+docker/test.sh tests/test_ui.py   # one file
+docker/test.sh -k ribbon          # anything pytest takes
+```
+
+The same container can take a picture of the window, which is how the chrome is
+checked without putting it on your desktop. Files land in `shots/`.
+
+```
+docker/shot.sh home.png --tab 0            # the whole window
+docker/shot.sh ribbon.png --tab 2 --ribbon-only
+docker/shot.sh dark.png --tab 0 --dark     # against a dark desktop palette
+docker/shot.sh large.png --tab 0 --large   # the roomy ribbon layout
+docker/shot.sh icons.png --icon-sheet      # every icon, at three sizes
+```
+
+The 3D view comes out black: Xvfb has no compositor, and the picture is taken
+from the widget rather than from the screen.
 
 ## Development
 

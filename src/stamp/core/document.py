@@ -625,6 +625,9 @@ class ProfileRef:
     unit_scale: float = 1.0  # extra scale the user applied at import
     join_tolerance: float = 0.01
     union_overlapping: bool = False
+    #: Keep a filled backdrop the importer would otherwise drop.  An import-time
+    #: option, so it is part of the cache key like the others.
+    keep_background: bool = False
     #: Set instead of *source_path* when the artwork is a message, not a file.
     text: TextSpec | None = None
     #: Set instead of source/text when the artwork is a QR or Data Matrix code.
@@ -651,6 +654,7 @@ class ProfileRef:
             "unit_scale": self.unit_scale,
             "join_tolerance": self.join_tolerance,
             "union_overlapping": self.union_overlapping,
+            "keep_background": self.keep_background,
         }
 
     @classmethod
@@ -665,6 +669,7 @@ class ProfileRef:
             unit_scale=float(d.get("unit_scale", 1.0)),
             join_tolerance=float(d.get("join_tolerance", 0.01)),
             union_overlapping=bool(d.get("union_overlapping", False)),
+            keep_background=bool(d.get("keep_background", False)),
             text=TextSpec.from_dict(d["text"]) if d.get("text") else None,
             code=CodeSpec.from_dict(d["code"]) if d.get("code") else None,
         )
@@ -680,6 +685,7 @@ class ProfileRef:
             self.unit_scale,
             self.join_tolerance,
             self.union_overlapping,
+            self.keep_background,
         )
 
 
@@ -697,6 +703,15 @@ class Feature:
     pattern: PatternSpec | None = None
     metadata: FeatureMetadata = field(default_factory=FeatureMetadata)
     inspection: InspectionSettings | None = None
+    #: Print colour per artwork component, keyed by the component key the profile
+    #: reports (§9).  Absent means "the same as the rest of the feature", which is
+    #: what every feature starts as and what most stay as - so an empty mapping is
+    #: the normal state, not an unset one.
+    component_colors: dict[str, str] = field(default_factory=dict)
+    #: Which part of a multi-part file this sits on, as an index into
+    #: :attr:`BasePart.parts`.  -1 means the whole thing, which is every feature
+    #: on a file that arrived as one part.
+    part_index: int = -1
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -710,7 +725,18 @@ class Feature:
             "pattern": self.pattern.to_dict() if self.pattern else None,
             "metadata": self.metadata.to_dict(),
             "inspection": self.inspection.to_dict() if self.inspection else None,
+            "component_colors": dict(self.component_colors),
+            "part_index": self.part_index,
         }
+
+    def color_for(self, key: str, default: str) -> str:
+        """The colour this feature prints *key* in, or *default* if it never said."""
+        return self.component_colors.get(key) or default
+
+    @property
+    def is_multicolor(self) -> bool:
+        """True when the user has singled out at least one component."""
+        return len(set(self.component_colors.values())) > 0
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> Feature:
@@ -725,6 +751,10 @@ class Feature:
             pattern=PatternSpec.from_dict(d["pattern"]) if d.get("pattern") else None,
             metadata=FeatureMetadata.from_dict(d.get("metadata", {})),
             inspection=InspectionSettings.from_dict(d["inspection"]) if d.get("inspection") else None,
+            part_index=int(d.get("part_index", -1)),
+            component_colors={
+                str(k): str(v) for k, v in (d.get("component_colors") or {}).items()
+            },
         )
 
     def copy_with_new_id(self, name: str | None = None) -> Feature:
@@ -777,6 +807,69 @@ class Feature:
 
 
 @dataclass
+class PartBody:
+    """One named part of a multi-part file - spec §4.2.
+
+    A 3MF from a slicer is usually an assembly: a base, a lid, four copies of a
+    clip.  Stamp used to flatten all of that into one mesh on the way in, so
+    there was no way to say "put the logo on the lid" or "export just the lid".
+
+    The geometry Stamp works on is still the whole assembly - picking, rebuilding
+    and every boolean are unchanged, which is what keeps this from touching the
+    engine.  What is kept here is identity: which piece is which, so the tree can
+    list them, the viewport can hide them, and an export can be asked for one.
+    """
+
+    name: str = "Part"
+    #: Index into :attr:`BasePart.parts`, and the stable id a feature stores.
+    index: int = 0
+    visible: bool = True
+    triangle_count: int = 0
+    bbox: tuple[float, float, float, float, float, float] = (0, 0, 0, 0, 0, 0)
+    #: The live geometry for this part alone.  Never serialized, like BasePart's.
+    runtime: Any = field(default=None, repr=False, compare=False)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "name": self.name,
+            "index": self.index,
+            "visible": self.visible,
+            "triangle_count": self.triangle_count,
+            "bbox": list(self.bbox),
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> PartBody:
+        return cls(
+            name=str(d.get("name", "Part")),
+            index=int(d.get("index", 0)),
+            visible=bool(d.get("visible", True)),
+            triangle_count=int(d.get("triangle_count", 0)),
+            bbox=tuple(d.get("bbox", (0, 0, 0, 0, 0, 0))),
+        )
+
+    @property
+    def center(self) -> tuple[float, float, float]:
+        x0, y0, z0, x1, y1, z1 = self.bbox
+        return ((x0 + x1) / 2.0, (y0 + y1) / 2.0, (z0 + z1) / 2.0)
+
+    def contains(self, point: tuple[float, float, float], slack: float = 1e-6) -> bool:
+        """Whether *point* is inside this part's box, with a little slack.
+
+        Boxes, not geometry: this decides which part a clicked face belongs to,
+        the click is already known to be on the surface of something, and a box
+        test cannot be defeated by a mesh that is not quite watertight.
+        """
+        x0, y0, z0, x1, y1, z1 = self.bbox
+        x, y, z = point
+        return (
+            x0 - slack <= x <= x1 + slack
+            and y0 - slack <= y <= y1 + slack
+            and z0 - slack <= z <= z1 + slack
+        )
+
+
+@dataclass
 class BasePart:
     """The imported 3D part - immutable once loaded, spec §4.2.
 
@@ -796,6 +889,9 @@ class BasePart:
     valid: bool = True
     warnings: list[str] = field(default_factory=list)
     runtime: Any = field(default=None, repr=False, compare=False)
+    #: The named pieces this file arrived as.  Empty for a file that is one
+    #: part, which is most of them and behaves exactly as it always did.
+    parts: list[PartBody] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -810,6 +906,7 @@ class BasePart:
             "watertight": self.watertight,
             "valid": self.valid,
             "warnings": list(self.warnings),
+            "parts": [p.to_dict() for p in self.parts],
         }
 
     @classmethod
@@ -826,7 +923,28 @@ class BasePart:
             watertight=bool(d.get("watertight", True)),
             valid=bool(d.get("valid", True)),
             warnings=list(d.get("warnings", [])),
+            parts=[PartBody.from_dict(p) for p in (d.get("parts") or [])],
         )
+
+    def part_at(self, point: tuple[float, float, float]) -> PartBody | None:
+        """Which part a picked point belongs to, or None when the file is one part.
+
+        Boxes overlap in a printed assembly - a lid sits inside the envelope of
+        the box it closes - so the smallest box that contains the point wins.
+        The smaller box is the more specific answer.
+        """
+        holding = [p for p in self.parts if p.contains(point)]
+        if not holding:
+            return None
+        def volume(part: PartBody) -> float:
+            dx = part.bbox[3] - part.bbox[0]
+            dy = part.bbox[4] - part.bbox[1]
+            dz = part.bbox[5] - part.bbox[2]
+            return abs(dx * dy * dz)
+        return min(holding, key=volume)
+
+    def part_named(self, name: str) -> PartBody | None:
+        return next((p for p in self.parts if p.name == name), None)
 
     @property
     def size(self) -> tuple[float, float, float]:

@@ -871,6 +871,8 @@ class Color3mfDialog(QDialog):
         base_color: str | None = None,
         feature_color: str | None = None,
         write_colors: bool = True,
+        parts: list | None = None,
+        features_on: list | None = None,
         parent=None,
     ) -> None:
         super().__init__(parent)
@@ -899,6 +901,28 @@ class Color3mfDialog(QDialog):
             )
             stamps.setWordWrap(True)
             layout.addWidget(stamps)
+
+        # A file that arrived as an assembly can go out as one part of it, which
+        # is usually the point: the logo went on the lid, and the lid is what
+        # goes to the printer.
+        self.part_box: QComboBox | None = None
+        if parts and len(parts) > 1:
+            self.part_box = QComboBox()
+            self.part_box.addItem("Every part", -1)
+            for part in parts:
+                held = sum(1 for f in (features_on or []) if f == part.index)
+                caption = f"Just {part.name}"
+                if held:
+                    caption += f"   ({held} on it)"
+                self.part_box.addItem(caption, part.index)
+            chosen = next((p.index for p in parts if any(
+                f == p.index for f in (features_on or []))), None)
+            if chosen is not None:
+                self.part_box.setCurrentIndex(self.part_box.findData(chosen))
+            row = QHBoxLayout()
+            row.addWidget(QLabel("Export"))
+            row.addWidget(self.part_box, 1)
+            layout.addLayout(row)
 
         self.color_box = QCheckBox("Write these colors into the file")
         self.color_box.setChecked(write_colors)
@@ -958,6 +982,13 @@ class Color3mfDialog(QDialog):
 
     def write_colors(self) -> bool:
         return self.color_box.isChecked()
+
+    def part_index(self) -> int | None:
+        """Which part to write, or None for the whole assembly."""
+        if self.part_box is None:
+            return None
+        value = int(self.part_box.currentData())
+        return None if value < 0 else value
 
     def _paint_buttons(self) -> None:
         for button, value in (

@@ -16,6 +16,7 @@ from stamp.batch import BatchError, run_batch
 from stamp.core.profiles import ProfileCache
 from stamp.core.rebuild import RebuildEngine
 from stamp.io import export as export_io
+from stamp.io.import_process import WORKER_COMMAND, run_worker
 from stamp.io.part_import import PART_EXTS, import_part
 from stamp.io.project import open_project
 
@@ -31,6 +32,15 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--project")
     parser.add_argument("--output")
     args, _unknown = parser.parse_known_args(argv[1:])
+    if args.command == WORKER_COMMAND:
+        # A second copy of Stamp, started to read one part file and hand it back.
+        # It must not touch Qt: the point of it is that this process has none of
+        # OpenCascade's GIL-holding work to do.  See stamp.io.import_process.
+        rest = [a for a in argv[2:] if not a.startswith("-")]
+        if not rest:
+            print(f"stamp {WORKER_COMMAND} needs a request file", file=sys.stderr)
+            return 2
+        return run_worker(rest[0])
     if args.command == "batch":
         if not all((args.template, args.csv, args.output_dir, args.format)):
             print("stamp batch requires --template, --csv, --output-dir, and --format", file=sys.stderr)
@@ -95,6 +105,10 @@ def main(argv: list[str] | None = None) -> int:
 
     # Ask about a crash only once the window is up, so the dialog has a parent.
     QTimer.singleShot(0, window.offer_crash_report)
+    # And the update check after that, for the same reason and one more: it is
+    # started here rather than in the window's constructor so that building a
+    # window - which every UI test does - never makes a network call.
+    QTimer.singleShot(0, window.begin_update_check)
 
     return app.exec()
 

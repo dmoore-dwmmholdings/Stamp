@@ -16,7 +16,18 @@ from stamp.geom.part_transform import PartTransformError
 
 
 def points(shape, deflection: float = 0.1) -> np.ndarray:
-    verts, _ = mesh_ops.triangulate(shape, deflection)
+    """The mesh vertices, always meshed here rather than possibly earlier.
+
+    OpenCascade stores a triangulation on the shape and reuses one that is
+    already fine enough, and the part fixtures are session-scoped - so a test
+    that meshed the part more finely leaves that mesh behind for this one, and
+    the comparison is then between an old mesh and a fresh one.  A copy carries
+    no triangulation, so both sides of every comparison here are meshed at the
+    same deflection.
+    """
+    from OCP.BRepBuilderAPI import BRepBuilderAPI_Copy
+
+    verts, _ = mesh_ops.triangulate(BRepBuilderAPI_Copy(shape).Shape(), deflection)
     return verts
 
 

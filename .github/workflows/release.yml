@@ -78,3 +78,52 @@ jobs:
         run: |
           tag="${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.event.release.tag_name }}"
           gh release upload "$tag" build/*-macos-${{ matrix.arch }}.dmg build/*-macos-${{ matrix.arch }}.pkg --clobber
+
+  # The update feed.  Stamp will not read a manifest it cannot verify, so this
+  # runs last, over the installers the other jobs have already attached, and
+  # signs the result with the key held in the STAMP_RELEASE_KEY secret.
+  #
+  # No secret, no manifest - and no manifest simply means nobody is offered the
+  # update.  That is the safe way round: publishing an unsigned one would be
+  # rejected by every client anyway.
+  manifest:
+    needs: [windows-installer, macos-installer]
+    if: always() && !cancelled()
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && 'main' || github.ref }}
+      - uses: astral-sh/setup-uv@v5
+      - name: Collect the installers from the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.event.release.tag_name }}"
+          mkdir -p assets
+          gh release download "$tag" --dir assets \
+            --pattern '*-Setup.exe' --pattern '*.dmg' || true
+          ls -l assets
+      - name: Write and sign the manifest
+        id: sign
+        env:
+          STAMP_RELEASE_KEY: ${{ secrets.STAMP_RELEASE_KEY }}
+        run: |
+          if [ -z "$STAMP_RELEASE_KEY" ]; then
+            echo "::warning::STAMP_RELEASE_KEY is not set, so no update feed is published and nobody is offered this release automatically. See packaging/make_release_key.py."
+            exit 0
+          fi
+          tag="${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.event.release.tag_name }}"
+          uv run --no-project --with cryptography python packaging/make_manifest.py \
+            --version "${tag#v}" --tag "$tag" --assets assets \
+            --repo "${{ github.repository }}" --output feed
+          echo "signed=true" >> "$GITHUB_OUTPUT"
+      - name: Attach the feed to the release
+        if: steps.sign.outputs.signed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.event.release.tag_name }}"
+          gh release upload "$tag" \
+            feed/latest.json feed/latest.json.sig feed/SHA256SUMS --clobber

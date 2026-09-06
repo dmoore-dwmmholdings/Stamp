@@ -11,6 +11,7 @@ from __future__ import annotations
 from dataclasses import replace
 
 from PySide6.QtCore import Qt, Signal
+from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
     QButtonGroup,
     QCheckBox,
@@ -99,6 +100,25 @@ class NumberField(QDoubleSpinBox):
         self.blockSignals(blocked)
 
 
+def _is_light(color: str) -> bool:
+    """Whether black text reads better than white on *color*.
+
+    A swatch has to show the colour and stay legible, and a fixed text colour
+    fails at one end or the other of the range.  Rec. 601 luma, which is what
+    every "is this dark?" check in a UI ends up being.
+    """
+    text = str(color).strip().lstrip("#")
+    if len(text) == 3:
+        text = "".join(c * 2 for c in text)
+    if len(text) != 6:
+        return False
+    try:
+        r, g, b = (int(text[i:i + 2], 16) for i in (0, 2, 4))
+    except ValueError:
+        return False
+    return (0.299 * r + 0.587 * g + 0.114 * b) > 140
+
+
 class PropertiesPanel(QScrollArea):
     """Contextual to the tree selection.  Empty state shows base part info (§7)."""
 
@@ -120,6 +140,9 @@ class PropertiesPanel(QScrollArea):
 
         self._document: Document | None = None
         self._feature: Feature | None = None
+        #: The normalized artwork of the selected feature, when the caller has it.
+        #: Only the colour list needs it, and only to name the pieces.
+        self._profile = None
         self._native_size = (1.0, 1.0)
         self._updating = False
         #: Held so a kind change can redraw the modifier rows, whose captions read
@@ -136,6 +159,7 @@ class PropertiesPanel(QScrollArea):
         self._transform = self._build_transform()
         self._text = self._build_text()
         self._code = self._build_code()
+        self._components = self._build_components()
         self._metadata = self._build_metadata()
         self._placement = self._build_placement()
         self._operation = self._build_operation()
@@ -143,7 +167,8 @@ class PropertiesPanel(QScrollArea):
         self._modifiers = self._build_modifiers()
 
         for widget in (
-            self._empty, self._transform, self._text, self._code, self._metadata,
+            self._empty, self._transform, self._text, self._code,
+            self._components, self._metadata,
             self._placement, self._operation, self._pattern, self._modifiers,
         ):
             self._layout.addWidget(widget)
@@ -340,6 +365,167 @@ class PropertiesPanel(QScrollArea):
         self.code_module.valueChanged.connect(self._on_code_changed)
         form.addRow("Module:", self.code_module)
         return box
+
+    def _build_components(self) -> QWidget:
+        """Per-colour control over the artwork - spec §9.
+
+        Everything prints in one colour until the user says otherwise, so this
+        starts as a list of swatches all showing the same thing.  Giving one of
+        them its own colour is what turns a feature into several bodies at export
+        and several filaments in the slicer.
+        """
+        box = QGroupBox("Artwork colours")
+        layout = QVBoxLayout(box)
+        layout.setSpacing(6)
+
+        self._component_rows = QWidget()
+        self._component_layout = QVBoxLayout(self._component_rows)
+        self._component_layout.setContentsMargins(0, 0, 0, 0)
+        self._component_layout.setSpacing(4)
+        layout.addWidget(self._component_rows)
+
+        self.component_reset = QPushButton("Print it all in one colour")
+        self.component_reset.setToolTip(
+            "Forget the per-colour choices and let the whole feature take the "
+            "export colour again."
+        )
+        self.component_reset.clicked.connect(self._on_components_reset)
+        layout.addWidget(self.component_reset)
+
+        self.background_note = QLabel()
+        self.background_note.setWordWrap(True)
+        self.background_note.setStyleSheet("color: #c58a2a;")
+        layout.addWidget(self.background_note)
+
+        self.keep_background = QCheckBox("Keep the background layer")
+        self.keep_background.setToolTip(
+            "Put the filled backdrop back into the artwork. It covers everything "
+            "behind it, so the stamp becomes a solid panel."
+        )
+        self.keep_background.toggled.connect(self._on_keep_background)
+        layout.addWidget(self.keep_background)
+        return box
+
+    def _clear_component_rows(self) -> None:
+        while self._component_layout.count():
+            item = self._component_layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+
+    def _fill_components(self, feature: Feature, profile) -> None:
+        """Rebuild the swatch list for whatever artwork this feature points at."""
+        self._clear_component_rows()
+        components = list(getattr(profile, "components", []) or [])
+        dropped = getattr(profile, "dropped_background", None) if profile else None
+
+        # One component is not a choice, so the whole box goes away rather than
+        # showing a single swatch that does nothing.
+        self._components.setVisible(len(components) > 1 or dropped is not None)
+        self.component_reset.setVisible(bool(feature.component_colors))
+        self.component_reset.setEnabled(bool(feature.component_colors))
+
+        for component in components:
+            self._component_layout.addWidget(
+                self._component_row(feature, component)
+            )
+
+        if dropped is not None:
+            self.background_note.setText(
+                f"A filled {dropped.label.lower()} backdrop covered the whole "
+                f"drawing, so Stamp left it out."
+            )
+            self.background_note.setVisible(True)
+            self.keep_background.setVisible(True)
+        else:
+            self.background_note.setVisible(False)
+            self.keep_background.setVisible(feature.profile.keep_background)
+        self._updating = True
+        self.keep_background.setChecked(feature.profile.keep_background)
+        self._updating = False
+
+    def _component_row(self, feature: Feature, component) -> QWidget:
+        row = QWidget()
+        layout = QHBoxLayout(row)
+        layout.setContentsMargins(0, 0, 0, 0)
+
+        name = QLabel(component.label)
+        name.setToolTip(
+            f"{component.element_count} shape"
+            f"{'' if component.element_count == 1 else 's'} drawn in "
+            f"{component.color or 'this colour'}"
+        )
+        layout.addWidget(name, 1)
+
+        chosen = feature.component_colors.get(component.key, "")
+        swatch = QPushButton("Same as the rest" if not chosen else chosen.upper())
+        swatch.setMinimumWidth(150)
+        swatch.setStyleSheet(self._swatch_style(chosen or component.color))
+        swatch.clicked.connect(
+            lambda _checked=False, key=component.key, source=component.color:
+            self._pick_component_color(key, source)
+        )
+        layout.addWidget(swatch)
+
+        clear = QPushButton("Reset")
+        clear.setFixedWidth(60)
+        clear.setEnabled(bool(chosen))
+        clear.setToolTip("Let this piece take the export colour again.")
+        clear.clicked.connect(
+            lambda _checked=False, key=component.key: self._clear_component_color(key)
+        )
+        layout.addWidget(clear)
+        return row
+
+    @staticmethod
+    def _swatch_style(color: str) -> str:
+        if not color:
+            return ""
+        return (
+            f"QPushButton {{ background: {color}; "
+            f"color: {'#101010' if _is_light(color) else '#f0f0f0'}; "
+            f"border: 1px solid #4a4a4a; padding: 4px; }}"
+        )
+
+    def _pick_component_color(self, key: str, source: str) -> None:
+        if self._feature is None:
+            return
+        from PySide6.QtWidgets import QColorDialog
+
+        start = self._feature.component_colors.get(key) or source or "#808080"
+        picked = QColorDialog.getColor(
+            QColor(start), self, "Print this piece in"
+        )
+        if not picked.isValid():
+            return
+        self._feature.component_colors[key] = picked.name()
+        self._fill_components(self._feature, self._profile)
+        self.changed.emit("artwork colour")
+
+    def _clear_component_color(self, key: str) -> None:
+        if self._feature is None:
+            return
+        if self._feature.component_colors.pop(key, None) is None:
+            return
+        self._fill_components(self._feature, self._profile)
+        self.changed.emit("artwork colour")
+
+    def _on_components_reset(self) -> None:
+        if self._feature is None or not self._feature.component_colors:
+            return
+        self._feature.component_colors.clear()
+        self._fill_components(self._feature, self._profile)
+        self.changed.emit("artwork colour")
+
+    def _on_keep_background(self, on: bool) -> None:
+        if self._updating or self._feature is None:
+            return
+        if self._feature.profile.keep_background == on:
+            return
+        self._feature.profile.keep_background = on
+        # An import-time option, so the artwork has to be read again; the caller
+        # rebuilds, which goes back through the profile cache under a new key.
+        self.changed.emit("background layer")
 
     def _build_metadata(self) -> QWidget:
         box = QGroupBox("Manufacturing")
@@ -686,10 +872,14 @@ class PropertiesPanel(QScrollArea):
         self, part: BasePart | None, units: str = "mm", document: Document | None = None
     ) -> None:
         self._feature = None
+        self._profile = None
         self._document = document if document is not None else self._document
         self._empty.setVisible(True)
         self._transform.setVisible(part is not None)
-        for widget in (self._text, self._placement, self._operation, self._pattern, self._modifiers):
+        for widget in (
+            self._text, self._code, self._components, self._metadata,
+            self._placement, self._operation, self._pattern, self._modifiers,
+        ):
             widget.setVisible(False)
         self._refresh_transform(part, units)
 
@@ -726,9 +916,11 @@ class PropertiesPanel(QScrollArea):
         native_size: tuple[float, float],
         *,
         mesh_mode: bool = False,
+        profile=None,
     ) -> None:
         self._document = document
         self._feature = feature
+        self._profile = profile
         self._native_size = (max(native_size[0], 1e-9), max(native_size[1], 1e-9))
 
         self._empty.setVisible(False)
@@ -743,6 +935,7 @@ class PropertiesPanel(QScrollArea):
         if feature.profile.is_code:
             self._fill_code(feature)
         self._fill_metadata(feature)
+        self._fill_components(feature, profile)
 
         self._updating = True
         placement = feature.placement

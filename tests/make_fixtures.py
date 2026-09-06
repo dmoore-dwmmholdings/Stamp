@@ -158,8 +158,78 @@ SVG_SELF_INTERSECTING = """<?xml version="1.0" encoding="UTF-8"?>
 """
 
 
+SVG_TWO_COLOR = """<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="40mm" height="20mm"
+     viewBox="0 0 40 20">
+  <circle cx="12" cy="10" r="6" fill="#000000"/>
+  <rect x="24" y="5" width="10" height="10" fill="#ff0000"/>
+</svg>
+"""
+
+SVG_BACKGROUND = """<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="40mm" height="20mm"
+     viewBox="0 0 40 20">
+  <rect x="0" y="0" width="40" height="20" fill="#ffffff"/>
+  <circle cx="12" cy="10" r="6" fill="#000000"/>
+  <rect x="24" y="5" width="10" height="10" fill="#ff0000"/>
+</svg>
+"""
+
+#: A border, not a backdrop.  It surrounds the artwork and its bounding box
+#: contains everything, but it leaves the middle empty, so it must survive.
+SVG_BORDERED = """<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="40mm" height="20mm"
+     viewBox="0 0 40 20">
+  <path d="M 0 0 L 40 0 L 40 20 L 0 20 Z M 2 2 L 2 18 L 38 18 L 38 2 Z"
+        fill="#0000ff" fill-rule="evenodd"/>
+  <circle cx="20" cy="10" r="5" fill="#000000"/>
+</svg>
+"""
+
+
+#: A backdrop the exporter already carved the drawing out of: one path, evenodd,
+#: with the artwork as subpaths, and the artwork drawn again on top in its own
+#: colours.  Its *material* is the page minus the drawing, so it covers well
+#: under the 95% a backdrop is recognised by - and it used to survive as a solid
+#: slab the size of the whole image.  Every logo traced from a bitmap looks like
+#: this.
+SVG_KNOCKOUT = """<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="40mm" height="20mm"
+     viewBox="0 0 40 20">
+  <path d="M 0 0 L 40 0 L 40 20 L 0 20 Z
+           M 8 5 L 16 5 L 16 15 L 8 15 Z
+           M 24 5 L 32 5 L 32 15 L 24 15 Z"
+        fill="#ffffff" fill-rule="evenodd"/>
+  <rect x="8" y="5" width="8" height="10" fill="#000000"/>
+  <rect x="24" y="5" width="8" height="10" fill="#ff0000"/>
+</svg>
+"""
+
+
+def make_assembly_3mf(path: Path) -> None:
+    """Two separate boxes in one 3MF, which is what a slicer file looks like.
+
+    Stamp used to flatten this into a single mesh on the way in, so there was no
+    way to say which part a stamp went on or to export one of them.
+    """
+    import trimesh
+
+    lid = trimesh.creation.box(extents=(40, 20, 4))
+    lid.apply_translation((0, 0, 22))
+    body = trimesh.creation.box(extents=(40, 20, 20))
+    body.apply_translation((0, 0, 10))
+    scene = trimesh.Scene()
+    scene.add_geometry(body, geom_name="body")
+    scene.add_geometry(lid, geom_name="lid")
+    path.write_bytes(scene.export(file_type="3mf"))
+
+
 def make_svgs() -> None:
     (FIXTURES / "logo.svg").write_text(SVG_LOGO, encoding="utf-8")
+    (FIXTURES / "two_color.svg").write_text(SVG_TWO_COLOR, encoding="utf-8")
+    (FIXTURES / "background.svg").write_text(SVG_BACKGROUND, encoding="utf-8")
+    (FIXTURES / "bordered.svg").write_text(SVG_BORDERED, encoding="utf-8")
+    (FIXTURES / "knockout.svg").write_text(SVG_KNOCKOUT, encoding="utf-8")
     (FIXTURES / "stroke_only.svg").write_text(SVG_STROKE_ONLY, encoding="utf-8")
     (FIXTURES / "live_text.svg").write_text(SVG_LIVE_TEXT, encoding="utf-8")
     (FIXTURES / "unitless.svg").write_text(SVG_UNITLESS, encoding="utf-8")
@@ -346,6 +416,7 @@ def main() -> None:
     make_bracket_moved(FIXTURES / "bracket_moved.step")
     make_bracket_rev_b_stl(FIXTURES / "bracket_rev_b.stl")
     make_leaky_stl(FIXTURES / "leaky.stl")
+    make_assembly_3mf(FIXTURES / "assembly.3mf")
     make_svgs()
     make_dxf(FIXTURES / "profile.dxf")
     make_open_loop_dxf(FIXTURES / "open_loop.dxf")

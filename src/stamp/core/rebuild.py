@@ -53,8 +53,22 @@ class FeatureResult:
 
 
 @dataclass
+class PartGeometry:
+    """One part of a multi-part file, after its own features were applied."""
+
+    index: int
+    name: str
+    geometry: object
+    #: False when the part was passed through untouched - nothing is on it, so
+    #: nothing was recomputed.
+    rebuilt: bool = False
+
+
+@dataclass
 class RebuildResult:
     #: ``TopoDS_Shape`` in solid mode, ``manifold3d.Manifold`` in mesh mode.
+    #: For a multi-part file this is every part composed back together, which is
+    #: what the exporters and the volume have always been given.
     geometry: object | None = None
     mode: str = "solid"
     features: list[FeatureResult] = field(default_factory=list)
@@ -62,6 +76,12 @@ class RebuildResult:
     volume: float = 0.0
     #: True when every feature applied cleanly.
     ok: bool = True
+    #: The parts, each rebuilt on its own.  Empty for a file that is one part,
+    #: which is most of them and behaves exactly as it always did.
+    parts: list[PartGeometry] = field(default_factory=list)
+
+    def part(self, index: int) -> PartGeometry | None:
+        return next((p for p in self.parts if p.index == index), None)
 
     def result_for(self, feature_id: str) -> FeatureResult | None:
         for f in self.features:
@@ -147,6 +167,11 @@ class RebuildEngine:
         result = RebuildResult(mode=mode)
 
         enabled = [f for f in document.features if f.enabled]
+        if document.base.parts:
+            return self._rebuild_parts(
+                document, enabled, result, start,
+                should_cancel=should_cancel, progress=progress,
+            )
         geometry, resume_at = self._resume_point(document, enabled)
 
         for index, feature in enumerate(enabled):
@@ -191,6 +216,152 @@ class RebuildEngine:
         result.duration_ms = (time.perf_counter() - start) * 1000.0
         result.volume = self._volume(geometry, mode)
         return result
+
+    def _rebuild_parts(
+        self,
+        document: Document,
+        enabled: list[Feature],
+        result: RebuildResult,
+        start: float,
+        *,
+        should_cancel: Callable[[], bool] | None,
+        progress: Callable[[int, int, str], None] | None,
+    ) -> RebuildResult:
+        """Rebuild each part of an assembly on its own, then put them back together.
+
+        Cheaper than the old whole-assembly rebuild, not dearer: a part with
+        nothing on it is passed straight through, so stamping the lid of an
+        eleven-part box does boolean work on the lid alone instead of on all
+        eleven parts fused into one mesh.
+
+        Anchors still resolve against the whole assembly - a face is where it is
+        regardless of which part is being rebuilt - so only the geometry the
+        features are applied *to* is per part.
+        """
+        mode = document.base.mode
+        pieces: list[PartGeometry] = []
+        for part in document.base.parts:
+            mine = [f for f in enabled if f.part_index == part.index]
+            if not mine or part.runtime is None:
+                pieces.append(PartGeometry(part.index, part.name, part.runtime))
+                continue
+            geometry, rows = self._run_features(
+                document, mine, part.runtime, mode,
+                should_cancel=should_cancel, progress=progress, result=result,
+            )
+            pieces.append(PartGeometry(part.index, part.name, geometry, rebuilt=True))
+            result.features.extend(rows)
+
+        # A feature whose part is gone - the file was replaced by one with fewer
+        # parts - would otherwise vanish from the tree with no explanation.
+        known = {p.index for p in document.base.parts}
+        for feature in enabled:
+            if feature.part_index not in known and feature.part_index != -1:
+                row = FeatureResult(feature_id=feature.id)
+                row.errors.append(
+                    f"{feature.name}: the part it was on is not in this file."
+                )
+                row.ok = False
+                result.features.append(row)
+
+        # Features that never named a part go on the whole assembly, which is
+        # what every feature placed before this existed did.
+        loose = [f for f in enabled if f.part_index == -1]
+        if loose:
+            whole = self._compose([p.geometry for p in pieces], mode)
+            geometry, rows = self._run_features(
+                document, loose, whole, mode,
+                should_cancel=should_cancel, progress=progress, result=result,
+            )
+            result.features.extend(rows)
+            result.geometry = geometry
+            pieces = [PartGeometry(-1, "Assembly", geometry, rebuilt=True)]
+        else:
+            result.geometry = self._compose([p.geometry for p in pieces], mode)
+
+        result.parts = pieces
+        result.ok = not any(r.broken for r in result.features)
+        result.features = self._in_document_order(document, result.features)
+        result.duration_ms = (time.perf_counter() - start) * 1000.0
+        result.volume = self._volume(result.geometry, mode)
+        return result
+
+    @staticmethod
+    def _in_document_order(document: Document, rows: list[FeatureResult]) -> list[FeatureResult]:
+        """The tree reads top to bottom; rebuilding by part does not."""
+        order = {f.id: i for i, f in enumerate(document.features)}
+        return sorted(rows, key=lambda r: order.get(r.feature_id, len(order)))
+
+    @staticmethod
+    def _compose(pieces: list, mode: str):
+        """Put disjoint parts back into one shape, without a boolean.
+
+        The parts of a printed assembly do not overlap, so nothing has to be
+        resolved between them - which is why this is free on a sound mesh and a
+        full union would not be.
+        """
+        pieces = [p for p in pieces if p is not None]
+        if not pieces:
+            return None
+        if len(pieces) == 1:
+            return pieces[0]
+        if mode == "solid":
+            # Parts come from mesh files today, so this is here for the day a
+            # STEP assembly gets the same treatment rather than for use now.
+            from OCP.BRep import BRep_Builder
+            from OCP.TopoDS import TopoDS_Compound
+
+            compound = TopoDS_Compound()
+            builder = BRep_Builder()
+            builder.MakeCompound(compound)
+            for piece in pieces:
+                builder.Add(compound, piece)
+            return compound
+        from manifold3d import Manifold
+
+        return Manifold.compose(pieces)
+
+    def _run_features(
+        self,
+        document: Document,
+        features: list[Feature],
+        geometry: object,
+        mode: str,
+        *,
+        should_cancel: Callable[[], bool] | None,
+        progress: Callable[[int, int, str], None] | None,
+        result: RebuildResult,
+    ) -> tuple[object, list[FeatureResult]]:
+        """Apply *features* in order to *geometry*.  No cache: see below.
+
+        The per-feature cache is keyed on the whole document's feature list, and
+        a part rebuilds only its own, so the key would not mean what it says.
+        Parts make that matter far less than it did - the work skipped by the
+        cache is now mostly skipped by not touching untouched parts at all.
+        """
+        rows: list[FeatureResult] = []
+        for index, feature in enumerate(features):
+            if should_cancel and should_cancel():
+                raise Cancelled()
+
+            def report(step: str, _i=index, _f=feature) -> None:
+                if progress:
+                    progress(_i + 1, len(features), f"{_f.name} - {step}")
+
+            report("start")
+            row = FeatureResult(feature_id=feature.id)
+            for instance in feature.pattern_instances():
+                geometry, one = self._apply_feature(
+                    document, instance, geometry, mode, report=report
+                )
+                row.warnings.extend(one.warnings)
+                row.errors.extend(one.errors)
+                row.failed_edges.extend(one.failed_edges)
+                row.suggested_values.update(one.suggested_values)
+                row.tool = one.tool
+            row.ok = not row.errors
+            rows.append(row)
+        return geometry, rows
 
     @staticmethod
     def _anchor_shape(document: Document, feature: Feature, geometry: object, mode: str):
