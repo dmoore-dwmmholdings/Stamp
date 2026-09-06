@@ -10,7 +10,7 @@
 ; administrator password.
 
 #define AppName "Stamp"
-#define AppVersion "1.1.1"
+#define AppVersion "1.5.0"
 #define AppPublisher "DWMM Holdings"
 #define AppExeName "Stamp.exe"
 #define SourceDir "..\build\dist\Stamp"
@@ -33,9 +33,16 @@ SolidCompression=yes
 WizardStyle=modern
 ArchitecturesInstallIn64BitMode=x64compatible
 ArchitecturesAllowed=x64compatible
-; Per-user, so a tester needs no administrator password.
+; Per-user, so a tester needs no administrator password.  This is also what lets
+; Stamp update itself without a UAC prompt: {autopf} under "lowest" resolves to
+; %LOCALAPPDATA%\Programs, which the user can already write to.
 PrivilegesRequired=lowest
 PrivilegesRequiredOverridesAllowed=dialog
+; Stamp starts this installer and then quits, and the two overlap for a moment.
+; Restart Manager closes anything still holding a file rather than the install
+; failing halfway - in a silent run it does so without asking.
+CloseApplications=yes
+RestartApplications=no
 
 [Languages]
 Name: "english"; MessagesFile: "compiler:Default.isl"
@@ -60,6 +67,11 @@ Root: HKA; Subkey: "Software\Classes\Stamp.Project\shell\open\command"; ValueTyp
 
 [Run]
 Filename: "{app}\{#AppExeName}"; Description: "Start {#AppName}"; Flags: nowait postinstall skipifsilent
+; Stamp updating itself runs this installer silently, which skips the entry
+; above, so it asks for the restart with a switch of its own: /RELAUNCH=1.  An
+; ordinary install never passes it, and WantsRelaunch keeps the entry off the
+; Finished page there.
+Filename: "{app}\{#AppExeName}"; Flags: nowait postinstall; Check: WantsRelaunch
 
 ; The log directory is deliberately NOT deleted here.  It holds the crash reports
 ; and the bug reports, and a tester who removes Stamp may still have one to send.
@@ -67,3 +79,11 @@ Filename: "{app}\{#AppExeName}"; Description: "Start {#AppName}"; Flags: nowait 
 [UninstallDelete]
 Type: dirifempty; Name: "{localappdata}\Stamp\logs"
 Type: dirifempty; Name: "{localappdata}\Stamp"
+
+; Last, and last on purpose: everything after this header is Pascal, so a
+; semicolon comment here is a syntax error rather than a note.
+[Code]
+function WantsRelaunch: Boolean;
+begin
+  Result := ExpandConstant('{param:RELAUNCH|0}') = '1';
+end;
