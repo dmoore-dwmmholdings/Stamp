@@ -65,7 +65,7 @@ need a real window and an OpenGL context.
 | `geom/solid_ops.py` | OCC booleans, fillets, chamfers. Section 6.4. |
 | `geom/mesh_ops.py` | The manifold3d path. Sections 2 and 6.5. |
 | `geom/mesh_regions.py` | Face selection on mesh parts. Section 6.1. |
-| `geom/color_split.py` | One body per feature, for multi-color printing. |
+| `geom/color_split.py` | One body per feature and per colour, for multi-color printing. |
 | `ui/viewport.py` | The OCC viewport widget. |
 | `ui/main_window.py` | The window and all commands. Section 7. |
 | `ui/feature_tree.py` | The feature tree on the left. |
@@ -73,6 +73,11 @@ need a real window and an OpenGL context.
 | `ui/handles.py` | Drag handles and snap logic. |
 | `ui/dialogs.py` | Import and export prompts. |
 | `ui/rebuild_worker.py` | The worker thread and debounce. |
+| `ui/ribbon.py` | The command ribbon and its two sizes. Section 7. |
+| `ui/icons.py` | The drawn icon set the ribbon uses. |
+| `ui/update_bar.py` | The strip that says a newer Stamp exists. |
+| `ui/update_worker.py` | The update check and download, off the GUI thread. |
+| `update.py` | The signed release manifest, and verifying what it names. |
 | `diagnostics.py` | Logging, crash dumps, the crash flag. |
 | `reporting.py` | Crash and bug reports. |
 
@@ -342,6 +347,346 @@ a missing color.
 build would rebuild it as a plain engraving and export a part with a hole in the
 face, so the version refuses instead.
 
+## Opening and drawing a converted mesh
+
+A 3MF run through a mesh-to-STEP converter arrives as one flat face per
+triangle. The test file here is 81,920 of them, in a 274 MB STEP. Opening it
+froze the window for about a minute and then drew it as a black smudge.
+
+### The importer runs in another process
+
+OpenCascade holds the GIL for the whole of every call it is given. Measured:
+`TransferRoots` on that file runs for 35 seconds and the main thread gets one
+scheduling slot in all of it. So no worker *thread* can keep the window alive
+during an import, and none ever could - the rebuild engine's thread has the same
+limit. Only a worker *process* can.
+
+`stamp.io.import_process` is both halves. The child reads the file, meshes the
+result for display, and writes it out as binary BREP beside a small JSON
+description; the parent reads the BREP back. A `TopoDS_Shape` has no pickle and
+a mesh that size has no business in a pipe, so everything crossing between them
+is a file. The child is started as `Stamp import-worker <request>` - an argv
+word rather than a module path, because a PyInstaller build has no interpreter
+to call and `sys.executable` is Stamp.exe itself.
+
+The parent's cost is the BREP read, 1.4 s, and the triangulation comes across
+with it so nothing meshes again. Everything else - 10 s of parsing, 35 s of
+building, 10 s of validity checking, 7 s of meshing, and a 6 GB memory peak -
+happens somewhere that cannot freeze anything, under a progress dialog naming
+the phase it is in. Cancel kills the process outright, which is the only way to
+stop OpenCascade mid-call.
+
+Files under 12 MB are still read in process. Starting a second interpreter and
+loading OpenCascade into it costs a couple of seconds, which is worth paying
+against a minute and absurd against a tenth of one.
+
+### The viewport stopped repeating itself
+
+Nothing it did was wrong at ten faces and ruinous at eighty thousand except how
+often it ran and how much of it there was.
+
+Redisplaying an unchanged shape is now free. Switching selection mode,
+reselecting a feature and toggling the preview all handed the viewport the shape
+already on screen, and rebuilding that presentation cost three seconds.
+
+Selection is computed on the first click rather than on display. It costs about
+as much as drawing does and most of what gets displayed is never picked on. On a
+converted mesh hover highlighting is skipped entirely - picking out one triangle
+tells the user nothing, and it is not worth a second of frozen mouse to say it.
+Face boundary edges are skipped for the same reason: they outline every triangle,
+which costs a second to build and draws the part as a black smudge.
+
+### Measured on the 81,920-face file
+
+| | Before | After |
+|---|---|---|
+| Open the part, window frozen for | 66 s | 3 s |
+| Open the part, wall clock | 66 s | 76 s |
+| Rebuild redisplay | 3.3 s | 10 ms |
+| Change selection mode | 2.2 s | 9 ms |
+| Mouse move over the part | 5.8 ms each | 0.03 ms each |
+| First click on the part | 30 ms | 1.2 s |
+
+Two of those rows are trades, and both are deliberate. The wall clock is ten
+seconds longer because a second interpreter has to start and the part has to be
+written out and read back; the window is usable for all but three of those
+seconds instead of none of them. And the selection nobody had asked for yet is
+now built when they ask for it, under a busy cursor.
+
+The importer also says what it sees: a STEP with that many faces is a converted
+mesh, and Stamp now says so and points at the original 3MF, which goes through
+the mesh path and needs none of this.
+
+## Artwork components, and the backdrop that swallowed the drawing
+
+An SVG now divides by fill colour. Every black path is one component, every red
+path another; a feature can give any of them a colour of its own, and the export
+then splits that feature into one body per colour with a filament slot each.
+Grouping by colour rather than by element is what keeps it usable - a detailed
+logo has hundreds of paths and three colours, and it is the three the user picks
+from.
+
+The same change fixed a bug that had been eating artwork. Overlapping elements
+were resolved by unioning the whole profile into one silhouette, which is right
+for two shapes of one colour and badly wrong across colours: a filled backdrop
+and the drawing on top of it wind the same way, so their union is just the
+backdrop. A logo with a white page rect behind it - which is most of what comes
+out of an exporter - imported as a plain rectangle the size of its own page:
+
+    nobg.svg  ->  loops=2 faces=2   bbox 28.00 x 12.00   (the artwork)
+    bg.svg    ->  loops=1 faces=1   bbox 40.00 x 20.00   (the page)
+
+Resolution is now per component, and between components it is the painter's
+rule: whatever the source draws later is on top and comes out of everything
+under it. So the pieces never overlap, and a body divided between them is
+divided rather than counted twice.
+
+A backdrop is still not wanted, so it is detected and left out, with a message
+naming it and a switch to keep it. It is recognised by shape rather than by
+colour or position: something covering nearly all of its own bounding box with
+every other component inside it. Holes are subtracted when measuring that, which
+is what tells a backdrop from a border - a border's outlines add up to more than
+its box, but the material it covers is a thin frame, and the first version of
+the check called every border a backdrop.
+
+Detection runs before resolution rather than after. Afterwards the backdrop has
+had the artwork carved out of it and no longer looks like one.
+
+## The ribbon
+
+Thirty commands never fitted on the bottom toolbar. Qt's answer was to move the
+overflow into a chevron menu that shut again at every layout pass, so Export
+STEP - which had no shortcut either - had no working path at all, and the menu
+bar exists because of it.
+
+They are now on a ribbon: four tabs, each holding captioned groups, each tab
+scrolling sideways rather than hiding anything. The icons started as characters
+painted into pixmaps, because Stamp ships no icon set; see the third pass below
+for why that had to go. Buttons deliberately do not use `setDefaultAction`: that
+keeps a button's text tied to the action's, which overwrote every short caption
+with the full command name and left a row reading "Align... edge" and "Set
+st...vertex". Enabled and checked state is wired through by hand instead, so the
+window still enables one object and both views follow.
+
+## The ribbon, second pass, and moving the view
+
+The first ribbon was 126 px tall, which is a lot of chrome to look at while
+working on a part. Buttons went from 78x64 to 66x53 with 17 px glyphs, margins
+tightened, and the whole thing now collapses to its 26 px tab strip on a
+double-click or Ctrl+F1. Open, it is 99 px.
+
+Getting the camera somewhere was worse than the ribbon: a combo box, two clicks
+to a standard view, and no way at all to rotate by hand. Four things were added,
+and OpenCascade supplied most of them:
+
+* **A navigation cube**, `AIS_ViewCube`, top right. Click a face, edge or corner
+  and the camera swings there. Its animation is driven from a timer rather than
+  OCC's own fixed loop, which blocks inside itself for the length of every swing.
+  A click on it is navigation, not selection, so it is intercepted before the
+  pick reaches the document.
+* **Arrow keys** orbit 15° a press, Shift 90°, about the centre of what is on
+  screen rather than about the eye - turning the eye is looking around, and what
+  an arrow key should do is turn the part.
+* **Roll**, Alt with left or right, through `SetTwist`. On the window rather than
+  the viewport so it answers wherever the focus is; the arrows stay on the
+  viewport, because taking them window-wide would break every spin box in the
+  properties panel.
+* **Normal to face**, Ctrl+8, which points the camera down the normal of the face
+  the selected stamp is anchored to.
+
+## The ribbon, third pass: making it look like one
+
+It had the shape of a ribbon and none of the finish, and one of the reasons was
+a plain bug. The emoji stand-in for an icon set fell back to painting the glyph
+in a fixed `#d8d8d8`, which is white on white against a light desktop theme: on
+Windows out of the box, the ribbon's icons were not there at all. The screenshot
+that showed it is the whole argument for `docker/shot.sh`.
+
+Three things changed.
+
+**A drawn icon set**, `stamp/ui/icons.py`. Thirty-five icons on one 24-unit grid
+at one stroke weight, in two colours taken from the palette - the outline in the
+window's text colour, an accent for the part that carries the verb. Emoji could
+never be a set: some render in colour, some as a box with a hex number in it,
+and none of them share an optical size. Commands that belong together wear the
+same badge - a plus for every "add this", a down arrow for every "write this
+out" - and the badge's ring and its inner mark are *erased* rather than painted
+in the background colour, because the button behind them changes colour on
+hover, on press and when checked, and a hole is right against all four.
+
+**A theme mixed from the palette**, not hard-coded. The body sits a shade off
+the strip above it and the window below; the current tab carries the accent and
+an underline; every button has a hover, a pressed and a checked state, because
+those states are what tell you a rectangle is a button before you click it. All
+of it is computed from `QPalette`, so it follows a light or a dark desktop, and
+the menu bar is painted from the same mix so the top of the window reads as one
+surface rather than as two programs stacked. `--dark` on the screenshot tool is
+there to check the other end of that.
+
+**Two button sizes and a quick-access bar.** A group whose commands are all one
+size has no shape. The command you reach for is large; the ones beside it stack
+three to a column, small, label alongside - which is also how thirty commands
+fit across a laptop screen. Save, undo and redo also sit level with the menus,
+because they are wanted from whichever tab you happen to be on.
+
+## The ribbon, fourth pass: it was still too tall
+
+100 px of chrome, and the complaint was the same as the second pass. Making a
+ribbon *look* right and making it *cost* little are different problems, and the
+third pass only solved the first.
+
+So it now opens **compact**: one row of small buttons per tab, no captions under
+the groups, 56 px including the tab strip - against 102 for the roomy
+arrangement. That is 46 px back to the 3D view on every window, and nothing is
+lost from a tab; only the labels move from under the icon to beside it. "Large
+ribbon buttons" in the View menu brings the roomy layout back and is remembered.
+
+The group lays itself out twice over rather than being built twice. Buttons are
+made once and re-dressed - object name, button style, icon size, caption - and
+the group swaps in a freshly built row. That matters because each button carries
+live connections to its action; rebuilding them would leave those behind, and
+the action would end up driving a widget that no longer exists.
+
+The trap in doing it that way is that **re-parenting a widget hides it**. Qt's
+own documentation says so and it is easy to read past: a button moved into the
+new row comes back invisible unless it is shown again, so the first working
+version of the switch emptied the ribbon. `_move()` takes the widget out of its
+old layout, puts it in the new one, and shows it, in that order.
+
+Two traps worth recording.
+
+`ribbon.findChildren(QToolButton)` is not the list of commands. A `QTabBar`
+keeps two scroller buttons of its own, they have no icon, and a test that
+asserts every button has one fails on them. `command_buttons()` returns the
+registered ones.
+
+And the test for "clicking a button runs the command" used to click Batch. The
+first line of `batch_stamp` is a `QFileDialog`, which is modal, does not consult
+`interactive`, and under Xvfb never comes back - so the container run stopped
+dead two thirds of the way through the suite with no failure and no output,
+which reads exactly like a slow test. It clicks Fit to window now. Anything that
+opens a file dialog needs an `interactive` guard before a test may click it.
+
+## Updating itself
+
+An updater downloads an executable and runs it. That is the exact shape of a
+supply-chain attack, so the design question was never "how do we fetch a file" -
+it was "what has to be true before anything is allowed to run".
+
+The answer is a signed manifest. Every release publishes `latest.json` listing
+the version and one artifact per platform with its SHA-256, plus an Ed25519
+signature over its exact bytes. Stamp verifies the signature *before parsing the
+JSON* - parsing attacker-controlled input before checking who wrote it is doing
+work on their behalf - and then checks the downloaded installer against the hash
+in that manifest before running it. A file that does not match is deleted rather
+than kept. The private key exists only as a GitHub Actions secret; the public
+half is compiled into `stamp/update.py`.
+
+TLS was not enough on its own. It says the bytes came from GitHub, not that they
+are the bytes we published, and it has nothing to say about a release that was
+replaced or a machine with an extra root certificate.
+
+With no key compiled in, the whole feature reports itself unconfigured and does
+nothing. That is deliberate: a version check that trusts whatever it is handed
+is worse than no version check, so it refuses rather than degrading quietly. The
+release workflow does the same in reverse - no `STAMP_RELEASE_KEY` secret, no
+manifest published, and nobody is offered the release.
+
+Four decisions that are about the app rather than the crypto:
+
+* **A bar, not a dialog.** An update is never urgent enough to interrupt
+  somebody halfway through placing a stamp on a face, and a modal box at start-up
+  trains people to dismiss modal boxes.
+* **Never over unsaved work, never a silent restart.** Closing to install and
+  losing somebody's part is the one unforgivable bug in this feature, so the
+  install path asks, refuses while a rebuild is running, and offers "install when
+  I quit" - which is the moment nobody is waiting on Stamp.
+* **A failed automatic check says nothing.** A laptop on a train is not the
+  user's problem to be told about. A check they *asked* for reports either way.
+* **The check starts from `main.py`, not the window's constructor.** Every UI
+  test builds a window, and building a window must never make a network call.
+
+Two things that bit while writing it. The Windows install being per-user is what
+makes the whole thing possible without a UAC prompt - `{autopf}` under
+`PrivilegesRequired=lowest` is `%LOCALAPPDATA%\Programs`, which the user can
+already write to. And Inno deliberately skips its "start the application" entry
+in a silent install, so Stamp asks for the restart with a switch of its own,
+`/RELAUNCH=1`, read by a `Check` in the script.
+
+`update.py` has no Qt in it, which is what lets the tests sign real manifests
+with a real key, serve them over `file://`, and exercise the verification Stamp
+actually performs rather than a stand-in for it - including the forged manifest,
+the tampered installer, and the attempted downgrade.
+
+## Assemblies, and colours that were already in the file
+
+Three things a real job needed, and the finding behind each.
+
+**A two-colour logo exported as one lump.** `_split_by_component` began with
+`if not colors`, so a feature was only divided by colour when the user had
+assigned one to each component by hand. The colours were sitting in the SVG the
+whole time. A component's colour now falls back to the colour the artwork was
+drawn in - nobody draws a logo in two colours and means one - and what the user
+picks still wins. One function, `effective_colors`, answers this for both the
+export and the preview, because a preview that lies about the colours is worse
+than a preview with no colours in it.
+
+**The colour-stamp preview was one flat blue.** A colour stamp is a layer or two
+deep, so the translucent solid over it is almost flush with the face and says
+very little about where the artwork actually is. The decal is now drawn one
+shape per component in its printing colour. `component_footprints` is the first
+two lines of `component_prisms` pulled out - placement transform, no extrusion,
+no boolean - because it redraws constantly and the 2D footprint is all it needs.
+
+**Multi-part 3MFs arrived as one blob.** `import_mesh` called
+`trimesh.load(force="mesh")`, which flattens a scene before Stamp sees it. Now
+the parts are kept, named and measured. Use `scene.dump()` and not
+`scene.geometry`: the second is the mesh *library*, where four copies of one clip
+are a single entry carrying none of the transforms that put them where they are -
+two instances came out with identical bounding boxes, which is no use for telling
+them apart.
+
+Two approaches were measured and rejected before the third:
+
+| | 4-part, 346k tris | 11-part, 957k tris |
+|---|---|---|
+| `decompose()` the rebuilt result | 4 pieces, 66 ms | **267 pieces, 6752 ms** |
+| `compose()` the parts | 0 ms | 7572 ms (broken mesh) |
+
+`decompose` is out twice over: seven seconds on every rebuild, and it returns
+shells rather than parts - a part is not one connected lump. `compose` is free on
+a sound mesh and only slow on a file that is not watertight, which is a repair
+cost, so that is what puts the assembly back together at the end.
+
+So each part is rebuilt on its own, with only the features anchored to it, and a
+part with nothing on it is passed straight through untouched. That makes this
+**cheaper** than what it replaced rather than dearer: stamping one bracket of a
+four-part file did boolean work on 346k triangles and now does it on 16k.
+
+The one thing given up is the per-feature cache on that path. Its key is the
+whole document's feature list and a part rebuilds only its own, so the key would
+not mean what it says - and not touching untouched parts skips far more work than
+the cache ever did. The single-part path keeps the cache and is untouched, which
+is why every existing test still passes unchanged.
+
+`part_at` picks the *smallest* box containing a clicked point. Boxes overlap in a
+printed assembly - a lid sits inside the envelope of the box it closes - and the
+smaller box is the more specific answer.
+
+## Testing without a desktop
+
+Sixteen tests build a real window and two build the OCC viewport, so a local run
+takes over the screen. `QT_QPA_PLATFORM=offscreen` is not the way out: the
+viewport tests hang on it, because OpenCascade needs a real GL surface, and its
+empty font database fails three text tests that pass normally.
+
+`docker/` runs them under Xvfb with Mesa's software renderer instead. Two things
+cost an hour between them and are worth recording. `python:3.12-slim` has no
+glib, so PySide6 would not import - and the failure showed up as a container
+sitting at 0% CPU rather than as an error. And `uv run` without `--no-sync`
+re-resolves the project at every start, reaches for the network, and hangs there
+with no output, which looks exactly like a wedged test suite and is not one.
+
 ## Timings on the standard test
 
 `bracket.step` / `bracket.stl` with `logo.svg`:
@@ -367,3 +712,11 @@ Module names inside the root match section 13.
    machine, so that path is untested. Stamp detects the converter at startup and
    shows a download link and a file picker when it's missing.
 3. Nothing from section 11's "later" list. Cylindrical wrap is first in line.
+4. Code signing. Nothing is signed with an Authenticode certificate or notarised
+   for macOS, so SmartScreen warns on every install and Gatekeeper quarantines a
+   downloaded bundle. The update manifest's Ed25519 signature covers *what Stamp
+   installs*; it does nothing about what the operating system thinks of the
+   installer. Until there is a Developer ID, the update bar on macOS links to the
+   release page rather than installing anything.
+5. No release key has been generated yet, so update checking is switched off in
+   this build. See "Signing releases" in the README.

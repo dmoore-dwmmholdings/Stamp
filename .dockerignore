@@ -1,0 +1,11 @@
+# The build context for docker/Dockerfile.  Docker reads this from the context
+# root, which is the repository root, not the docker/ directory.
+.venv/
+build/
+dist/
+.git/
+.pytest_cache/
+.ruff_cache/
+**/__pycache__/
+packaging/dist/
+shots/

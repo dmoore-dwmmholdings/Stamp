@@ -297,6 +297,25 @@ Steps, in order:
    operation.
 7. **Cache.** Store the normalized `Profile` keyed by source hash. Reimport is free.
 
+**Components.** An SVG is grouped by fill color: every black path is one component,
+every red path another. Steps 3 and 4 run per component, and overlaps *between*
+components resolve by the painter's rule — whatever the source draws later is on
+top and comes out of everything under it.
+
+This is not decoration; a single union across the whole profile is wrong. A filled
+backdrop and the artwork on top of it wind the same way, so their union is just the
+backdrop, and a logo with a white page rect behind it imports as a plain rectangle
+the size of its own page. That is the single most common way an SVG "doesn't show
+anything".
+
+**Background layers.** A component covering ≥95% of its own bounding box, with every
+other component inside it, is a backdrop and is dropped, with a message naming it and
+an import option to keep it. Holes are subtracted when measuring that coverage —
+that is what tells a backdrop from a border, whose outlines add up to more than its
+box but whose material is a thin frame. The check runs *before* step 4's resolution:
+afterwards the backdrop has had the artwork carved out of it and no longer looks
+like one.
+
 ---
 
 ## 6. Placing a profile — the core interaction
@@ -461,7 +480,17 @@ Cap at 100. This is far simpler than command-pattern undo and, at this document 
 
 ## 7. UI layout
 
-A single window. No modes, no ribbon, no floating palettes.
+A single window. No modes, no floating palettes. Commands live on a ribbon across
+the top — four tabs (Home, Place, Export, View), each holding groups of icon
+buttons, each tab scrolling sideways rather than hiding anything. It opens
+compact, one row of buttons per tab; View → Large ribbon buttons gives the
+roomier arrangement, labels under icons in captioned groups.
+
+This replaced a single toolbar along the bottom, and the reason is worth
+recording: thirty commands do not fit on one bar at any ordinary window size, and
+Qt's answer is to move the overflow into a chevron menu that shuts again at every
+layout pass. Export STEP, which had no shortcut either, had no working path at
+all. The menu bar was added to paper over that and stays as a second way in.
 
 ```
 ┌──────────────────────────────────────────────────────────────────────────┐
@@ -601,6 +630,13 @@ with the feature that created them and re-derived on rebuild rather than re-sear
   preflight warns.
 - Only 3MF carries the second body. STEP and STL get the bare recess, and preflight says so before
   writing one.
+
+**Per-component color** (§5.5): an SVG is grouped by fill color, one component per
+color, and a feature can give any component a color of its own. The split then
+divides that feature into one body per color and the 3MF writes a filament slot
+for each. Grouping by color rather than by element is what keeps it usable — a
+detailed logo has hundreds of paths and three colors. Colors nothing uses are not
+written; every spare entry is a filament the user has to dismiss on the way in.
 
 **Both:** default filename = `<project>_<yyyymmdd>.<ext>`. Remember the last export folder.
 Show a completion toast with the file size and, for STL, the triangle count.

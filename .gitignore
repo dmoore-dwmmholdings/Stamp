@@ -17,3 +17,6 @@ wheels/
 # Generated files
 tests/fixtures/
 packaging/assets/
+
+# Screenshots taken by docker/shot.sh
+shots/
