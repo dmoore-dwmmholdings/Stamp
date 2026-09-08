@@ -314,6 +314,40 @@ def _shape_diagonal(shape: TopoDS_Shape) -> float:
     return math.dist((x0, y0, z0), (x1, y1, z1))
 
 
+def face_extent_in_plane(face: TopoDS_Face, plane: Plane) -> tuple[float, float]:
+    """The face's width and height measured along the sketch plane's own axes.
+
+    A world-axis box on a tilted face is the box the face sits in, which is
+    bigger than the face in both directions and in neither of the two a profile
+    is scaled along.  Vertices alone are worse still: a face bounded by a full
+    circle has one seam vertex and so measures nothing at all, and a slot
+    measures only the distance between its arc ends.  So the face is moved into
+    the plane's frame and boxed there, which follows the curved edges too.
+    """
+    from OCP.Bnd import Bnd_Box
+    from OCP.BRepBndLib import BRepBndLib
+    from OCP.BRepBuilderAPI import BRepBuilderAPI_Transform
+    from OCP.gp import gp_Ax3, gp_Dir, gp_Trsf
+
+    try:
+        frame = gp_Ax3(gp_Pnt(*plane.origin), gp_Dir(*plane.normal), gp_Dir(*plane.u_axis))
+    except Exception as exc:  # a degenerate normal or u axis
+        raise ReferenceError("This face's sketch plane has no usable axes.") from exc
+    into_plane = gp_Trsf()
+    into_plane.SetTransformation(frame)
+    moved = BRepBuilderAPI_Transform(face, into_plane, True).Shape()
+
+    box = Bnd_Box()
+    # AddOptimal rather than Add: the plain one boxes a spline's control points,
+    # which sit outside the curve, and it pads the result by the shape tolerance.
+    BRepBndLib.AddOptimal_s(moved, box)
+    if box.IsVoid():
+        raise ReferenceError("This face has no measurable size.")
+    box.SetGap(0.0)
+    umin, vmin, _, umax, vmax, _ = box.Get()
+    return (umax - umin, vmax - vmin)
+
+
 # ---------------------------------------------------------------- sketch plane
 
 
@@ -446,6 +480,7 @@ __all__ = [
     "ResolvedFace",
     "face_area",
     "face_center",
+    "face_extent_in_plane",
     "face_normal_at",
     "faces_of",
     "longest_edge_direction",

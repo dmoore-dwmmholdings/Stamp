@@ -122,7 +122,7 @@ from stamp.ui.handles import HandleOverlay
 from stamp.ui.import_worker import ImportCancelled, import_part_for_ui
 from stamp.ui.properties import PropertiesPanel
 from stamp.ui.rebuild_worker import PROGRESS_AFTER_MS, RebuildController
-from stamp.ui.ribbon import Ribbon, header_stylesheet
+from stamp.ui.ribbon import Ribbon, Theme, header_stylesheet
 from stamp.ui.update_bar import UpdateBar
 from stamp.ui.update_worker import UpdateController
 from stamp.ui.viewport import Viewport
@@ -193,6 +193,33 @@ class _BatchWorker(QObject):
         self.finished.emit(report)
 
 
+class _BatchProgressDialog(QProgressDialog):
+    """The batch's progress window, which only the batch itself can close.
+
+    QProgressDialog treats Esc as a cancel even with no cancel button, and
+    closing it does not stop run_batch.  The dialog would simply vanish and
+    leave the batch running behind a window that says nothing about it.
+    """
+
+    def __init__(self, parent) -> None:
+        super().__init__("Running the batch\u2026", "", 0, 0, parent)
+        self._closable = False
+
+    def force_close(self) -> None:
+        self._closable = True
+        self.close()
+
+    def reject(self) -> None:  # noqa: N802
+        if self._closable:
+            super().reject()
+
+    def closeEvent(self, event) -> None:  # noqa: N802
+        if self._closable:
+            super().closeEvent(event)
+        else:
+            event.ignore()
+
+
 class MainWindow(QMainWindow):
     """Owns the document and drives everything else."""
 
@@ -239,6 +266,10 @@ class MainWindow(QMainWindow):
         self._auto_value_attempts: dict[str, int] = {}
         self._auto_value_note = ""
         self._mesh_region = None
+        #: Set when a rebuild is asked for, cleared when one comes back.  A
+        #: cancelled or failed rebuild leaves it set, which is what tells an
+        #: export that the result it can see is older than the document.
+        self._result_stale = False
         #: The batch, while one is running off the GUI thread.
         self._batch_thread: QThread | None = None
         self._batch_worker: QObject | None = None
@@ -731,10 +762,15 @@ class MainWindow(QMainWindow):
         the whole top of the window is one piece of chrome - and both follow a
         light or a dark desktop, because the mix comes from the palette.
         """
-        sheet = header_stylesheet(self.ribbon.theme)
+        # Mixed here from the palette rather than read off the ribbon.  The
+        # ribbon rebuilds its own theme on its own PaletteChange, which Qt
+        # delivers after the parent's, so self.ribbon.theme is still the
+        # previous palette's at the moment this runs.
+        theme = Theme(QApplication.palette())
+        sheet = header_stylesheet(theme)
         self.menuBar().setStyleSheet(sheet)
         self._ribbon_holder_bar.setStyleSheet(sheet)
-        self.update_bar.apply_theme(self.ribbon.theme)
+        self.update_bar.apply_theme(theme)
 
     def changeEvent(self, event) -> None:  # noqa: N802
         """Follow the desktop switching between light and dark.
@@ -1540,6 +1576,7 @@ class MainWindow(QMainWindow):
         if self.document.base is None:
             return
         base = self.document.base
+        base_relinked = False
         base_source = Path(self._base_path or base.source_path)
         if base.source_path and not base_source.exists():
             found = self._find_missing_base(base_source)
@@ -1550,6 +1587,7 @@ class MainWindow(QMainWindow):
                     base.source_path = str(found)
                     self._base_path = str(found)
                     self._remember_dir("part", found)
+                    base_relinked = True
 
         missing = [
             f.profile.source_path
@@ -1559,7 +1597,13 @@ class MainWindow(QMainWindow):
             ).exists()
         ]
         if not missing:
-            self.statusBar().showMessage("Every source file is where it should be.", 5000)
+            if base_relinked:
+                # The part itself was just relinked, so the cached geometry is
+                # the old file's and the project now points somewhere new.
+                self._finish_relink()
+                self.statusBar().showMessage(f"The part is now {Path(base.source_path).name}.", 5000)
+            else:
+                self.statusBar().showMessage("Every source file is where it should be.", 5000)
             return
 
         for original in dict.fromkeys(missing):
@@ -1575,7 +1619,13 @@ class MainWindow(QMainWindow):
             for feature in self.document.features:
                 if feature.profile.source_path == original:
                     feature.profile.source_path = chosen
+        self._finish_relink()
+
+    def _finish_relink(self) -> None:
+        """Drop the cached geometry a relink invalidated and rebuild from it."""
         self.engine.invalidate()
+        self._dirty = True
+        self._update_title()
         self.request_rebuild(immediate=True)
 
     def _find_missing_base(self, original: Path) -> Path | None:
@@ -1615,6 +1665,7 @@ class MainWindow(QMainWindow):
     def request_rebuild(self, *, immediate: bool = False) -> None:
         if self.document.base is None:
             return
+        self._result_stale = True
         self.rebuilder.request(self.document, immediate=immediate)
 
     # ------------------------------------------------------------ part loading
@@ -1738,8 +1789,6 @@ class MainWindow(QMainWindow):
         if self.document.base is None:
             self._notify("There is no part to replace", "Open a part first.")
             return
-        if not self._confirm_discard():
-            return
 
         result = self._import_part(path)
         if result is None:
@@ -1791,6 +1840,10 @@ class MainWindow(QMainWindow):
         self._mesh_pick_cache = None
         self._mesh_region = None
         self._last_result = None
+        # The relink that pointed the old base at a file elsewhere on disk does
+        # not describe the new one.  Left standing it is the path a save would
+        # archive, and the path a redo of this replace would reload from.
+        self._base_path = None
         self._remember_dir("part", path)
 
         if result.part.warnings:
@@ -2673,44 +2726,20 @@ class MainWindow(QMainWindow):
         self.request_rebuild(immediate=True)
 
     def _anchor_face_size(self, feature: Feature) -> tuple[float, float] | None:
-        from stamp.core.refs import resolve_anchor
+        """The face's size in the sketch plane's own axes, or None when unknown."""
+        from stamp.core.refs import face_extent_in_plane, resolve_anchor, resolve_face_ref
 
         if self.document.base is None or self.document.base.mode != "solid":
             return None
         try:
             plane, _ = resolve_anchor(feature.placement.anchor, self.document.base.runtime, self.document.datums)
-        except Exception:
-            return None
-        from stamp.core.refs import resolve_face_ref
-
-        try:
             face = resolve_face_ref(feature.placement.anchor.face_ref, self.document.base.runtime).face
+            width, height = face_extent_in_plane(face, plane)
         except Exception:
             return None
-        # Measured in the sketch plane's own axes, not the world's.  A world-axis
-        # bounding box on a tilted face is the box the face sits in, which is
-        # bigger than the face in both directions and in neither of the two the
-        # profile is actually scaled along.
-        from OCP.BRep import BRep_Tool
-        from OCP.TopAbs import TopAbs_ShapeEnum
-        from OCP.TopExp import TopExp_Explorer
-        from OCP.TopoDS import TopoDS
-
-        ox, oy, oz = plane.origin
-        ux, uy, uz = plane.u_axis
-        vx, vy, vz = snapping.v_axis(plane)
-        us: list[float] = []
-        vs: list[float] = []
-        explorer = TopExp_Explorer(face, TopAbs_ShapeEnum.TopAbs_VERTEX)
-        while explorer.More():
-            point = BRep_Tool.Pnt_s(TopoDS.Vertex_s(explorer.Current()))
-            dx, dy, dz = point.X() - ox, point.Y() - oy, point.Z() - oz
-            us.append(dx * ux + dy * uy + dz * uz)
-            vs.append(dx * vx + dy * vy + dz * vz)
-            explorer.Next()
-        if not us:
+        if width <= 0.0 or height <= 0.0:
             return None
-        return (max(us) - min(us), max(vs) - min(vs))
+        return (width, height)
 
     def _on_handle_moved(self, _label: str) -> None:
         snapped = self.handles.last_snap
@@ -2796,6 +2825,7 @@ class MainWindow(QMainWindow):
 
     def _on_rebuild_finished(self, result: RebuildResult) -> None:
         self._last_result = result
+        self._result_stale = False
         if result.geometry is not None:
             self._display_geometry(result.geometry, result.mode)
             if self._fit_after_display:
@@ -3055,12 +3085,17 @@ class MainWindow(QMainWindow):
     def _space_pressed(self) -> None:
         """Space toggles the preview, except where Space already means something.
 
-        It is a window shortcut, so without this it fired instead of the focused
-        button's own Space - a checkbox in the properties panel could not be
-        ticked from the keyboard at all.
+        It is a window shortcut, so it consumes the key before the focused widget
+        ever sees it.  Returning early would only make Space do nothing there, so
+        the widget's own Space is performed here instead: a checkbox in the
+        properties panel is ticked, a drop-down is opened.
         """
         focused = QApplication.focusWidget()
-        if isinstance(focused, (QAbstractButton, QComboBox)):
+        if isinstance(focused, QAbstractButton):
+            focused.click()
+            return
+        if isinstance(focused, QComboBox):
+            focused.showPopup()
             return
         self.action_preview.toggle()
 
@@ -3459,6 +3494,15 @@ class MainWindow(QMainWindow):
                 "Stamp is still rebuilding - try again in a moment.", 5000
             )
             return False
+        if self._result_stale:
+            # Busy and pending are both clear after a cancelled or a failed
+            # rebuild too, and the result kept from before it is the shape from
+            # before the edit that asked for it.
+            self.statusBar().showMessage(
+                "The last rebuild did not finish, so there is nothing current to "
+                "write. Change something to rebuild, or undo.", 8000
+            )
+            return False
         return True
 
     def _export_geometry(self):
@@ -3795,7 +3839,7 @@ class MainWindow(QMainWindow):
         thread.finished.connect(self._close_batch_progress)
 
         if self.interactive:
-            progress = QProgressDialog("Running the batch…", "", 0, 0, self)
+            progress = _BatchProgressDialog(self)
             progress.setWindowTitle("Batch")
             progress.setWindowModality(Qt.WindowModality.WindowModal)
             # No cancel: run_batch has no per-row check to stop at, so a button
@@ -3816,7 +3860,7 @@ class MainWindow(QMainWindow):
 
     def _close_batch_progress(self) -> None:
         if self._batch_progress is not None:
-            self._batch_progress.close()
+            self._batch_progress.force_close()
             self._batch_progress = None
 
     def _on_batch_finished(self, report, folder: str) -> None:
@@ -3934,6 +3978,16 @@ class MainWindow(QMainWindow):
         return TopoDS.Face_s(shape), (point.X(), point.Y(), point.Z())
 
     def closeEvent(self, event) -> None:  # noqa: N802
+        # Asked before the save question, because there is no answer to it that
+        # would let the window close.  run_batch blocks the worker thread from
+        # end to end, so quit() is ignored and wait() only stalls the desktop
+        # before Qt aborts the process over a QThread destroyed while running.
+        if self._batch_thread is not None and self._batch_thread.isRunning():
+            self.statusBar().showMessage(
+                "A batch is still running; wait for it to finish before closing.", 8000
+            )
+            event.ignore()
+            return
         if self._dirty and self.document.base is not None and not self._installing_update:
             if not self._confirm(
                 "Close without saving?",
@@ -3947,9 +4001,6 @@ class MainWindow(QMainWindow):
             self._apply_update(now=False)
         if not self._install_on_quit:
             self._discard_update_download()
-        if self._batch_thread is not None and self._batch_thread.isRunning():
-            self._batch_thread.quit()
-            self._batch_thread.wait(5000)
         self.updater.shutdown()
         self.rebuilder.shutdown()
         # This run ended because the user closed it, thus the next start must not

@@ -588,3 +588,61 @@ class TestWorkingValueSearch:
         result, _ = self._suggestion(tool, ModifierKind.FILLET, 0.2)
         assert result.applied
         assert result.suggested_value is None
+
+
+class TestMeasuringAFaceInItsSketchPlane:
+    """A face's size decides what "Fit to face" scales the artwork to.
+
+    Measuring the vertices alone got this wrong on anything bounded by arcs: a
+    face bounded by a full circle has one seam vertex, so it measured nothing
+    at all and the fit collapsed the profile to zero.
+    """
+
+    @staticmethod
+    def _extent(face):
+        from stamp.core.refs import face_center, face_extent_in_plane, plane_from_face
+
+        plane, _ = plane_from_face(face, face_center(face))
+        return face_extent_in_plane(face, plane)
+
+    def test_a_full_circle_measures_its_diameter(self):
+        from OCP.BRepPrimAPI import BRepPrimAPI_MakeCylinder
+
+        from stamp.core.refs import faces_of, surface_kind
+
+        shape = BRepPrimAPI_MakeCylinder(10.0, 30.0).Shape()
+        flat = [f for f in faces_of(shape) if surface_kind(f) == "plane"]
+        assert flat, "a cylinder has two flat ends"
+        assert self._extent(flat[0]) == pytest.approx((20.0, 20.0), abs=1e-6)
+
+    def test_a_tilted_slab_measures_its_own_sides_not_the_world_box(self):
+        """A 60 x 20 face turned 45 degrees sits in a world box of about
+        56.6 x 56.6, which is the wrong number in both directions."""
+        import math
+
+        from OCP.BRepBuilderAPI import BRepBuilderAPI_Transform
+        from OCP.BRepPrimAPI import BRepPrimAPI_MakeBox
+        from OCP.gp import gp_Ax1, gp_Dir, gp_Pnt, gp_Trsf
+
+        from stamp.core.refs import face_center, face_normal_at, faces_of
+
+        box = BRepPrimAPI_MakeBox(gp_Pnt(0, 0, 0), gp_Pnt(60, 20, 10)).Shape()
+        turn = gp_Trsf()
+        turn.SetRotation(gp_Ax1(gp_Pnt(0, 0, 0), gp_Dir(0, 0, 1)), math.radians(45))
+        shape = BRepBuilderAPI_Transform(box, turn, True).Shape()
+
+        top = next(
+            f for f in faces_of(shape)
+            if face_normal_at(f, face_center(f))[2] > 0.99
+        )
+        assert sorted(self._extent(top)) == pytest.approx([20.0, 60.0], abs=1e-6)
+
+    def test_the_bracket_top_face_measures_the_part(self, bracket_step):
+        from stamp.core.refs import face_area, face_center, face_normal_at, faces_of
+
+        flat = [
+            f for f in faces_of(bracket_step.runtime)
+            if face_normal_at(f, face_center(f))[2] > 0.99
+        ]
+        top = max(flat, key=face_area)
+        assert sorted(self._extent(top)) == pytest.approx([40.0, 80.0], abs=1e-6)

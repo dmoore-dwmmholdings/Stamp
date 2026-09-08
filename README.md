@@ -123,9 +123,9 @@ the placement panel to make its profile follow a cylindrical or conical face. On
 a cylinder it is a true wrap: the artwork keeps its drawn arc length as it rolls
 onto the surface and its walls run out along the radii, which is also why a draft
 angle is not available there. On a cone it is a projection instead, and Stamp
-refuses artwork wider than about 1.4 times the local radius rather than smearing
-it around the taper. Mesh parts, other curved surfaces, and artwork that crosses
-the face seam are refused too.
+refuses artwork wider than about 1.4 times the face's smallest radius rather
+than smearing it around the taper. Mesh parts, other curved surfaces, and
+artwork that crosses the face seam are refused too.
 
 The same panel also turns a seed feature into an editable linear, circular, or
 mirror pattern. The pattern remains one feature-tree item: edit its text,

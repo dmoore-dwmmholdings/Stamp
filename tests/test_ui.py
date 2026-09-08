@@ -3051,9 +3051,11 @@ class TestWindowKeys:
             bound = [a for a in window.actions() if a.shortcut() == wanted]
             assert len(bound) == 1, f"{digit} is bound {len(bound)} times"
 
-    def test_space_leaves_a_focused_button_alone(self, window, qtbot):
+    def test_space_ticks_a_focused_checkbox(self, window, qtbot):
         """Item 15: Space was a window shortcut, so it toggled the preview
-        instead of ticking whatever checkbox had the keyboard."""
+        instead of ticking whatever checkbox had the keyboard.  The shortcut
+        still gets the key first, so the slot has to do the tick itself -
+        standing aside only made Space do nothing at all there."""
         from PySide6.QtTest import QTest
         from PySide6.QtWidgets import QCheckBox
 
@@ -3064,6 +3066,7 @@ class TestWindowKeys:
 
         before = window.action_preview.isChecked()
         QTest.keyClick(window, Qt.Key.Key_Space)
+        assert box.isChecked(), "the focused checkbox must actually toggle"
         assert window.action_preview.isChecked() == before
 
     def test_space_still_toggles_the_preview_from_the_viewport(self, window, qtbot):
@@ -3758,3 +3761,198 @@ class TestTheDraftFieldOnAWrap:
             panel.placement_mode.findData(PlacementMode.WRAP)
         )
         assert not panel.draft_field.isEnabled()
+
+
+class TestTheReReviewFixes:
+    """A second pass over the same window, on defects the first one left."""
+
+    @pytest.fixture
+    def window(self, qtbot):
+        from stamp.ui.main_window import MainWindow
+
+        win = MainWindow()
+        win.interactive = False
+        qtbot.addWidget(win)
+        yield win
+        win.rebuilder.shutdown()
+
+    # ------------------------------------------------------ a running batch
+
+    def test_closing_is_refused_while_a_batch_runs(self, window, qtbot):
+        """Item 2: run_batch blocks its thread end to end, so quit() was ignored
+        and Qt aborted the process over a QThread destroyed while running."""
+        from PySide6.QtGui import QCloseEvent
+
+        class Running:
+            def isRunning(self):  # noqa: N802
+                return True
+
+        window._batch_thread = Running()
+        event = QCloseEvent()
+        window.closeEvent(event)
+        try:
+            assert not event.isAccepted()
+            assert "batch is still running" in window.statusBar().currentMessage()
+        finally:
+            window._batch_thread = None
+
+    def test_the_batch_progress_dialog_ignores_escape(self, window, qtbot):
+        from stamp.ui.main_window import _BatchProgressDialog
+
+        dialog = _BatchProgressDialog(window)
+        qtbot.addWidget(dialog)
+        dialog.show()
+        dialog.reject()
+        assert dialog.isVisible(), "Esc must not dismiss a running batch"
+        dialog.force_close()
+        assert not dialog.isVisible()
+
+    # ------------------------------------------------- the relinked base path
+
+    def test_replacing_the_part_forgets_the_relinked_base_path(
+        self, window, qtbot, fixtures
+    ):
+        """Item 3: the path a relink found for the OLD part was still the one a
+        save archived and a redo reloaded from."""
+        window.open_part(fixtures / "bracket.step")
+        qtbot.waitUntil(lambda: window._last_result is not None, timeout=20000)
+        window._base_path = str(fixtures / "bracket.step")
+
+        window.replace_part(fixtures / "bracket_rev_b.step")
+        assert window._base_path is None
+
+    def test_replacing_the_part_does_not_ask_about_closing(
+        self, window, qtbot, fixtures, monkeypatch
+    ):
+        """Item 8: nothing closes and the swap is on the undo stack, so the
+        "Close without saving?" question was both wrong and unnecessary."""
+        window.open_part(fixtures / "bracket.step")
+        qtbot.waitUntil(lambda: window._last_result is not None, timeout=20000)
+        window._dirty = True
+
+        asked = []
+        monkeypatch.setattr(window, "_confirm", lambda *a: asked.append(a) or True)
+        window.replace_part(fixtures / "bracket_rev_b.step")
+        assert not asked
+
+    # ------------------------------------------------------------- a relink
+
+    def test_relinking_only_the_base_still_rebuilds(
+        self, window, qtbot, fixtures, monkeypatch
+    ):
+        """Item 9: with no missing profiles the relink returned early, leaving
+        the old part's geometry cached and the title saying it was saved."""
+        window.open_part(fixtures / "bracket.step")
+        qtbot.waitUntil(lambda: window._last_result is not None, timeout=20000)
+        window._dirty = False
+        window.document.base.source_path = str(fixtures / "gone.step")
+
+        monkeypatch.setattr(
+            window, "_find_missing_base", lambda original: fixtures / "bracket_rev_b.step"
+        )
+        invalidated = []
+        monkeypatch.setattr(
+            window.engine, "invalidate", lambda: invalidated.append(1)
+        )
+        rebuilt = []
+        monkeypatch.setattr(
+            window, "request_rebuild", lambda **k: rebuilt.append(k)
+        )
+
+        window.relink_sources()
+
+        assert invalidated, "the cached geometry is the old file's"
+        assert rebuilt
+        assert window._dirty
+
+    # -------------------------------------------- a rebuild that never landed
+
+    def test_an_unfinished_rebuild_is_not_current(self, window, qtbot, fixtures):
+        """Item 6: busy and pending are both clear after a cancel or a failure
+        too, so the check passed on the shape from before the edit."""
+        window.open_part(fixtures / "bracket.step")
+        qtbot.waitUntil(lambda: window._last_result is not None, timeout=20000)
+        qtbot.waitUntil(
+            lambda: not window.rebuilder.busy and not window.rebuilder.pending,
+            timeout=20000,
+        )
+        assert window._result_is_current()
+
+        # What a cancelled rebuild leaves: nothing running, an old result.
+        window._result_stale = True
+        assert not window._result_is_current()
+        assert "did not finish" in window.statusBar().currentMessage()
+
+    def test_a_finished_rebuild_clears_the_stale_flag(self, window, qtbot, fixtures):
+        window.open_part(fixtures / "bracket.step")
+        qtbot.waitUntil(lambda: window._last_result is not None, timeout=20000)
+        assert not window._result_stale
+        window.request_rebuild(immediate=True)
+        qtbot.waitUntil(lambda: not window._result_stale, timeout=20000)
+
+    # -------------------------------------------------- fit to a curved face
+
+    def test_fitting_to_a_round_face_does_not_collapse_the_artwork(
+        self, window, qtbot
+    ):
+        """Item 1: a face bounded by a full circle has one seam vertex, so the
+        old vertex-only measurement returned (0, 0) and scaled the profile to
+        nothing - with an undo entry and a degenerate rebuild behind it."""
+        from OCP.BRepPrimAPI import BRepPrimAPI_MakeCylinder
+
+        from stamp.core.document import BasePart, Document
+        from stamp.core.refs import faces_of, make_face_ref, plane_from_face, surface_kind
+
+        shape = BRepPrimAPI_MakeCylinder(10.0, 30.0).Shape()
+        flat = [f for f in faces_of(shape) if surface_kind(f) == "plane"]
+        assert flat
+        from stamp.core.refs import face_center
+
+        face = flat[0]
+        point = face_center(face)
+        plane, _ = plane_from_face(face, point)
+
+        window.document = Document(base=BasePart(mode="solid", runtime=shape))
+        feature = a_feature()
+        feature.placement.anchor = Anchor(
+            kind=AnchorKind.FACE, face_ref=make_face_ref(face, point), plane=plane
+        )
+        window.document.add_feature(feature)
+
+        size = window._anchor_face_size(feature)
+        assert size is not None
+        assert size == pytest.approx((20.0, 20.0), abs=1e-6)
+
+
+class TestDraggingKeepsTheSelection:
+    """Item 7: an InternalMove takes the row out and puts a new one back, which
+    deselects it, so the panel dropped to the base part on the next rebuild."""
+
+    def test_the_moved_feature_is_selected_again(
+        self, qtbot, bracket_step, monkeypatch
+    ):
+        from PySide6.QtWidgets import QAbstractItemView, QTreeWidget
+
+        from stamp.ui.feature_tree import FeatureTree
+
+        tree = FeatureTree()
+        qtbot.addWidget(tree)
+        document = Document(base=bracket_step)
+        first, second = a_feature("First"), a_feature("Second")
+        document.add_feature(first)
+        document.add_feature(second)
+        tree.set_document(document)
+        tree.select_feature(second.id)
+
+        def rearrange(self, event):
+            """What QTreeWidget's own drop does: take the row out, put it back."""
+            self.insertTopLevelItem(1, self.takeTopLevelItem(2))
+
+        monkeypatch.setattr(QTreeWidget, "dropEvent", rearrange)
+        monkeypatch.setattr(
+            FeatureTree, "dropIndicatorPosition",
+            lambda self: QAbstractItemView.DropIndicatorPosition.AboveItem,
+        )
+        tree.dropEvent(object())
+
+        assert tree.selected_feature_id() == second.id

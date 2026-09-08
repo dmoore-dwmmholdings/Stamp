@@ -288,16 +288,22 @@ class FeatureTree(QTreeWidget):
             event.ignore()
             return
         moved = [
-            item for item in self.selectedItems()
+            item.data(0, ROLE_FEATURE_ID) for item in self.selectedItems()
             if item.data(0, ROLE_KIND) == "feature"
         ]
         before = self._feature_order()
         super().dropEvent(event)
         after = self._feature_order()
+        # An InternalMove takes the row out and puts a new one back, which leaves
+        # nothing selected.  Without this the panel drops to the base part on the
+        # next rebuild, so a drag lost the feature the user was working on.
+        for feature_id in moved:
+            if feature_id:
+                self.select_feature(feature_id)
+                break
         if self._document is None or after == before:
             return
-        for item in moved:
-            feature_id = item.data(0, ROLE_FEATURE_ID)
+        for feature_id in moved:
             if feature_id in after:
                 self.reordered.emit(feature_id, after.index(feature_id))
                 return
