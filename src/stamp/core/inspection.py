@@ -4,7 +4,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from stamp.core.document import Document, Feature, InspectionSettings, OperationKind
+from stamp.core.document import DepthMode, Document, Feature, InspectionSettings, OperationKind
+
+#: The depth limit is a distance the machine has to cut, so it only means anything
+#: where the feature has a depth of its own.  A through cut and a cut to a face take
+#: theirs from the part, and the number on the feature is ignored by the rebuild.
+DEPTHS_THAT_USE_THE_NUMBER = (DepthMode.BLIND, DepthMode.SYMMETRIC)
 
 # Conservative starting points, in millimetres.  They are editable after selection.
 MANUFACTURING_RULESETS: dict[str, tuple[float, float, float]] = {
@@ -134,6 +139,7 @@ def inspect_feature(document: Document, feature: Feature) -> list[str]:
     # the printer has a whole layer to change filament on - is checked at export.
     if (
         feature.operation.kind is not OperationKind.COLOR
+        and feature.operation.depth_mode in DEPTHS_THAT_USE_THE_NUMBER
         and feature.operation.depth < settings.min_depth_mm
     ):
         warnings.append(prefix + f"depth {feature.operation.depth:g} mm is below the {settings.min_depth_mm:g} mm manufacturing limit.")
@@ -155,7 +161,7 @@ def inspect_feature(document: Document, feature: Feature) -> list[str]:
     for modifier in feature.modifiers:
         if modifier.enabled and modifier.value < settings.min_detail_mm:
             warnings.append(prefix + f"{modifier.label} is below the {settings.min_detail_mm:g} mm detail limit.")
-        if modifier.enabled and modifier.value < settings.min_detail_mm * 1.5:
+        elif modifier.enabled and modifier.value < settings.min_detail_mm * 1.5:
             warnings.append(prefix + f"{modifier.label} may be below a practical cutter radius; verify the toolpath.")
     clearance = anchor_clearance(document, feature)
     if clearance is not None and clearance < settings.min_clearance_mm:

@@ -134,36 +134,80 @@ def parse_length(text: str | None) -> tuple[float, str] | None:
     return value, unit
 
 
-def svg_user_unit_mm(path: Path) -> tuple[float, str, bool]:
-    """Work out how many millimetres one SVG user unit is.
+#: The width units svgelements resolves to millimetres by itself, given the
+#: 25.4 ppi ocpsvg parses at.  ``pt`` and ``pc`` are absolute too, but
+#: svgelements turns those into CSS pixels first, so they land with the rest.
+_MM_SVG_UNITS = {"mm", "cm", "in"}
 
-    Returns ``(mm_per_user_unit, declared_unit, ambiguous)``.  ``ambiguous`` is True
-    when the document gives no physical size, so the caller must show the 96 dpi
-    guess as an editable field rather than commit to it (§5.3).
+
+@dataclass(frozen=True)
+class SvgScale:
+    """The two different scales an SVG needs, which are not the same number.
+
+    *geometry* multiplies what ocpsvg hands back.  ocpsvg parses at 25.4 ppi and
+    applies the width/viewBox viewport transform itself, so its shapes are
+    already millimetres whenever the document has a viewBox and a physical
+    width; everything else it leaves in CSS pixels.  Multiplying those shapes by
+    the viewBox ratio as well scaled the file a second time, and only a document
+    whose viewBox happened to equal its width in millimetres came out right.
+
+    *user_unit_mm* is what one viewBox unit measures, which is what a
+    ``stroke-width`` written in the file is expressed in.
     """
-    root = ET.parse(path).getroot()
-    width = parse_length(root.get("width"))
+
+    geometry: float
+    user_unit_mm: float
+    unit: str
+    ambiguous: bool
+
+
+def svg_view_box_width(root) -> float | None:
     view_box = root.get("viewBox")
+    if not view_box:
+        return None
+    parts = re.split(r"[,\s]+", view_box.strip())
+    if len(parts) != 4:
+        return None
+    try:
+        width = float(parts[2])
+    except ValueError:
+        return None
+    return width if width > 0 else None
 
-    vb_width = None
-    if view_box:
-        parts = re.split(r"[,\s]+", view_box.strip())
-        if len(parts) == 4:
-            try:
-                vb_width = float(parts[2])
-            except ValueError:
-                vb_width = None
 
-    if width is None:
-        # No width at all: user units are px by the CSS reference pixel.
-        return TO_MM["px"], "px", True
+def svg_scale(path: Path) -> SvgScale:
+    """Work out how to size an SVG.  See :class:`SvgScale`."""
+    root = ET.parse(path).getroot()
+    size = parse_length(root.get("width")) or parse_length(root.get("height"))
+    vb_width = svg_view_box_width(root)
 
-    value, unit = width
+    if size is None:
+        # No usable size - a percentage counts as none.  User units are read as
+        # CSS pixels at 96 dpi, and that reading is a guess the UI must offer to
+        # correct (§5.3).
+        return SvgScale(TO_MM["px"], TO_MM["px"], "px", True)
+
+    value, unit = size
+    if vb_width is None:
+        # Without a viewBox one user unit *is* one CSS pixel, whatever the
+        # viewport is declared in, so the width says nothing about the artwork.
+        return SvgScale(TO_MM["px"], TO_MM["px"], "px", False)
+
     physical_mm = value * TO_MM.get(unit, TO_MM["px"])
-    ambiguous = unit == "px"
-    if vb_width and vb_width > 0:
-        return physical_mm / vb_width, unit, ambiguous
-    return physical_mm / value if value else 1.0, unit, ambiguous
+    user_unit_mm = physical_mm / vb_width
+    if unit in _MM_SVG_UNITS:
+        return SvgScale(1.0, user_unit_mm, unit, False)
+    return SvgScale(TO_MM["px"], user_unit_mm, unit, unit == "px")
+
+
+def svg_user_unit_mm(path: Path) -> tuple[float, str, bool]:
+    """How many millimetres one SVG user unit is, plus the declared unit.
+
+    ``ambiguous`` is True when the document gives no physical size, so the caller
+    must show the 96 dpi guess as an editable field rather than commit to it.
+    """
+    scale = svg_scale(path)
+    return scale.user_unit_mm, scale.unit, scale.ambiguous
 
 
 def _scan_svg_extras(path: Path) -> list[Issue]:
@@ -206,11 +250,18 @@ def import_svg(path: Path, options: ImportOptions) -> ImportResult:
     from ocpsvg import import_svg_document
 
     issues = _scan_svg_extras(path)
-    scale, declared_unit, ambiguous = svg_user_unit_mm(path)
+    sizing = svg_scale(path)
+    declared_unit, ambiguous = sizing.unit, sizing.ambiguous
+    scale, user_unit_mm = sizing.geometry, sizing.user_unit_mm
     if options.unit_override:
-        scale = TO_MM[options.unit_override.lower()]
+        # The override says what one user unit is, so it replaces the reading of
+        # the document, not the viewport transform ocpsvg already applied.
+        override = TO_MM[options.unit_override.lower()]
+        scale *= override / user_unit_mm if user_unit_mm else override
+        user_unit_mm = override
         ambiguous = False
     scale *= options.extra_scale
+    user_unit_mm *= options.extra_scale
 
     from ocpsvg import ColorAndLabel
 
@@ -238,7 +289,7 @@ def import_svg(path: Path, options: ImportOptions) -> ImportResult:
                     f"area to extrude. Outline the strokes at {width:g} mm to give "
                     "them area.",
                     blocking=True,
-                    detail={"suggested_width_mm": width * scale},
+                    detail={"suggested_width_mm": width * user_unit_mm},
                 )
             )
             profile = Profile(issues=issues)
@@ -448,6 +499,37 @@ _DXF_GEOMETRY_TYPES = {
 _DXF_TEXT_TYPES = {"TEXT", "MTEXT", "ATTDEF", "ATTRIB"}
 _DXF_SKIP_LAYERS = {"defpoints"}
 
+#: How far to follow block references into other block references.  Deep enough
+#: for any real drawing; a guard against a block that somehow inserts itself.
+_MAX_INSERT_DEPTH = 16
+
+
+def _exploded(entity, layer: str | None = None, depth: int = 0):
+    """Yield ``(entity, layer)`` for everything *entity* actually draws.
+
+    A block reference draws nothing itself - its geometry lives in the block
+    definition - so an INSERT is replaced by its transformed contents, and a
+    nested INSERT by its own.  Entities drawn on layer 0 inside a block take the
+    layer the block was inserted on, which is how AutoCAD has always resolved
+    them; anything on a named layer keeps it.
+    """
+    kind = entity.dxftype()
+    own = getattr(entity.dxf, "layer", "0")
+    resolved = layer if (own == "0" and layer is not None) else own
+    if kind != "INSERT":
+        yield entity, resolved
+        return
+    if depth >= _MAX_INSERT_DEPTH:
+        return
+    try:
+        virtual = list(entity.virtual_entities())
+    except Exception:
+        return  # a block Stamp cannot expand is skipped, not fatal
+    for sub in virtual:
+        yield from _exploded(sub, resolved, depth + 1)
+    for attrib in getattr(entity, "attribs", ()):
+        yield attrib, resolved
+
 
 def dxf_layers(path: Path) -> list[str]:
     """The layers that actually carry geometry, for the layer filter UI."""
@@ -456,8 +538,9 @@ def dxf_layers(path: Path) -> list[str]:
     doc = ezdxf.readfile(path)
     layers: dict[str, int] = {}
     for e in doc.modelspace():
-        if e.dxftype() in _DXF_GEOMETRY_TYPES:
-            layers[e.dxf.layer] = layers.get(e.dxf.layer, 0) + 1
+        for entity, layer in _exploded(e):
+            if entity.dxftype() in _DXF_GEOMETRY_TYPES:
+                layers[layer] = layers.get(layer, 0) + 1
     return sorted(layers)
 
 
@@ -515,28 +598,28 @@ def import_dxf(path: Path, options: ImportOptions) -> ImportResult:
     text_elsewhere = 0
     edges: list[TopoDS_Edge] = []
     msp = doc.modelspace()
-    for entity in msp:
-        kind = entity.dxftype()
-        layer = getattr(entity.dxf, "layer", "0")
-        selected = layer.lower() in wanted_set
-        if kind in _DXF_TEXT_TYPES:
-            if selected:
-                text_on_selected += 1
-            else:
-                text_elsewhere += 1
-            continue
-        if not selected or kind not in _DXF_GEOMETRY_TYPES:
-            continue
+    for top in msp:
+        for entity, layer in _exploded(top):
+            kind = entity.dxftype()
+            selected = layer.lower() in wanted_set
+            if kind in _DXF_TEXT_TYPES:
+                if selected:
+                    text_on_selected += 1
+                else:
+                    text_elsewhere += 1
+                continue
+            if not selected or kind not in _DXF_GEOMETRY_TYPES:
+                continue
 
-        try:
-            if kind == "HATCH":
-                paths = list(ezpath.from_hatch(entity))
-            else:
-                paths = [ezpath.make_path(entity)]
-        except Exception:
-            continue
-        for p in paths:
-            edges.extend(_edges_from_ezdxf_path(p, scale))
+            try:
+                if kind == "HATCH":
+                    paths = list(ezpath.from_hatch(entity))
+                else:
+                    paths = [ezpath.make_path(entity)]
+            except Exception:
+                continue
+            for p in paths:
+                edges.extend(_edges_from_ezdxf_path(p, scale))
 
     if text_on_selected:
         issues.append(
@@ -726,5 +809,6 @@ __all__ = [
     "import_profile",
     "import_svg",
     "parse_length",
+    "svg_scale",
     "svg_user_unit_mm",
 ]

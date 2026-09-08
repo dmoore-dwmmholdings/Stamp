@@ -136,8 +136,10 @@ class RebuildController(QObject):
         """Ask for a rebuild.  Coalesces with anything already waiting."""
         self._pending = Document.from_dict(document.to_dict())
         if document.base is not None and self._pending.base is not None:
-            # The runtime geometry is shared, not copied - it is immutable.
-            self._pending.base.runtime = document.base.runtime
+            # The runtime geometry is shared, not copied - it is immutable.  The
+            # parts of an assembly each carry their own, and the copy has to get
+            # all of them or the rebuild finds nothing to work on.
+            self._pending.base.adopt_runtime(document.base)
         if immediate:
             self._timer.stop()
             self._dispatch()

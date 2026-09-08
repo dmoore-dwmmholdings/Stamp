@@ -181,14 +181,21 @@ def _write_mesh(manifold, out_dir: Path) -> Path:
 # ----------------------------------------------------------------- the parent
 
 
-def read_answer(answer_path: str | Path) -> PartImportResult:
+def read_answer(answer_path: str | Path, *, detail: str = "") -> PartImportResult:
     """Turn what the child wrote back into a :class:`PartImportResult`.
 
     Raises :class:`PartImportError` with the child's own message, so a failure in
     the subprocess reaches the user reading exactly as it would have in process.
+    *detail* is what the parent knows about how the child ended - its exit status
+    and the tail of its stderr - which is the only account there is when it died
+    before writing anything.
     """
     answer_path = Path(answer_path)
     if not answer_path.exists():
+        if detail:
+            raise PartImportError(
+                f"The import stopped before it produced anything. {detail}"
+            )
         raise PartImportError(
             "The import stopped before it produced anything. If the file is very "
             "large, Stamp may have run out of memory reading it."

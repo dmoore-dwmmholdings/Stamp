@@ -17,6 +17,8 @@ from dataclasses import dataclass, field
 
 from stamp import diagnostics
 from stamp.core.document import (
+    AnchorKind,
+    DepthMode,
     Document,
     EdgeRole,
     Feature,
@@ -31,6 +33,12 @@ from stamp.io.normalize import Profile
 
 class Cancelled(RuntimeError):
     """Raised inside a rebuild when the caller asked it to stop."""
+
+
+#: What a feature says when the document describes a part whose geometry is not in
+#: memory.  The project file never holds geometry, so a copy that arrives without it
+#: has to be re-imported before anything can be built on it.
+NEEDS_RELOADING = "the part it sits on is not loaded, so it has to be re-imported."
 
 
 @dataclass
@@ -120,8 +128,10 @@ class RebuildEngine:
     ) -> None:
         self._load_profile = profile_loader
         self.deflection = tessellation_deflection
-        #: geometry after feature i, keyed by the chain signature up to i
-        self._cache: dict[str, object] = {}
+        #: geometry *and the result row* after feature i, keyed by the chain
+        #: signature up to i.  The row travels with the geometry because a feature
+        #: that is skipped still has to report what it found the first time.
+        self._cache: dict[str, tuple[object, FeatureResult | None]] = {}
         self._cache_order: list[str] = []
         self._cache_limit = 32
 
@@ -131,24 +141,74 @@ class RebuildEngine:
         self._cache.clear()
         self._cache_order.clear()
 
-    def _remember(self, key: str, geometry: object) -> None:
+    def _remember(self, key: str, geometry: object, row: FeatureResult | None) -> None:
         if key not in self._cache:
             self._cache_order.append(key)
             if len(self._cache_order) > self._cache_limit:
                 self._cache.pop(self._cache_order.pop(0), None)
-        self._cache[key] = geometry
+        self._cache[key] = (geometry, row)
 
     @staticmethod
-    def _chain_key(document: Document, upto: int) -> str:
+    def _geometry_key(document: Document, feature: Feature) -> dict:
+        """Everything about a feature that changes the geometry, and nothing else.
+
+        Hashing the whole record threw the cache away whenever the user renamed a
+        feature or typed a note into it, which is a rebuild of the entire chain for
+        an edit that cannot move a single vertex.  A datum plane is geometry even
+        though it lives on the document, so the plane a datum anchor names is
+        folded in here rather than being missed altogether.
+        """
+        anchor = feature.placement.anchor
+        datum = None
+        if anchor.kind is AnchorKind.DATUM:
+            named = next((d for d in document.datums if anchor.datum in (d.id, d.name)), None)
+            datum = named.plane.to_dict() if named is not None else anchor.datum
+        return {
+            "profile": list(feature.profile.cache_key),
+            "placement": feature.placement.to_dict(),
+            "operation": feature.operation.to_dict(),
+            "modifiers": [m.to_dict() for m in feature.modifiers],
+            "pattern": feature.pattern.to_dict() if feature.pattern else None,
+            "part_index": feature.part_index,
+            "enabled": feature.enabled,
+            "datum": datum,
+        }
+
+    @classmethod
+    def _chain_key(cls, document: Document, upto: int) -> str:
         import hashlib
         import json
 
         payload = {
             "base": document.base.source_hash if document.base else "",
-            "features": [f.to_dict() for f in document.features[:upto] if f.enabled],
+            "features": [
+                cls._geometry_key(document, f)
+                for f in document.features[:upto] if f.enabled
+            ],
         }
         blob = json.dumps(payload, sort_keys=True, default=str).encode()
         return hashlib.sha256(blob).hexdigest()[:24]
+
+    @staticmethod
+    def _replay(row: FeatureResult | None, feature: Feature) -> FeatureResult:
+        """A copy of a cached row, so a reader cannot edit what is in the cache.
+
+        Handing back a bare ``FeatureResult(ok=True)`` for a cached-through feature
+        erased everything it had to say: a broken feature read as fine in the tree
+        for the rest of the session, the export preflight lost its warnings, and
+        the colour split skipped the feature for want of a tool solid.
+        """
+        if row is None:
+            return FeatureResult(feature_id=feature.id)
+        return FeatureResult(
+            feature_id=row.feature_id,
+            ok=row.ok,
+            warnings=list(row.warnings),
+            errors=list(row.errors),
+            tool=row.tool,
+            failed_edges=list(row.failed_edges),
+            suggested_values=dict(row.suggested_values),
+        )
 
     # ----------------------------------------------------------------- rebuild
 
@@ -160,10 +220,12 @@ class RebuildEngine:
         progress: Callable[[int, int, str], None] | None = None,
     ) -> RebuildResult:
         start = time.perf_counter()
-        if document.base is None or document.base.runtime is None:
+        if document.base is None:
             return RebuildResult(ok=False, mode="solid")
 
         mode = document.base.mode
+        if document.base.runtime is None:
+            return self._unloaded(document, document.features, mode, start)
         result = RebuildResult(mode=mode)
 
         enabled = [f for f in document.features if f.enabled]
@@ -200,18 +262,20 @@ class RebuildEngine:
                 feature_result.tool = instance_result.tool
             feature_result.ok = not feature_result.errors
             result.features.append(feature_result)
-            if feature_result.broken:
-                result.ok = False
-            self._remember(self._chain_key(document, self._absolute_index(document, feature) + 1), geometry)
+            key = self._chain_key(document, self._absolute_index(document, feature) + 1)
+            self._remember(key, geometry, feature_result)
 
-        # Cached-through features still need a result row so the tree can show them.
+        # Cached-through features still need a result row so the tree can show them,
+        # and it has to be the row they earned rather than a blank one.
         if resume_at:
             done = {r.feature_id for r in result.features}
             cached_rows = [
-                FeatureResult(feature_id=f.id) for f in enabled[:resume_at] if f.id not in done
+                self._replay(self._cached_row(document, f), f)
+                for f in enabled[:resume_at] if f.id not in done
             ]
             result.features = cached_rows + result.features
 
+        result.ok = not any(r.broken for r in result.features)
         result.geometry = geometry
         result.duration_ms = (time.perf_counter() - start) * 1000.0
         result.volume = self._volume(geometry, mode)
@@ -242,8 +306,17 @@ class RebuildEngine:
         pieces: list[PartGeometry] = []
         for part in document.base.parts:
             mine = [f for f in enabled if f.part_index == part.index]
-            if not mine or part.runtime is None:
+            if not mine:
                 pieces.append(PartGeometry(part.index, part.name, part.runtime))
+                continue
+            if part.runtime is None:
+                # The names of the parts are in the project file; their geometry
+                # never is.  A copy that arrived without it would otherwise apply
+                # no features, report no rows, and compose to nothing at all -
+                # which is a stamped assembly quietly turning into an empty
+                # viewport, with the tree still saying everything is fine.
+                result.features.extend(self._unloaded_rows(mine))
+                pieces.append(PartGeometry(part.index, part.name, None))
                 continue
             geometry, rows = self._run_features(
                 document, mine, part.runtime, mode,
@@ -393,8 +466,34 @@ class RebuildEngine:
             last = enabled[count - 1]
             key = self._chain_key(document, document.index_of(last.id) + 1)
             if key in self._cache:
-                return self._cache[key], count
+                return self._cache[key][0], count
         return document.base.runtime, 0
+
+    def _cached_row(self, document: Document, feature: Feature) -> FeatureResult | None:
+        entry = self._cache.get(self._chain_key(document, document.index_of(feature.id) + 1))
+        return entry[1] if entry is not None else None
+
+    @staticmethod
+    def _unloaded_rows(features: list[Feature]) -> list[FeatureResult]:
+        return [
+            FeatureResult(feature_id=f.id, ok=False, errors=[f"{f.name}: {NEEDS_RELOADING}"])
+            for f in features
+        ]
+
+    def _unloaded(
+        self, document: Document, features: list[Feature], mode: str, start: float
+    ) -> RebuildResult:
+        """The whole part is missing its geometry - say so, once per feature.
+
+        This is what an undo across "Replace part" leaves behind: the record that
+        comes back is the old part's, and the geometry in hand is the new one, so
+        nothing is attached rather than the wrong thing being attached.  Returning
+        an empty result made that look like a document with no features in it.
+        """
+        result = RebuildResult(ok=False, mode=mode)
+        result.features = self._unloaded_rows([f for f in features if f.enabled])
+        result.duration_ms = (time.perf_counter() - start) * 1000.0
+        return result
 
     # ---------------------------------------------------------- single feature
 
@@ -450,13 +549,14 @@ class RebuildEngine:
             feature.operation.depth,
         )
         try:
+            to_face_distance = self._to_face_distance(feature, plane, anchor_shape, mode)
             tool = build_tool_solid(
                 profile,
                 feature.placement,
                 feature.operation,
                 plane,
                 part_diagonal=document.base.diagonal,
-                to_face_distance=self._to_face_distance(feature, plane, anchor_shape),
+                to_face_distance=to_face_distance,
                 target_face=target_face,
             )
         except ToolSolidError as exc:
@@ -474,7 +574,9 @@ class RebuildEngine:
                 # of a boss cuts an undercut notch, and a chamfer on a pocket rim
                 # leaves an overhanging lip.
                 continue
-            edges = solid_ops.select_edges(tool_shape, modifier, tool.direction)
+            edges = solid_ops.select_edges(
+                tool_shape, modifier, tool.direction, axis=tool.axis
+            )
             step(f"{modifier.kind} on {len(edges)} edges")
             diagnostics.breadcrumb(
                 "modifier: feature=%s kind=%s role=%s value=%s edges=%d",
@@ -533,6 +635,7 @@ class RebuildEngine:
             edges = solid_ops.find_blend_edges(
                 shape, boolean.section_edges, tool_shape, tool.direction,
                 min_length=max(tool.contact_overlap * 3.0, 1e-5),
+                axis=tool.axis,
             )
             for modifier in blends:
                 applied = solid_ops.apply_modifier(
@@ -563,8 +666,7 @@ class RebuildEngine:
 
     # ----------------------------------------------------------------- helpers
 
-    def _to_face_distance(self, feature: Feature, plane, shape) -> float | None:
-        from stamp.core.document import DepthMode
+    def _to_face_distance(self, feature: Feature, plane, shape, mode: str) -> float | None:
         from stamp.core.refs import resolve_face_ref
         from stamp.geom.tool_solid import distance_to_face
 
@@ -573,9 +675,19 @@ class RebuildEngine:
         ref = feature.operation.to_face_ref
         if ref is None:
             return None
+        if mode != "solid":
+            # A mesh has no faces to resolve against, and asking anyway threw a
+            # TypeError straight out of rebuild() - one feature with the wrong
+            # depth mode took the whole rebuild with it.
+            raise ToolSolidError(
+                "A depth to a face needs the faces of a solid part, and a mesh has "
+                "none. Give this a blind depth, or one that goes through the part."
+            )
         try:
             resolved = resolve_face_ref(ref, shape)
-        except ReferenceError:
+        except Exception:
+            # The face is not on this shape any more, so fall back to the plain
+            # depth rather than losing the feature over it.
             return None
         from stamp.core.refs import face_center
 

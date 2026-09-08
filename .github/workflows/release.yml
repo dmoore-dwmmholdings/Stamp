@@ -13,7 +13,60 @@ permissions:
   contents: write
 
 jobs:
+  # What the installers are about to be named after.  A manual run builds main
+  # and attaches the result to a tag somebody typed, so nothing otherwise makes
+  # the two agree: the manifest would say one version over the bytes of another,
+  # which is the one thing a signed feed must never do.
+  version:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && 'main' || github.ref }}
+      - name: Check the tag against the version being built
+        shell: bash
+        run: |
+          tag="${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.event.release.tag_name }}"
+          want="${tag#v}"
+          source_version=$(sed -n 's/^__version__ = "\(.*\)"/\1/p' src/stamp/__init__.py)
+          installer_version=$(sed -n 's/^#define AppVersion "\(.*\)"/\1/p' packaging/stamp.iss)
+          echo "tag $tag, source $source_version, installer $installer_version"
+          if [ "$source_version" != "$want" ] || [ "$installer_version" != "$want" ]; then
+            echo "::error::$tag would ship Stamp $source_version (installer $installer_version). Bump src/stamp/__init__.py and packaging/stamp.iss, or run this over the matching tag."
+            exit 1
+          fi
+      - name: Say so when the updater is switched off
+        shell: bash
+        run: |
+          key=$(sed -n 's/^RELEASE_PUBLIC_KEY = "\(.*\)"/\1/p' src/stamp/update.py)
+          if [ -z "$key" ]; then
+            echo "::warning::RELEASE_PUBLIC_KEY is empty, so this build cannot check a manifest signature and nobody running it will ever be offered an update. See packaging/make_release_key.py."
+          fi
+
+  # The installers are what people run.  Shipping one the suite has not passed
+  # costs a release; waiting ten minutes costs ten minutes.
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    env:
+      QT_QPA_PLATFORM: offscreen
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && 'main' || github.ref }}
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - name: Install Qt system libraries and fonts
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libegl1 libgl1 libopengl0 libxkbcommon0 libdbus-1-3 libglib2.0-0 fonts-dejavu-core
+      - run: uv sync --frozen
+      - run: uv run pytest
+
   windows-installer:
+    needs: [version, test]
     runs-on: windows-latest
     timeout-minutes: 60
     steps:
@@ -21,12 +74,13 @@ jobs:
         with:
           # A manual run attaches a rebuilt installer to an existing release;
           # build the current release tooling, not the historical tag that
-          # predates it. Published releases still build the tag itself.
+          # predates it. Published releases still build the tag itself.  The
+          # version job has already checked that the two agree.
           ref: ${{ github.event_name == 'workflow_dispatch' && 'main' || github.ref }}
       - uses: astral-sh/setup-uv@v5
         with:
           enable-cache: true
-      - run: uv sync
+      - run: uv sync --frozen
       - run: uv run python packaging/make_icons.py
       - run: uv run pyinstaller packaging/stamp.spec --noconfirm --distpath build/dist --workpath build/work
       - name: Compile the installer
@@ -39,6 +93,7 @@ jobs:
           gh release upload $tag (Get-ChildItem packaging\dist\*-Setup.exe).FullName --clobber
 
   macos-installer:
+    needs: [version, test]
     strategy:
       fail-fast: false
       matrix:
@@ -62,7 +117,7 @@ jobs:
       - uses: astral-sh/setup-uv@v5
         with:
           enable-cache: true
-      - run: uv sync
+      - run: uv sync --frozen
       - run: uv run python packaging/make_icons.py
       - run: uv run pyinstaller packaging/stamp.spec --noconfirm --distpath build/dist --workpath build/work
       - name: Create macOS installers
@@ -90,9 +145,12 @@ jobs:
   # No secret, no manifest - and no manifest simply means nobody is offered the
   # update.  That is the safe way round: publishing an unsigned one would be
   # rejected by every client anyway.
+  #
+  # It needs every installer job to have succeeded, and says nothing if one did
+  # not.  Signing over whatever happens to be on the release is how a feed ends
+  # up offering the previous run's installer under this run's version.
   manifest:
     needs: [windows-installer, macos-installer]
-    if: always() && !cancelled()
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -107,7 +165,7 @@ jobs:
           tag="${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.event.release.tag_name }}"
           mkdir -p assets
           gh release download "$tag" --dir assets \
-            --pattern '*-Setup.exe' --pattern '*.dmg' || true
+            --pattern '*-Setup.exe' --pattern '*.dmg'
           ls -l assets
       - name: Write and sign the manifest
         id: sign

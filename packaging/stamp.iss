@@ -37,7 +37,10 @@ ArchitecturesAllowed=x64compatible
 ; Stamp update itself without a UAC prompt: {autopf} under "lowest" resolves to
 ; %LOCALAPPDATA%\Programs, which the user can already write to.
 PrivilegesRequired=lowest
-PrivilegesRequiredOverridesAllowed=dialog
+; No override, on purpose.  Offered the choice, somebody picks "all users", and
+; the silent self-update - which runs as the user with no /ALLUSERS - then
+; installs a second per-user copy beside the first one and updates that.  The
+; README promises a current-user install; this is what keeps that true.
 ; Stamp starts this installer and then quits, and the two overlap for a moment.
 ; Restart Manager closes anything still holding a file rather than the install
 ; failing halfway - in a silent run it does so without asking.

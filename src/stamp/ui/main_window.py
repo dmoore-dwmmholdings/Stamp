@@ -1941,6 +1941,7 @@ class MainWindow(QMainWindow):
             layers=options.layers,
             outline_strokes=options.outline_stroke_width,
             union_overlapping=options.union_overlapping,
+            close_open_loops=options.close_open_loops,
         )
         self.profiles.put(ref, result.profile)
         self._remember_dir("profile", path)
@@ -3023,7 +3024,9 @@ class MainWindow(QMainWindow):
             self._notify("The part could not be reloaded", str(exc))
             return
 
-        document.base.runtime = reloaded.part.runtime
+        # The geometry is never in the project file, so the fresh import supplies it -
+        # for the assembly and, just as importantly, for each of its parts.
+        document.base.adopt_runtime(reloaded.part, require_match=False)
         self.document = document
         self.profiles.clear()
         self.engine.invalidate()

@@ -36,6 +36,32 @@ def available_families() -> list[str]:
     return sorted(QFontDatabase.families())
 
 
+def font_substitution(spec: TextSpec, font) -> Issue | None:
+    """The issue to raise when Qt quietly swapped the family for another.
+
+    Qt never refuses a family it does not have - it picks the nearest thing
+    installed and lays the message out in that.  The outlines then belong to a
+    font nobody asked for, and when the substitute has none for a character the
+    fallback glyphs cross themselves, so the user was shown a self-intersection
+    in artwork they never drew.  Say which font is actually being used instead.
+    """
+    from PySide6.QtGui import QFontInfo
+
+    wanted = (spec.family or "").strip()
+    if not wanted:
+        return None
+    actual = QFontInfo(font).family()
+    if actual.strip().lower() == wanted.lower():
+        return None
+    return Issue(
+        IssueKind.UNSUPPORTED_ELEMENT,
+        f"The font {wanted} is not installed, so this text is being laid out in "
+        f"{actual}. Install {wanted}, or choose a font from the list.",
+        blocking=False,
+        detail={"requested_family": wanted, "actual_family": actual},
+    )
+
+
 def _font(spec: TextSpec):
     from PySide6.QtGui import QFont
 
@@ -237,6 +263,7 @@ def build_text_profile(spec: TextSpec) -> Profile:
     from PySide6.QtGui import QFontMetricsF
 
     font = _font(spec)
+    substitution = font_substitution(spec, font)
     metrics = QFontMetricsF(font)
     lines = _wrap(spec, metrics)
     paths, underlines = _line_paths(spec, font, metrics, lines)
@@ -265,13 +292,17 @@ def build_text_profile(spec: TextSpec) -> Profile:
                     blocking=True,
                 )
             ]
+            + ([substitution] if substitution else [])
         )
 
-    return normalize_groups(groups, source_units="mm")
+    return normalize_groups(
+        groups, issues=[substitution] if substitution else None, source_units="mm"
+    )
 
 
 __all__ = [
     "TextProfileError",
     "available_families",
     "build_text_profile",
+    "font_substitution",
 ]

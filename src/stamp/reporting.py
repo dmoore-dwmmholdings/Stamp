@@ -23,7 +23,7 @@ from datetime import datetime
 from pathlib import Path
 from urllib.parse import quote
 
-from stamp import diagnostics
+from stamp import __version__, diagnostics
 
 #: Where a report goes.
 SUPPORT_EMAIL = "dmoore@dwmmholdings.com"
@@ -40,12 +40,10 @@ BODY_TAIL_LINES = 25
 
 
 def app_version() -> str:
-    try:
-        from importlib.metadata import version
-
-        return version("stamp")
-    except Exception:
-        return "unknown"
+    # The version the application was built from, not the one the installed
+    # distribution metadata claims: a PyInstaller build ships no metadata, so
+    # asking importlib for it made every frozen crash report say "unknown".
+    return __version__
 
 
 @dataclass
@@ -239,7 +237,10 @@ def build_body(report: Report, attachment: Path | None, budget: int | None = Non
     if attachment is not None:
         footer = ["", f"Full log: {attachment}"]
         if budget is not None:
-            budget -= _encoded_length("\n".join(footer))
+            # The newline that joins the footer to the body counts too: it is
+            # three characters once encoded, and leaving it out is how a link
+            # that was measured to fit comes out three over.
+            budget -= _encoded_length("\n" + "\n".join(footer))
 
     # 4. The log, newest last.  Take as many lines as the rest of the budget holds.
     tail = _log_tail(source_log(report), BODY_TAIL_LINES)

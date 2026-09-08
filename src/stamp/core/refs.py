@@ -384,9 +384,9 @@ def plane_from_face(
 
     if kind != "plane":
         warnings.append(
-            f"This is a {kind} face, not a flat one. Stamp uses the flat plane that "
-            f"touches it where you clicked, so the walls of the feature will be "
-            f"straight, not radial."
+            f"This is a {kind} face, not a flat one. Unless the feature is set to "
+            f"wrap, Stamp uses the flat plane that touches it where you clicked, so "
+            f"the walls of the feature will be straight, not radial."
         )
     u_axis = longest_edge_direction(face, normal)
     return Plane(origin=origin, normal=normal, u_axis=u_axis), warnings

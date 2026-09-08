@@ -112,10 +112,19 @@ def _run_worker(
     # quitting a loop that has not started does nothing at all: exec() would then
     # wait for an event that has already been and gone.  That hung the window
     # forever.  The flag is what the wait below actually tests.
-    state = {"cancelled": False, "done": False, "phase": ""}
+    state = {"cancelled": False, "done": False, "phase": "", "stderr": ""}
+
+    def collect_stderr() -> None:
+        try:
+            chunk = bytes(process.readAllStandardError()).decode("utf-8", "replace")
+        except Exception:
+            return
+        if chunk:
+            state["stderr"] = (state["stderr"] + chunk)[-STDERR_TAIL_CHARS:]
 
     def finish() -> None:
         state["done"] = True
+        collect_stderr()
         loop.quit()
 
     def show_phase() -> None:
@@ -142,6 +151,7 @@ def _run_worker(
     poll.timeout.connect(show_phase)
     process.finished.connect(lambda *_: finish())
     process.errorOccurred.connect(lambda *_: finish())
+    process.readyReadStandardError.connect(collect_stderr)
     dialog.canceled.connect(on_cancel)
 
     process.start()
@@ -171,7 +181,36 @@ def _run_worker(
 
     if state["cancelled"]:
         raise ImportCancelled(f"Opening {title} was stopped.")
-    return read_answer(work / "request.answer.json")
+    return read_answer(
+        work / "request.answer.json", detail=_worker_failure(process, state["stderr"])
+    )
+
+
+#: How much of the child's stderr to keep for the failure message.  A traceback
+#: fits; a megabyte of OpenCascade warnings does not reach the user.
+STDERR_TAIL_CHARS = 2000
+
+
+def _worker_failure(process: QProcess, stderr: str) -> str:
+    """How the import worker ended, in words, for when it produced no answer.
+
+    The child's stderr used to go nowhere at all, so a worker that died on a
+    missing library or a segmentation fault was reported to the user as a file
+    that might be too large for memory - which sent them off resizing a part
+    that was never the problem.
+    """
+    said: list[str] = []
+    try:
+        if process.exitStatus() == QProcess.ExitStatus.CrashExit:
+            said.append("The importer crashed.")
+        elif process.exitCode():
+            said.append(f"The importer exited with status {process.exitCode()}.")
+    except Exception:
+        pass
+    tail = stderr.strip()
+    if tail:
+        said.append("It said:\n" + tail)
+    return " ".join(said)
 
 
 def _worker_environment() -> QProcessEnvironment:

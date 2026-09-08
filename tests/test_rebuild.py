@@ -1038,3 +1038,251 @@ class TestColorlessExport:
         colors = [c.get("color")
                   for c in model.findall(f".//{{{self.MATERIAL}}}color")]
         assert colors == ["#000000FF", "#C8A24AFF"]
+
+
+def a_broken_feature(name, source, *, depth=0.6) -> Feature:
+    """A feature anchored to a face that is nowhere on the part."""
+    return a_feature(
+        name, source,
+        FaceRef(point=(1e5, 1e5, 1e5), normal=(0.0, 0.0, 1.0),
+                surface_type="plane", area=1e9),
+        kind=OperationKind.CUT, depth=depth, direction=Direction.INTO,
+    )
+
+
+class TestTheCacheKeepsWhatEachFeatureFound:
+    """§6.6 optimization 1, minus the part that lost the answer.
+
+    Skipping a feature whose geometry is already cached is the whole point of the
+    cache.  Handing back a blank ``ok`` row for it was not: a broken feature read
+    as fine in the tree for the rest of the session, the export preflight lost the
+    warnings, and the colour split skipped a feature that had no tool solid.
+    """
+
+    def test_a_broken_feature_stays_broken_after_a_later_edit(
+        self, bracket_step, engine, fixtures, top_ref
+    ):
+        doc = Document(base=bracket_step)
+        broken = doc.add_feature(a_broken_feature("Broken", fixtures / "logo.svg"))
+        good = doc.add_feature(
+            a_feature("Good", fixtures / "serial.dxf", top_ref,
+                      kind=OperationKind.CUT, depth=0.5, direction=Direction.INTO)
+        )
+        first = engine.rebuild(doc)
+        assert not first.ok
+        assert first.result_for(broken.id).errors
+
+        good.operation.depth = 0.7
+        second = engine.rebuild(doc)
+
+        assert not second.ok, "the broken feature is still broken"
+        row = second.result_for(broken.id)
+        assert row is not None and not row.ok
+        assert row.errors == first.result_for(broken.id).errors
+
+    def test_a_cached_feature_still_carries_its_tool_solid(
+        self, bracket_step, engine, fixtures, top_ref
+    ):
+        """The colour split needs it, and the second rebuild used to lose it."""
+        doc = Document(base=bracket_step)
+        logo = doc.add_feature(
+            a_feature("Logo", fixtures / "logo.svg", top_ref,
+                      kind=OperationKind.ADD, depth=0.8, direction=Direction.OUT_OF)
+        )
+        assert engine.rebuild(doc).result_for(logo.id).tool is not None
+
+        again = engine.rebuild(doc)
+
+        assert again.result_for(logo.id).tool is not None
+
+    def test_a_cached_feature_still_carries_its_warnings(
+        self, bracket_step, engine, fixtures, top_ref
+    ):
+        """preflight_export reads them, and a second rebuild used to empty them."""
+        doc = Document(base=bracket_step)
+        feature = a_feature(
+            "Logo", fixtures / "logo.svg", top_ref,
+            kind=OperationKind.CUT, depth=0.6, direction=Direction.INTO,
+            modifiers=[Modifier(kind=ModifierKind.FILLET, value=9.0,
+                                target=EdgeSelector(role=EdgeRole.TOP))],
+        )
+        doc.add_feature(feature)
+        first = engine.rebuild(doc)
+        assert first.warnings, "an over-large fillet should have something to say"
+
+        assert engine.rebuild(doc).warnings == first.warnings
+
+    def test_reading_a_cached_row_does_not_edit_the_cache(
+        self, bracket_step, engine, fixtures, top_ref
+    ):
+        doc = Document(base=bracket_step)
+        logo = doc.add_feature(
+            a_feature("Logo", fixtures / "logo.svg", top_ref,
+                      kind=OperationKind.ADD, depth=0.8, direction=Direction.OUT_OF)
+        )
+        engine.rebuild(doc)
+        engine.rebuild(doc).result_for(logo.id).warnings.append("scribbled on")
+
+        assert engine.rebuild(doc).result_for(logo.id).warnings == []
+
+
+class TestWhatInvalidatesTheCache:
+    """Only geometry does.  A rename is not geometry."""
+
+    @pytest.fixture
+    def counted(self):
+        """An engine that says how many times it went and read the artwork."""
+        cache = ProfileCache()
+        loads: list[str] = []
+
+        def loader(ref):
+            loads.append(ref.source_path)
+            return cache.get(ref)
+
+        return RebuildEngine(loader), loads
+
+    def test_renaming_a_feature_hits_the_cache(
+        self, bracket_step, counted, fixtures, top_ref
+    ):
+        engine, loads = counted
+        doc = Document(base=bracket_step)
+        logo = doc.add_feature(
+            a_feature("Logo", fixtures / "logo.svg", top_ref,
+                      kind=OperationKind.ADD, depth=0.8, direction=Direction.OUT_OF)
+        )
+        engine.rebuild(doc)
+        before = len(loads)
+
+        logo.name = "Company logo"
+        logo.metadata.notes = "check this with the machinist"
+        result = engine.rebuild(doc)
+
+        assert len(loads) == before, "a rename is not a reason to rebuild anything"
+        assert result.ok
+
+    def test_changing_the_depth_does_not(
+        self, bracket_step, counted, fixtures, top_ref
+    ):
+        engine, loads = counted
+        doc = Document(base=bracket_step)
+        logo = doc.add_feature(
+            a_feature("Logo", fixtures / "logo.svg", top_ref,
+                      kind=OperationKind.ADD, depth=0.8, direction=Direction.OUT_OF)
+        )
+        engine.rebuild(doc)
+        before = len(loads)
+
+        logo.operation.depth = 1.4
+        engine.rebuild(doc)
+
+        assert len(loads) > before
+
+    def test_moving_the_datum_a_feature_sits_on_does_not(
+        self, bracket_step, counted, fixtures
+    ):
+        """The datum lives on the document, so the feature's own record never moved."""
+        from stamp.core.document import DatumDefinition, Plane
+
+        engine, loads = counted
+        datum = DatumDefinition(name="Mid", plane=Plane((0.0, 0.0, 4.0), (0.0, 0.0, 1.0),
+                                                        (1.0, 0.0, 0.0)))
+        doc = Document(base=bracket_step, datums=[datum])
+        doc.add_feature(Feature(
+            name="Logo",
+            profile=ProfileRef(source_path=str(fixtures / "logo.svg"),
+                               source_hash=file_hash(fixtures / "logo.svg")),
+            placement=Placement(anchor=Anchor(kind=AnchorKind.DATUM, datum=datum.id)),
+            operation=Operation(kind=OperationKind.CUT, depth_mode=DepthMode.BLIND,
+                                depth=0.5, direction=Direction.INTO),
+        ))
+        engine.rebuild(doc)
+        before = len(loads)
+
+        datum.plane = Plane((0.0, 0.0, 6.0), (0.0, 0.0, 1.0), (1.0, 0.0, 0.0))
+        engine.rebuild(doc)
+
+        assert len(loads) > before, "the plane moved, so the geometry has to be redone"
+
+
+class TestADepthToAFaceOnAMesh:
+    """A mesh has no faces, and asking anyway took the whole rebuild with it."""
+
+    def test_it_reports_the_feature_instead_of_raising(
+        self, bracket_stl, fixtures, top_plane
+    ):
+        doc = Document(base=bracket_stl)
+        feature = Feature(
+            name="Logo",
+            profile=ProfileRef(source_path=str(fixtures / "logo.svg"),
+                               source_hash=file_hash(fixtures / "logo.svg")),
+            placement=Placement(anchor=Anchor(kind=AnchorKind.MESH_REGION,
+                                              plane=top_plane)),
+            operation=Operation(kind=OperationKind.CUT, depth_mode=DepthMode.TO_FACE,
+                                depth=2.0, direction=Direction.INTO,
+                                to_face_ref=FaceRef(point=(30.0, 20.0, 0.0),
+                                                    normal=(0.0, 0.0, -1.0))),
+        )
+        doc.add_feature(feature)
+
+        result = RebuildEngine(ProfileCache().get).rebuild(doc)
+
+        assert not result.ok
+        assert len(result.features) == 1
+        assert any("blind depth" in e for e in result.errors), result.errors
+
+    def test_the_rest_of_the_document_still_builds(
+        self, bracket_stl, fixtures, top_plane
+    ):
+        doc = Document(base=bracket_stl)
+        doc.add_feature(Feature(
+            name="Bad",
+            profile=ProfileRef(source_path=str(fixtures / "logo.svg"),
+                               source_hash=file_hash(fixtures / "logo.svg")),
+            placement=Placement(anchor=Anchor(kind=AnchorKind.MESH_REGION,
+                                              plane=top_plane)),
+            operation=Operation(kind=OperationKind.CUT, depth_mode=DepthMode.TO_FACE,
+                                depth=2.0, direction=Direction.INTO,
+                                to_face_ref=FaceRef(point=(30.0, 20.0, 0.0),
+                                                    normal=(0.0, 0.0, -1.0))),
+        ))
+        good = Feature(
+            name="Good",
+            profile=ProfileRef(source_path=str(fixtures / "logo.svg"),
+                               source_hash=file_hash(fixtures / "logo.svg")),
+            placement=Placement(anchor=Anchor(kind=AnchorKind.MESH_REGION,
+                                              plane=top_plane)),
+            operation=Operation(kind=OperationKind.ADD, depth_mode=DepthMode.BLIND,
+                                depth=0.8, direction=Direction.OUT_OF),
+        )
+        doc.add_feature(good)
+
+        result = RebuildEngine(ProfileCache().get).rebuild(doc)
+
+        assert result.geometry is not None
+        assert result.result_for(good.id).ok
+        assert result.volume > bracket_stl.volume
+
+
+class TestAPartThatIsNotLoaded:
+    """The geometry is never in the project file (§4.4), so it can be absent.
+
+    An undo across "Replace part" restores the old part's record while the
+    geometry in hand is the new one, and attaching that would be worse than
+    attaching nothing.  What must not happen is a silent empty result.
+    """
+
+    def test_every_feature_says_the_part_needs_reloading(
+        self, bracket_step, engine, fixtures, top_ref
+    ):
+        from stamp.core.document import BasePart
+
+        doc = Document(base=BasePart.from_dict(bracket_step.to_dict()))
+        doc.add_feature(a_feature("Logo", fixtures / "logo.svg", top_ref,
+                                  kind=OperationKind.ADD, depth=0.8,
+                                  direction=Direction.OUT_OF))
+
+        result = engine.rebuild(doc)
+
+        assert not result.ok
+        assert len(result.features) == 1
+        assert any("re-imported" in e for e in result.errors), result.errors

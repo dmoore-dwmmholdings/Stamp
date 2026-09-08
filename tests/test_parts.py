@@ -206,3 +206,58 @@ class TestExportingOnePart:
         # Only the lid: the body sat below z=20 and must not be in here.
         lo, _hi = scene.bounds
         assert lo[2] > 15.0
+
+
+class TestTheGeometrySurvivesACopy:
+    """§4.4 again, and it bites hardest on an assembly.
+
+    The parts are named in the project file; their geometry never is.  Every
+    round trip through JSON - the undo stack, the copy the rebuild worker sends
+    across the thread boundary, opening the project - has to put it back on each
+    part, not only on the assembly.  Without it a stamped assembly rebuilt to
+    nothing at all, and said it was fine while doing so.
+    """
+
+    @pytest.fixture
+    def stamped(self, assembly, fixtures):
+        document = Document(base=assembly)
+        body = assembly.part_named("body")
+        region = _pick_top(body, assembly)
+        _stamp_on(document, fixtures / "two_color.svg", body.index, region.point, region.plane)
+        return document
+
+    def test_an_undo_keeps_every_part_buildable(self, stamped):
+        engine = RebuildEngine(ProfileCache().get)
+        before = engine.rebuild(stamped)
+        assert before.geometry is not None and before.volume > 0
+
+        stamped.restore(stamped.snapshot())
+
+        assert all(p.runtime is not None for p in stamped.base.parts)
+        after = engine.rebuild(stamped)
+        assert after.volume == pytest.approx(before.volume)
+        assert len(after.features) == len(before.features) == 1
+
+    def test_the_copy_the_worker_sends_builds_the_same_thing(self, stamped):
+        """What ui/rebuild_worker does to every document, on every rebuild."""
+        engine = RebuildEngine(ProfileCache().get)
+        before = engine.rebuild(stamped)
+
+        copy = Document.from_dict(stamped.to_dict())
+        copy.base.adopt_runtime(stamped.base)
+
+        after = RebuildEngine(ProfileCache().get).rebuild(copy)
+        assert after.geometry is not None
+        assert after.volume == pytest.approx(before.volume)
+        assert [p.name for p in after.parts] == ["body", "lid"]
+
+    def test_a_part_with_no_geometry_says_so(self, stamped):
+        """Rather than applying nothing and reporting nothing."""
+        for part in stamped.base.parts:
+            part.runtime = None
+
+        result = RebuildEngine(ProfileCache().get).rebuild(stamped)
+
+        assert not result.ok
+        assert len(result.features) == 1
+        assert any("re-imported" in e for e in result.errors), result.errors

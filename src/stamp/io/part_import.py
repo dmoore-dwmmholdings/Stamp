@@ -29,6 +29,7 @@ from OCP.TopTools import TopTools_IndexedMapOfShape
 
 from stamp.core.document import BasePart, PartBody
 from stamp.io.profile_import import file_hash
+from stamp.units import MM_PER_INCH
 
 SOLID_EXTS = {".step", ".stp", ".iges", ".igs", ".brep", ".brp"}
 MESH_EXTS = {".stl", ".3mf", ".obj", ".ply", ".off"}
@@ -377,6 +378,9 @@ def import_mesh(
         ) from exc
     except Exception as exc:
         raise PartImportError(f"Stamp cannot read {path.name}. {exc}") from exc
+    # Read before the scene is flattened: the unit is on the document, and the
+    # concatenated working mesh does not carry it.
+    declared = _declared_unit(loaded, path)
     pieces = _scene_parts(loaded)
     loaded = _one_mesh(loaded, pieces)
     if not isinstance(loaded, trimesh.Trimesh) or loaded.faces.shape[0] == 0:
@@ -403,14 +407,43 @@ def import_mesh(
                 "You can continue."
             )
 
+    # An inside-out mesh - every normal pointing in - is perfectly watertight, so
+    # the repair above never looks at it.  It reaches the booleans as a solid
+    # with negative volume, which is the whole of space minus the part, and
+    # everything cut into it comes out backwards.  Check the sign, not the seams.
+    if _inside_out(loaded):
+        try:
+            trimesh.repair.fix_normals(loaded)
+        except Exception:
+            pass
+        if _inside_out(loaded):
+            loaded.invert()
+        if not _inside_out(loaded):
+            warnings.append(
+                "Every face in this mesh pointed inward, so it described a hollow "
+                "rather than a solid. Stamp turned them the right way out."
+            )
+        else:
+            warnings.append(
+                "This mesh encloses a negative volume, so its faces point inward "
+                "and Stamp could not turn them out. Booleans on it will be wrong."
+            )
+
     # STL carries no unit.  The caller shows a size preview and passes the answer
     # back as unit_scale; the default is mm (§5.2).
-    ambiguous = unit_scale is None and path.suffix.lower() in (".stl", ".obj")
+    ambiguous = unit_scale is None and declared is None and path.suffix.lower() in (
+        ".stl", ".obj", ".3mf", ".ply", ".off"
+    )
+    if unit_scale is None and declared is not None and declared != 1.0:
+        unit_scale = declared
     scale = unit_scale if unit_scale is not None else 1.0
     if scale != 1.0:
         loaded.apply_scale(scale)
         for piece in pieces:
-            piece.apply_scale(scale)
+            # A one-object scene hands back its only piece as the working mesh,
+            # so scaling both would apply the factor to it twice.
+            if piece is not loaded:
+                piece.apply_scale(scale)
 
     manifold = _to_manifold(loaded)
     parts = _describe_parts(pieces)
@@ -433,6 +466,46 @@ def import_mesh(
         ),
         units_ambiguous=ambiguous,
     )
+
+
+def _inside_out(mesh) -> bool:
+    """True when the mesh closes on a negative volume - normals pointing in."""
+    try:
+        if bool(mesh.is_volume):
+            return False
+        return bool(mesh.is_watertight) and float(mesh.volume) < 0.0
+    except Exception:
+        return False
+
+
+#: Unit names a 3MF, PLY or OFF can name itself in, as millimetres.
+_MESH_UNITS_TO_MM = {
+    "micron": 0.001, "micrometer": 0.001, "um": 0.001,
+    "millimeter": 1.0, "millimetre": 1.0, "mm": 1.0,
+    "centimeter": 10.0, "centimetre": 10.0, "cm": 10.0,
+    "meter": 1000.0, "metre": 1000.0, "m": 1000.0,
+    "inch": MM_PER_INCH, "in": MM_PER_INCH,
+    "foot": MM_PER_INCH * 12.0, "feet": MM_PER_INCH * 12.0, "ft": MM_PER_INCH * 12.0,
+}
+
+
+def _declared_unit(loaded, path: Path) -> float | None:
+    """The unit a mesh file names itself in, as millimetres per file unit.
+
+    3MF says so in the ``unit`` attribute of its model element, and trimesh
+    passes that through in the metadata rather than applying it.  A file marked
+    ``inch`` used to arrive twenty-five times too small with nothing said.
+    """
+    if path.suffix.lower() not in (".3mf", ".ply", ".off"):
+        return None
+    metadata = getattr(loaded, "metadata", None) or {}
+    for key in ("unit", "units", "3mf_unit"):
+        value = metadata.get(key)
+        if isinstance(value, str):
+            scale = _MESH_UNITS_TO_MM.get(value.strip().lower())
+            if scale:
+                return scale
+    return None
 
 
 def _scene_parts(loaded) -> list:
