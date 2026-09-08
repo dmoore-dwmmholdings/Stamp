@@ -32,6 +32,46 @@ class TestInsideOutMesh:
         assert not [w for w in part.warnings if "inward" in w]
 
 
+class TestPartlyInsideOutMesh:
+    """Half a box turned around, and one body of an assembly turned around."""
+
+    def test_a_half_inverted_box_is_wound_back(self, fixtures):
+        """Watertight and wound both ways, so neither existing check saw it.
+
+        The two halves cancel to a volume of exactly zero rather than a negative
+        one, so it went through the importer without a word and enclosed nothing.
+        """
+        part = import_part(fixtures / "half_inverted.stl").part
+        assert part.volume == pytest.approx(4800.0, rel=1e-6)
+        assert part.watertight
+        assert float(part.runtime.volume()) == pytest.approx(4800.0, rel=1e-4)
+
+    def test_it_says_the_winding_was_wrong(self, fixtures):
+        part = import_part(fixtures / "half_inverted.stl").part
+        assert any("wound" in w for w in part.warnings), part.warnings
+
+    def test_one_inverted_body_of_an_assembly_is_turned_out(self, fixtures):
+        """40 x 20 x 10 plus a 10 mm cube, not the first one minus the second.
+
+        The negative body cancels part of the positive one, so the assembly is
+        watertight, consistently wound and positive in volume - and the part it
+        belongs to is rebuilt from its own geometry, so a stamp cut into that one
+        came out as the space around it.
+        """
+        part = import_part(fixtures / "half_inverted_assembly.3mf").part
+        assert part.volume == pytest.approx(9000.0, rel=1e-6)
+        assert len(part.parts) == 2
+        assert all(float(body.runtime.volume()) > 0 for body in part.parts)
+
+    def test_it_says_which_way_the_assembly_was_repaired(self, fixtures):
+        part = import_part(fixtures / "half_inverted_assembly.3mf").part
+        assert any("inward" in w for w in part.warnings), part.warnings
+
+    def test_a_good_assembly_is_left_alone(self, fixtures):
+        part = import_part(fixtures / "assembly.3mf").part
+        assert part.warnings == []
+
+
 class TestDeclaredMeshUnits:
     def test_a_3mf_in_inches_arrives_in_millimetres(self, fixtures):
         result = import_part(fixtures / "inch_box.3mf")

@@ -265,6 +265,43 @@ SVG_MM_NO_VIEWBOX = """<?xml version="1.0" encoding="UTF-8"?>
 </svg>
 """
 
+#: A width with no height.  svgelements applies the viewport transform only when
+#: both are absolute, so these four import in the file's own user units and the
+#: size has to be put back afterwards.
+SVG_WIDTH_ONLY = """<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="200mm" viewBox="0 0 100 50">
+  <rect x="0" y="0" width="100" height="50" fill="#000"/>
+</svg>
+"""
+
+#: A height with no width, and a viewBox that is not square - so dividing by the
+#: viewBox width instead of its height gets it wrong by the aspect ratio.
+SVG_HEIGHT_ONLY = """<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" height="100mm" viewBox="0 0 100 50">
+  <rect x="0" y="0" width="100" height="50" fill="#000"/>
+</svg>
+"""
+
+SVG_PX_WIDTH_ONLY = """<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="200px" viewBox="0 0 100 50">
+  <rect x="0" y="0" width="100" height="50" fill="#000"/>
+</svg>
+"""
+
+#: A percentage height, which is no height at all.  Inkscape writes these.
+SVG_PERCENT_HEIGHT = """<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="200mm" height="100%" viewBox="0 0 100 50">
+  <rect x="0" y="0" width="100" height="50" fill="#000"/>
+</svg>
+"""
+
+#: Units in capitals.  CSS unit identifiers are case-insensitive.
+SVG_UPPERCASE_UNITS = """<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="2IN" height="1IN" viewBox="0 0 192 96">
+  <rect x="0" y="0" width="192" height="96" fill="#000"/>
+</svg>
+"""
+
 #: A group transform inside a scaled viewport - the shape ocpsvg has to place,
 #: and the case a viewBox ratio applied afterwards gets most badly wrong.
 SVG_NESTED_TRANSFORM = """<?xml version="1.0" encoding="UTF-8"?>
@@ -324,6 +361,11 @@ SIZING_SVGS = {
     "size_bare.svg": SVG_BARE,
     "size_mm_no_viewbox.svg": SVG_MM_NO_VIEWBOX,
     "size_nested_transform.svg": SVG_NESTED_TRANSFORM,
+    "size_width_only.svg": SVG_WIDTH_ONLY,
+    "size_height_only.svg": SVG_HEIGHT_ONLY,
+    "size_px_width_only.svg": SVG_PX_WIDTH_ONLY,
+    "size_percent_height.svg": SVG_PERCENT_HEIGHT,
+    "size_uppercase_units.svg": SVG_UPPERCASE_UNITS,
 }
 
 
@@ -531,6 +573,44 @@ def make_inverted_stl(path: Path) -> None:
     ).export(path)
 
 
+def make_half_inverted_stl(path: Path) -> None:
+    """A closed box with half its triangles wound the wrong way round.
+
+    Watertight, so the seam repair never runs; the two halves cancel to a volume
+    of exactly zero rather than a negative one, so the inside-out test never runs
+    either.  It went through the whole importer without a word and enclosed
+    nothing at all.
+    """
+    import trimesh
+
+    box = trimesh.creation.box(extents=(40.0, 20.0, 6.0))
+    faces = box.faces.copy()
+    half = len(faces) // 2
+    faces[:half] = faces[:half][:, ::-1]
+    trimesh.Trimesh(vertices=box.vertices, faces=faces, process=False).export(path)
+
+
+def make_half_inverted_assembly_3mf(path: Path) -> None:
+    """Two bodies, one of them built inside out.
+
+    The negative body cancels part of the positive one, so the assembly is
+    watertight, consistently wound, and has a plausible positive volume - and
+    the part that is inside out is still rebuilt from its own geometry, so a
+    stamp cut into it came out as the space around it.
+    """
+    import trimesh
+
+    body = trimesh.creation.box(extents=(40, 20, 10))
+    body.apply_translation((0, 0, 5))
+    clip = trimesh.creation.box(extents=(10, 10, 10))
+    clip.apply_translation((40, 0, 5))
+    clip.invert()
+    scene = trimesh.Scene()
+    scene.add_geometry(body, geom_name="body")
+    scene.add_geometry(clip, geom_name="clip")
+    path.write_bytes(scene.export(file_type="3mf"))
+
+
 def make_blocks_dxf(path: Path) -> None:
     """A drawing whose geometry is all inside block references.
 
@@ -558,6 +638,31 @@ def make_blocks_dxf(path: Path) -> None:
     msp.add_blockref("PAD", (0, 0), dxfattribs={"layer": "PROFILE"})
     msp.add_blockref("PAD", (30, 0), dxfattribs={"layer": "PROFILE"})
     msp.add_circle((60, 3), 3, dxfattribs={"layer": "PROFILE"})
+    doc.saveas(path)
+
+
+def make_minsert_dxf(path: Path) -> None:
+    """A MINSERT: one block reference that draws its block on a 2 x 3 grid.
+
+    ``virtual_entities`` hands back one cell's worth of geometry no matter how
+    big the array is, so an array of six pads imported as one and the drawing
+    came in a sixth of its real size, without a word about it.
+    """
+    import ezdxf
+
+    doc = ezdxf.new("R2010")
+    doc.header["$INSUNITS"] = 4
+    doc.layers.add("ARRAY", color=7)
+
+    cell = doc.blocks.new(name="CELL")
+    cell.add_lwpolyline([(0, 0), (6, 0), (6, 4), (0, 4)], close=True, dxfattribs={"layer": "0"})
+
+    msp = doc.modelspace()
+    insert = msp.add_blockref("CELL", (0, 0), dxfattribs={"layer": "ARRAY"})
+    insert.dxf.row_count = 2
+    insert.dxf.column_count = 3
+    insert.dxf.row_spacing = 10
+    insert.dxf.column_spacing = 10
     doc.saveas(path)
 
 
@@ -642,6 +747,8 @@ def main() -> None:
     make_bracket_rev_b_stl(FIXTURES / "bracket_rev_b.stl")
     make_leaky_stl(FIXTURES / "leaky.stl")
     make_inverted_stl(FIXTURES / "inverted.stl")
+    make_half_inverted_stl(FIXTURES / "half_inverted.stl")
+    make_half_inverted_assembly_3mf(FIXTURES / "half_inverted_assembly.3mf")
     make_assembly_3mf(FIXTURES / "assembly.3mf")
     make_inch_3mf(FIXTURES / "inch_box.3mf")
     make_svgs()
@@ -651,6 +758,7 @@ def main() -> None:
     make_serial_dxf(FIXTURES / "serial.dxf")
     make_blocks_dxf(FIXTURES / "blocks.dxf")
     make_ring_bowtie_dxf(FIXTURES / "ring_bowtie.dxf")
+    make_minsert_dxf(FIXTURES / "minsert.dxf")
     for f in sorted(FIXTURES.iterdir()):
         print(f"{f.name:>26}  {f.stat().st_size:>8,} bytes")
 

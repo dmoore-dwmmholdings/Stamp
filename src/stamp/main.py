@@ -30,11 +30,22 @@ def _offscreen_qt_application():
     never produce a package at all.  The offscreen platform plugin ships with Qt
     on every system Stamp runs on and needs no display, no window server and no
     logged-in session, which is what a build machine has.
+
+    The platform is forced rather than defaulted.  A QT_QPA_PLATFORM already in
+    the environment is usually left over from something else - ``xcb`` exported
+    in a shell profile, then the same profile used on a Mac - and Qt aborts
+    inside the QGuiApplication constructor when the named plugin will not load,
+    which is not something the command line can catch or report.  Only a process
+    that has no QGuiApplication yet is affected; one that does keeps whatever
+    platform it started with.
     """
-    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     from PySide6.QtGui import QGuiApplication
 
-    return QGuiApplication.instance() or QGuiApplication([sys.argv[0]])
+    existing = QGuiApplication.instance()
+    if existing is not None:
+        return existing
+    os.environ["QT_QPA_PLATFORM"] = "offscreen"
+    return QGuiApplication([sys.argv[0]])
 
 
 def _package_resource(name: str):

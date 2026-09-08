@@ -13,6 +13,7 @@ import math
 import pytest
 from OCP.BRepAlgoAPI import BRepAlgoAPI_Common
 from OCP.BRepBuilderAPI import BRepBuilderAPI_MakeEdge
+from OCP.BRepCheck import BRepCheck_Analyzer
 from OCP.BRepPrimAPI import BRepPrimAPI_MakeBox, BRepPrimAPI_MakeCone, BRepPrimAPI_MakeCylinder
 from OCP.gp import gp_Ax2, gp_Dir, gp_Pnt
 
@@ -20,6 +21,9 @@ from stamp.core.document import (
     DepthMode,
     Direction,
     EdgeRole,
+    EdgeSelector,
+    Modifier,
+    ModifierKind,
     Operation,
     OperationKind,
     Placement,
@@ -198,6 +202,24 @@ class TestDepth:
         assert high == pytest.approx(RADIUS + 0.8, abs=1e-9)
         assert low < RADIUS  # the margin, buried in the part
 
+    def test_through_all_is_refused_for_a_boss(self, tube_face):
+        """A boss has no far side to reach, so it grew a 67 mm radial fin instead."""
+        operation = Operation(
+            kind=OperationKind.ADD, depth_mode=DepthMode.THROUGH_ALL,
+            direction=Direction.OUT_OF,
+        )
+        with pytest.raises(ToolSolidError, match="Through-all"):
+            wrap(rectangle(6.0, 3.0), tube_face, operation)
+
+    def test_a_through_cut_still_reaches_the_axis(self, tube_face):
+        operation = Operation(
+            kind=OperationKind.CUT, depth_mode=DepthMode.THROUGH_ALL,
+            direction=Direction.INTO,
+        )
+        tool = wrap(rectangle(6.0, 3.0), tube_face, operation)
+        low, _high = radial_range(tool.shape)
+        assert low < RADIUS * 0.01
+
     def test_a_draft_angle_is_refused_rather_than_ignored(self, tube_face):
         operation = Operation(
             kind=OperationKind.CUT, depth_mode=DepthMode.BLIND, depth=1.0,
@@ -241,6 +263,95 @@ class TestWrappedEdges:
         assert len(groups[EdgeRole.TOP]) == 8
         assert len(groups[EdgeRole.BOTTOM]) == 8
         assert len(groups[EdgeRole.SIDE]) == 8
+
+
+class TestExactCurves:
+    """The wrap is built from lines, arcs and planes, not from approximations.
+
+    Every segment used to be laid down as a line in the surface's own parameters
+    and approximated as a B-spline, and the walls ruled between those splines were
+    spline surfaces too.  The tool measured about a part in ten million off, and
+    nothing downstream could round it.
+    """
+
+    def test_the_tool_carries_no_approximated_geometry(self, tube_face):
+        tool = wrap(rectangle(12.0, 5.0), tube_face, cut(1.0))
+        assert _surface_types(tool.shape) == {"GeomAbs_Cylinder": 2, "GeomAbs_Plane": 4}
+        assert "GeomAbs_BSplineCurve" not in _curve_types(tool.shape)
+
+    def test_the_volume_is_the_annulus_sector_exactly(self, tube_face):
+        """A 12 x 5 mark 1 mm deep is a known number, to the last digit."""
+        tool = wrap(rectangle(12.0, 5.0), tube_face, cut(1.0))
+        margin = max(1e-3, DIAGONAL * 1e-5)
+        expected = (
+            0.5 * ((RADIUS + margin) ** 2 - (RADIUS - 1.0) ** 2) * (12.0 / RADIUS) * 5.0
+        )
+        assert solid_ops.volume(tool.shape) == pytest.approx(expected, rel=1e-9)
+
+    def test_a_turned_mark_still_wraps_as_a_helix(self, tube_face):
+        """A segment that is neither axial nor round the face is still approximated."""
+        tool = wrap(
+            rectangle(12.0, 5.0), tube_face, cut(1.0),
+            placement=Placement(mode=PlacementMode.WRAP, rotation=30.0),
+        )
+        assert solid_ops.volume(tool.shape) > 0
+        assert BRepCheck_Analyzer(tool.shape).IsValid()
+
+    def test_a_logo_wraps_to_the_volume_it_always_did(self, logo_profile, tube_face):
+        """Holes, corners and all - the exact curves did not move the artwork."""
+        tool = wrap(logo_profile, tube_face, cut(0.6))
+        assert BRepCheck_Analyzer(tool.shape).IsValid()
+        assert solid_ops.volume(tool.shape) == pytest.approx(298.4963, rel=1e-5)
+
+
+class TestModifiersOnAWrappedMark:
+    """A wrapped mark takes a fillet.  For a while no radius on it worked at all.
+
+    The tool was closed into a solid flagged reversed, which measures the volume it
+    should and passes every check, and which BRepFilletAPI then read inside out: it
+    reported IsDone on a result BRepCheck refused, at 0.3 mm, at 0.1 mm and at
+    0.02 mm alike, and the user was told a plain 12 x 5 rectangle was too fine.
+    """
+
+    def test_the_tool_solid_is_not_flagged_inside_out(self, tube_face):
+        from OCP.TopAbs import TopAbs_Orientation, TopAbs_ShapeEnum
+
+        for operation in (cut(1.0), add(1.0)):
+            tool = wrap(rectangle(12.0, 5.0), tube_face, operation)
+            solids = solid_ops.explore(tool.shape, TopAbs_ShapeEnum.TopAbs_SOLID)
+            assert solids
+            for solid in solids:
+                assert solid.Orientation() == TopAbs_Orientation.TopAbs_FORWARD
+
+    def test_every_radius_rounds_the_top_edges(self, tube_face):
+        for operation in (cut(1.0), add(1.0)):
+            tool = wrap(rectangle(12.0, 5.0), tube_face, operation)
+            for radius in (0.3, 0.1, 0.02):
+                self._works(tool, ModifierKind.FILLET, radius, EdgeRole.TOP)
+
+    def test_and_the_side_edges_too(self, tube_face):
+        for operation in (cut(1.0), add(1.0)):
+            tool = wrap(rectangle(12.0, 5.0), tube_face, operation)
+            for radius in (0.3, 0.1, 0.02):
+                self._works(tool, ModifierKind.FILLET, radius, EdgeRole.SIDE)
+
+    def test_a_chamfer_works_the_same_way(self, tube_face):
+        for operation in (cut(1.0), add(1.0)):
+            tool = wrap(rectangle(12.0, 5.0), tube_face, operation)
+            for distance in (0.3, 0.1, 0.02):
+                self._works(tool, ModifierKind.CHAMFER, distance, EdgeRole.TOP)
+
+    @staticmethod
+    def _works(tool, kind: ModifierKind, value: float, role: EdgeRole) -> None:
+        modifier = Modifier(kind=kind, value=value, target=EdgeSelector(role=role))
+        edges = solid_ops.select_edges(
+            tool.shape, modifier, tool.direction, axis=tool.axis
+        )
+        assert len(edges) == 4
+        result = solid_ops.apply_modifier(tool.shape, modifier, edges, label="Round")
+        assert result.applied, result.warnings
+        assert BRepCheck_Analyzer(result.shape).IsValid()
+        assert solid_ops.volume(result.shape) < solid_ops.volume(tool.shape)
 
 
 class TestHolesAndPlacement:
@@ -306,6 +417,25 @@ class TestCone:
         assert volume_beyond(tool.shape, 0.0) == pytest.approx(0.0, abs=1e-9)
         assert solid_ops.volume(tool.shape) > 0
 
+    def test_a_cut_past_the_local_radius_is_built_not_thrown(self, cone_face):
+        """Both radii clamped to the same 1e-6 threw "cone with two identic radii".
+
+        That is a raw Standard_Failure out of the kernel, which no caller was
+        catching, so a through cut on a cone ended the whole rebuild.
+        """
+        plane = self._plane(cone_face)
+        through = Operation(
+            kind=OperationKind.CUT, depth_mode=DepthMode.THROUGH_ALL,
+            direction=Direction.INTO,
+        )
+        for operation in (through, cut(12.0)):
+            tool = build_tool_solid(
+                rectangle(3.0, 2.0), Placement(mode=PlacementMode.WRAP), operation,
+                plane, part_diagonal=25.0, target_face=cone_face,
+            )
+            assert solid_ops.volume(tool.shape) > 0
+            assert volume_beyond(tool.shape, 0.0) == pytest.approx(0.0, abs=1e-9)
+
     def test_artwork_too_wide_for_a_projection_is_refused(self, cone_face):
         plane = self._plane(cone_face)
         with pytest.raises(ToolSolidError, match="too wide to wrap onto this cone"):
@@ -313,6 +443,36 @@ class TestCone:
                 rectangle(12.0, 12.0), Placement(mode=PlacementMode.WRAP), cut(0.4), plane,
                 part_diagonal=25.0, target_face=cone_face,
             )
+
+
+def _surface_types(shape) -> dict[str, int]:
+    from OCP.BRepAdaptor import BRepAdaptor_Surface
+    from OCP.TopAbs import TopAbs_ShapeEnum
+    from OCP.TopExp import TopExp_Explorer
+    from OCP.TopoDS import TopoDS
+
+    counts: dict[str, int] = {}
+    explorer = TopExp_Explorer(shape, TopAbs_ShapeEnum.TopAbs_FACE)
+    while explorer.More():
+        name = str(BRepAdaptor_Surface(TopoDS.Face_s(explorer.Current())).GetType())
+        counts[name.split(".")[-1]] = counts.get(name.split(".")[-1], 0) + 1
+        explorer.Next()
+    return counts
+
+
+def _curve_types(shape) -> set[str]:
+    from OCP.BRepAdaptor import BRepAdaptor_Curve
+    from OCP.TopAbs import TopAbs_ShapeEnum
+    from OCP.TopExp import TopExp_Explorer
+    from OCP.TopoDS import TopoDS
+
+    names = set()
+    explorer = TopExp_Explorer(shape, TopAbs_ShapeEnum.TopAbs_EDGE)
+    while explorer.More():
+        name = str(BRepAdaptor_Curve(TopoDS.Edge_s(explorer.Current())).GetType())
+        names.add(name.split(".")[-1])
+        explorer.Next()
+    return names
 
 
 def _rectangle_with_hole(width, height, hole_w, hole_h):

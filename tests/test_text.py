@@ -207,6 +207,47 @@ class TestTextFeature:
         assert target.exists()
 
 
+class TestFontSubstitution:
+    """Qt never refuses a family; it lays the message out in the nearest thing it has."""
+
+    def _issue(self, family):
+        from stamp.io.text_profile import _font, font_substitution
+
+        spec = TextSpec(text="Ab", size_mm=6.0, family=family)
+        return font_substitution(spec, _font(spec))
+
+    def _default_family(self, family="Stamp No Such Family"):
+        from PySide6.QtGui import QFont, QFontInfo
+
+        return QFontInfo(QFont(family)).family()
+
+    def test_a_family_that_is_not_installed_is_named(self, qapp):
+        issue = self._issue("Stamp No Such Family")
+        assert issue is not None
+        assert issue.detail["requested_family"] == "Stamp No Such Family"
+        assert not issue.blocking
+
+    def test_the_family_qt_falls_back_to_is_not_itself_a_substitution(self, qapp):
+        """Asked for by name, whatever this machine's fallback happens to be called.
+
+        QFontInfo reports the face Qt resolved to, which on some platforms is an
+        alias rather than the name in the family list, so the requested family
+        came back as "not installed" about the very font being used.
+        """
+        assert self._issue(self._default_family()) is None
+
+    def test_an_installed_family_is_matched_whatever_its_case(self, qapp):
+        from PySide6.QtGui import QFontDatabase
+
+        families = [f for f in QFontDatabase.families() if f.lower() != f.upper()]
+        assert families, "no font on this machine has a case to change"
+        assert self._issue(families[0].upper()) is None
+        assert self._issue(families[0].lower()) is None
+
+    def test_no_family_asked_for_is_never_a_substitution(self, qapp):
+        assert self._issue("") is None
+
+
 class TestTextGetsAWorkingValue:
     """Small text with a large fillet is the case the first search could not do.
 

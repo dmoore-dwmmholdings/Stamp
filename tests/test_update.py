@@ -79,9 +79,36 @@ class TestComparingVersions:
         assert update.parse_version("1.5.0rc1") < update.parse_version("1.5.0")
         assert update.parse_version("1.5.0rc1") > update.parse_version("1.4.9")
 
+    def test_the_pre_releases_of_one_version_are_ordered_among_themselves(self):
+        """Every pre-release of 1.6.0 used to compare equal to every other.
+
+        "1.6.0-rc1" and "1.6.0-rc2" came out as the same version, so rc2 was
+        not an update from rc1 and withdrawing rc1 withdrew rc2 with it.  The
+        tail is carried as its own part of the version now, tag and number.
+        """
+        ordered = ["1.6.0-alpha", "1.6.0-beta2", "1.6.0-rc1", "1.6.0-rc2",
+                   "1.6.0-rc10", "1.6.0", "1.9.0", "1.10.0"]
+        parsed = [update.parse_version(v) for v in ordered]
+        assert parsed == sorted(parsed)
+        assert len(set(parsed)) == len(parsed)
+
+    def test_the_same_version_written_three_ways_is_one_version(self):
+        assert update.parse_version("1.6.0rc1") == update.parse_version("1.6.0-rc1")
+        assert update.parse_version("1.6.0.rc1") == update.parse_version("1.6.0-rc1")
+
+    def test_build_metadata_is_not_a_different_release(self):
+        """"+build5" says how a release was built, not which release it is."""
+        assert update.parse_version("1.6.0+build5") == update.parse_version("1.6.0")
+        assert update.parse_version("1.6.0-rc1+build5") == update.parse_version("1.6.0-rc1")
+
+    def test_a_tail_behind_a_dot_is_still_a_pre_release(self):
+        """1.6.0.rc1 was read as a final release and offered over 1.6.0."""
+        assert update.parse_version("1.6.0.rc1") < update.parse_version("1.6.0")
+
     def test_nonsense_does_not_raise(self):
         """A feed is remote input; it must not be able to crash the check."""
-        assert update.parse_version("") == (0, 0, 0, 1)
+        assert update.parse_version("") == (0, 0, 0, 1, "", 0)
+        assert update.parse_version("not a version") < update.parse_version("0.0.1")
 
 
 class TestTrustingTheManifest:
@@ -302,6 +329,78 @@ class TestDownloading:
                 release.artifact, tmp_path / "into", cancelled=lambda: True
             )
         assert not (tmp_path / "into" / installer.name).exists()
+
+
+class TestTidyingUp:
+    """A download nobody installs is a hundred megabytes left in %TEMP%."""
+
+    @pytest.fixture
+    def installer(self, tmp_path):
+        path = tmp_path / "Stamp-9.9.9-Setup.exe"
+        path.write_bytes(b"pretend this is an installer" * 500)
+        return path
+
+    def _download(self, keypair, tmp_path, installer):
+        private, public = keypair
+        url = _publish(tmp_path, private, _manifest("9.9.9", installer))
+        with _key(public):
+            release = update.check("1.4.0", url)
+        return update.download(release.artifact, tmp_path / "into")
+
+    def test_a_second_download_clears_what_the_first_left(
+        self, keypair, tmp_path, installer
+    ):
+        """Skip, later, or quit without installing all used to leave one."""
+        first = self._download(keypair, tmp_path, installer)
+        second = self._download(keypair, tmp_path, installer)
+        assert second.exists()
+        assert not first.parent.exists()
+        assert [p.name for p in (tmp_path / "into").iterdir()] == [second.parent.name]
+
+    def test_what_was_swept_is_no_longer_a_file_stamp_would_run(
+        self, keypair, tmp_path, installer, monkeypatch
+    ):
+        """The hash goes with the file, or that path stays runnable forever."""
+        first = self._download(keypair, tmp_path, installer)
+        self._download(keypair, tmp_path, installer)
+        first.parent.mkdir(parents=True, exist_ok=True)
+        first.write_bytes(b"anything at all")
+        monkeypatch.setattr(sys, "platform", "win32")
+        with pytest.raises(update.UpdateError, match="does not know"):
+            update.install(first)
+
+    def test_discarding_takes_the_directory_with_it(
+        self, keypair, tmp_path, installer
+    ):
+        """What the UI calls when the user skips or closes without installing."""
+        got = self._download(keypair, tmp_path, installer)
+        update.discard(got)
+        assert not got.exists()
+        assert not got.parent.exists()
+        assert list((tmp_path / "into").iterdir()) == []
+
+    def test_discarding_forgets_the_hash_as_well(
+        self, keypair, tmp_path, installer, monkeypatch
+    ):
+        got = self._download(keypair, tmp_path, installer)
+        update.discard(got)
+        got.parent.mkdir(parents=True, exist_ok=True)
+        got.write_bytes(b"anything at all")
+        monkeypatch.setattr(sys, "platform", "win32")
+        with pytest.raises(update.UpdateError, match="does not know"):
+            update.install(got)
+
+    def test_discarding_a_file_stamp_did_not_place_leaves_the_folder(
+        self, tmp_path
+    ):
+        """Only the directories Stamp made are Stamp's to remove."""
+        elsewhere = tmp_path / "Downloads"
+        elsewhere.mkdir()
+        stray = elsewhere / "Stamp-Setup.exe"
+        stray.write_bytes(b"anything at all")
+        update.discard(stray)
+        assert not stray.exists()
+        assert elsewhere.exists()
 
 
 class TestInstalling:

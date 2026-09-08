@@ -45,6 +45,31 @@ class TestTheNameARowWritesTo:
         """"PN-1234.5" is a name, not a file type, and must keep its .5."""
         assert str(_output_name("PN-1234.5", "stl")) == "PN-1234.5.stl"
 
+    def test_the_batch_report_cannot_be_written_over(self):
+        """The check used to be made after the suffix had gone on.
+
+        By then the name was "stamp-batch-report.json.step" and the reserved
+        one it was compared against never matched, so a row could quietly
+        overwrite the report of the run it was part of.
+        """
+        for name in ("stamp-batch-report.json", "STAMP-Batch-Report.json",
+                     "stamp-batch-report", "stamp-batch-report.step"):
+            with pytest.raises(BatchError, match="batch report"):
+                _output_name(name, "step")
+
+    def test_a_name_that_is_only_a_suffix_is_refused(self):
+        """"part." was written as "part..step" and ".step" as ".step.step"."""
+        for name in ("part.", ".step", ".stl", "..."):
+            with pytest.raises(BatchError, match="no file name"):
+                _output_name(name, "step")
+
+    def test_a_folder_is_not_a_name_to_write_to(self):
+        """Path drops the trailing separator, so "dir/" became "dir.step"."""
+        with pytest.raises(BatchError, match="folder"):
+            _output_name("dir/", "step")
+        with pytest.raises(BatchError, match="folder"):
+            _output_name("sub/dir/", "step")
+
     def test_a_path_that_leaves_the_folder_is_refused(self):
         with pytest.raises(BatchError, match="inside"):
             _output_name("../escape", "stl")

@@ -455,6 +455,64 @@ class TestSwappingBetweenMeshAndSolid:
         assert len(report.lost) == 1
         assert report.lost[0].detail
 
+    def a_solid_document_with_references(self, part, fixtures):
+        """A face anchor carrying everything a solid can give it."""
+        from stamp.core.refs import resolve_anchor
+
+        ref = top_face_ref(part, 8.0)
+        anchor = Anchor(
+            kind=AnchorKind.FACE,
+            face_ref=FaceRef.from_dict(ref.to_dict()),
+            alignment_ref=longest_edge_of(ref, part),
+        )
+        anchor.plane, _warnings = resolve_anchor(anchor, part.runtime)
+        doc = Document(base=part)
+        doc.add_feature(Feature(
+            name="logo",
+            profile=ProfileRef(source_path=str(fixtures / "logo.svg"),
+                               source_hash=file_hash(fixtures / "logo.svg")),
+            placement=Placement(anchor=anchor),
+            operation=Operation(kind=OperationKind.CUT, depth_mode=DepthMode.BLIND,
+                                depth=0.6, direction=Direction.INTO),
+        ))
+        return doc
+
+    def test_a_mesh_leaves_no_references_to_the_solid_behind(self, bracket, fixtures):
+        """A mesh has no faces and no edges, so keeping them is keeping stale data."""
+        mesh = import_part(fixtures / "bracket.stl").part
+        doc = self.a_solid_document_with_references(bracket, fixtures)
+
+        replace_part(doc, mesh)
+
+        anchor = doc.features[0].placement.anchor
+        assert anchor.kind is AnchorKind.MESH_REGION
+        assert anchor.face_ref is None
+        assert anchor.alignment_ref is None
+        assert anchor.origin_ref is None
+        assert anchor.mesh_seed is not None
+
+    def test_a_solid_mesh_solid_round_trip_lands_on_the_new_part(self, bracket, fixtures):
+        """The mark went out to a print and came back to the model it was cut from.
+
+        Left as a face anchor on the way out, the second replacement resolved the
+        references captured two revisions ago rather than asking the mesh where the
+        mark actually sits.
+        """
+        mesh = import_part(fixtures / "bracket.stl").part
+        rev_b = import_part(fixtures / "bracket_rev_b.step").part
+        doc = self.a_solid_document_with_references(bracket, fixtures)
+
+        replace_part(doc, mesh)
+        report = replace_part(doc, rev_b)
+
+        assert report.ok, [m.detail for m in report.lost]
+        anchor = doc.features[0].placement.anchor
+        assert anchor.kind is AnchorKind.FACE
+        assert anchor.face_ref is not None
+        assert anchor.plane.origin[2] == pytest.approx(8.0, abs=0.2)
+        result = RebuildEngine(ProfileCache().get).rebuild(doc)
+        assert result.ok, result.errors
+
     def test_replacing_a_step_with_a_mesh_keeps_the_plane(self, bracket, fixtures):
         """The other direction: a mesh has no faces, so the fitted plane is it."""
         mesh = import_part(fixtures / "bracket.stl").part

@@ -350,8 +350,19 @@ def replace_part(document: Document, new_part: BasePart) -> ReplaceReport:
             continue
         if new_part.mode == "mesh":
             plane, _score, _detail = _match_mesh_anchor(anchor, shape, delta)
-            if plane is not None:
-                anchor.plane = plane
+            if plane is None:
+                continue
+            # The mark now sits on triangles, so it is a mesh-region anchor from here
+            # on, the mirror of what a region becomes when a solid replaces the mesh.
+            # Left as a face anchor it kept the old solid's face, edge and origin
+            # references, and the next replacement resolved references two revisions
+            # out of date against the part in hand.
+            anchor.plane = plane
+            anchor.kind = AnchorKind.MESH_REGION
+            anchor.mesh_seed = plane.origin
+            anchor.face_ref = None
+            anchor.alignment_ref = None
+            anchor.origin_ref = None
             continue
         if anchor.kind is AnchorKind.MESH_REGION:
             plane, _score, _detail = _match_region_on_solid(anchor, shape, delta)

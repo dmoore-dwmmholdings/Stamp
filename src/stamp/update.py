@@ -131,33 +131,60 @@ def can_install() -> bool:
 # Versions and platforms
 # --------------------------------------------------------------------------
 
-def parse_version(text: str) -> tuple[int, int, int, int]:
+def parse_version(text: str) -> tuple[int, int, int, int, str, int]:
     """A comparable version.
 
     String comparison gets 1.10.0 wrong against 1.9.0, which is the classic way
-    to strand everyone on an old release.  The fourth number carries "is this a
-    final release": a 0 for 1.5.0-rc1 sorts it below the 1 for 1.5.0.
+    to strand everyone on an old release, so the three numbers come out as
+    numbers.  What follows them is a pre-release tail, and it is kept whole
+    rather than flattened to a yes-or-no: the fourth field says whether this is
+    a final release, and the two after it order the pre-releases of one triple
+    among themselves.  Flattening made every pre-release of 1.6.0 equal, so
+    1.6.0-rc2 was not an update from 1.6.0-rc1 and a withdrawn rc1 revoked rc2
+    along with it.
 
-    A letter anywhere in the version means the same thing as the dash does, so
-    that 1.5.0rc1 sorts below 1.5.0 rather than above it: only the digits at the
-    front of a piece are its number, and "rc1" is what makes it a pre-release.
+    A letter anywhere means the same thing as the dash does, thus 1.6.0rc1 and
+    1.6.0.rc1 are the pre-release that 1.6.0-rc1 is.  "+build5" is metadata
+    about how a release was built, not a different release, thus it is dropped.
     """
     cleaned = str(text).strip().lstrip("vV")
-    head, _, pre = cleaned.partition("-")
-    prerelease = bool(pre)
+    cleaned = cleaned.partition("+")[0]
+    head, _, tail = cleaned.partition("-")
     numbers: list[int] = []
-    for piece in head.split(".")[:3]:
+    for index, piece in enumerate(head.split(".")):
         digits = ""
         for ch in piece:
             if not ch.isdigit():
                 break
             digits += ch
-        numbers.append(int(digits) if digits else 0)
-        if any(ch.isalpha() for ch in piece):
-            prerelease = True
+        if index < 3:
+            numbers.append(int(digits) if digits else 0)
+        rest = piece[len(digits):]
+        # The first letters in the head are where the version stops and its
+        # pre-release begins, whether they are stuck to a number or a piece of
+        # their own.  A tail after the dash is only reached when there are none.
+        if rest and not tail:
+            tail = rest
     while len(numbers) < 3:
         numbers.append(0)
-    return (numbers[0], numbers[1], numbers[2], 0 if prerelease else 1)
+
+    if not tail:
+        return (numbers[0], numbers[1], numbers[2], 1, "", 0)
+    # alpha, beta, rc happen to sort that way as words, which is the order they
+    # are released in.  The number after the tag is a number, so rc10 follows
+    # rc9 rather than rc1.
+    tag = ""
+    for ch in tail:
+        if not ch.isalpha():
+            break
+        tag += ch
+    digits = ""
+    for ch in tail[len(tag):]:
+        if ch.isdigit():
+            digits += ch
+        elif digits or ch not in ".-_":
+            break
+    return (numbers[0], numbers[1], numbers[2], 0, tag.lower(), int(digits or 0))
 
 
 def platform_key() -> str:
@@ -326,6 +353,64 @@ def _sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+#: The prefix every download's directory is made with, and what a later
+#: download recognises the earlier ones by.
+TEMP_PREFIX = "stamp-update-"
+
+
+def _forget_missing() -> None:
+    """Drop what was verified about files that are no longer on disk."""
+    for key in [name for name in _verified if not Path(name).exists()]:
+        _verified.pop(key, None)
+
+
+def _sweep(parent: Path) -> None:
+    """Remove the directories earlier downloads left behind.
+
+    An installer is around a hundred megabytes, and every offer that is skipped,
+    put off, or quit out of used to leave one where it fell.  Errors are
+    ignored on purpose: on Windows a directory an installer is still running
+    out of cannot be removed, and failing to tidy up is not a reason to refuse
+    the download that was actually asked for.
+    """
+    try:
+        stale = [entry for entry in parent.glob(TEMP_PREFIX + "*") if entry.is_dir()]
+    except OSError:
+        stale = []
+    for entry in stale:
+        shutil.rmtree(entry, ignore_errors=True)
+    _forget_missing()
+
+
+def discard(path: Path) -> None:
+    """Throw away a downloaded installer, directory and all.
+
+    The download and the install are separate decisions, so there is a state
+    where a verified installer sits in the temporary folder and nobody is going
+    to run it - the user skipped the version, or closed the window without
+    installing.  The UI says so here rather than leaving it for the next
+    download to sweep.
+    """
+    target = Path(path)
+    keys = {str(target)}
+    try:
+        keys.add(str(target.resolve()))
+    except OSError:
+        pass
+    for key in keys:
+        _verified.pop(key, None)
+    directory = target.parent
+    if directory.name.startswith(TEMP_PREFIX):
+        shutil.rmtree(directory, ignore_errors=True)
+    else:
+        # Somewhere Stamp did not make: take the file and leave the folder.
+        try:
+            target.unlink(missing_ok=True)
+        except OSError:
+            pass
+    _forget_missing()
+
+
 def download(
     artifact: Artifact,
     into: Path | None = None,
@@ -342,7 +427,10 @@ def download(
     """
     if into is not None:
         into.mkdir(parents=True, exist_ok=True)
-    directory = Path(tempfile.mkdtemp(prefix="stamp-update-", dir=into))
+    # Before, not after: what the last download left is dead weight the moment a
+    # new one starts, and this is the only moment Stamp is certainly running.
+    _sweep(into if into is not None else Path(tempfile.gettempdir()))
+    directory = Path(tempfile.mkdtemp(prefix=TEMP_PREFIX, dir=into))
     target = directory / Path(artifact.name).name
     digest = hashlib.sha256()
     # What the manifest promised, or the ceiling for an artifact of no stated
@@ -443,6 +531,7 @@ __all__ = [
     "UpdateError",
     "can_install",
     "check",
+    "discard",
     "download",
     "feed_url",
     "install",

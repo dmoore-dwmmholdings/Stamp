@@ -382,6 +382,7 @@ def import_mesh(
     # concatenated working mesh does not carry it.
     declared = _declared_unit(loaded, path)
     pieces = _scene_parts(loaded)
+    turned_out = _turn_out_inverted_pieces(pieces)
     loaded = _one_mesh(loaded, pieces)
     if not isinstance(loaded, trimesh.Trimesh) or loaded.faces.shape[0] == 0:
         raise PartImportError(
@@ -389,6 +390,11 @@ def import_mesh(
         )
 
     warnings: list[str] = []
+    if turned_out:
+        warnings.append(
+            f"{turned_out} part{'s' if turned_out != 1 else ''} of this assembly "
+            f"had every face pointing inward. Stamp turned them the right way out."
+        )
     watertight = bool(loaded.is_watertight)
     if not watertight:
         # trimesh's repair pass, then re-test.  Never block on the result (§5.2).
@@ -429,6 +435,27 @@ def import_mesh(
                 "and Stamp could not turn them out. Booleans on it will be wrong."
             )
 
+    # Watertight and wound both ways at once - half the faces of a box turned
+    # around.  It closes, so the seam repair never looks at it, and the two
+    # halves cancel to a volume of zero rather than a negative one, so the sign
+    # test above does not see it either.  It then reaches the booleans as a
+    # solid of no volume and takes the stamp with it, silently.
+    if watertight and not _winding_consistent(loaded):
+        try:
+            trimesh.repair.fix_normals(loaded)
+        except Exception:  # noqa: BLE001 - a mesh Stamp cannot repair is not fatal
+            pass
+        if _winding_consistent(loaded):
+            warnings.append(
+                "Some of this mesh's faces were wound the wrong way round. Stamp "
+                "turned them to match the rest."
+            )
+        else:
+            warnings.append(
+                "This mesh's faces are not wound consistently, so it encloses no "
+                "volume Stamp can work with. Booleans on it will be wrong."
+            )
+
     # STL carries no unit.  The caller shows a size preview and passes the answer
     # back as unit_scale; the default is mm (§5.2).
     ambiguous = unit_scale is None and declared is None and path.suffix.lower() in (
@@ -466,6 +493,40 @@ def import_mesh(
         ),
         units_ambiguous=ambiguous,
     )
+
+
+def _winding_consistent(mesh) -> bool:
+    """True when neighbouring faces agree on which side is out."""
+    try:
+        return bool(mesh.is_winding_consistent)
+    except Exception:  # noqa: BLE001 - a mesh that cannot answer is taken at its word
+        return True
+
+
+def _turn_out_inverted_pieces(pieces) -> int:
+    """Turn out any body of an assembly whose normals point in, and count them.
+
+    One body can be inside out on its own while the assembly as a whole is
+    watertight, consistently wound and positive in volume - the negative body
+    simply cancels part of a positive one.  Neither the seam repair nor the sign
+    test on the whole mesh looks at it, and each part is rebuilt from its own
+    geometry, so a stamp cut into that one came out as the space around it.
+    """
+    import trimesh
+
+    turned = 0
+    for piece in pieces:
+        if not _inside_out(piece):
+            continue
+        try:
+            trimesh.repair.fix_normals(piece)
+        except Exception:  # noqa: BLE001 - a body Stamp cannot repair is left alone
+            pass
+        if _inside_out(piece):
+            piece.invert()
+        if not _inside_out(piece):
+            turned += 1
+    return turned
 
 
 def _inside_out(mesh) -> bool:

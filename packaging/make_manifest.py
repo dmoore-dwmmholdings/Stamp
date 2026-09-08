@@ -76,22 +76,26 @@ def build(
     missing: list[str] = []
     artifacts: dict[str, dict] = {}
     for key, suffix in PLATFORMS.items():
+        # Spelled out rather than shown as "Stamp-1.6.0-*-Setup.exe": the match
+        # is a prefix and a suffix, and Stamp-1.6.0-Setup.exe - the name the
+        # Windows job produces - has nothing in the middle for a star.
+        described = f"a name starting with {prefix} and ending with {suffix}"
         candidates = sorted(assets.glob(f"*{suffix}"))
         matches = [path for path in candidates if path.name.startswith(prefix)]
         if len(matches) > 1:
             raise ManifestError(
-                f"{key}: more than one {prefix}*{suffix} in {assets} "
+                f"{key}: more than one file in {assets} has {described} "
                 f"({', '.join(path.name for path in matches)}). "
                 "Refusing to guess which one to sign."
             )
         if not matches:
             if candidates:
                 raise ManifestError(
-                    f"{key}: none of {', '.join(p.name for p in candidates)} is a "
-                    f"{prefix}*{suffix}. The tag and the version that was built "
+                    f"{key}: none of {', '.join(p.name for p in candidates)} has "
+                    f"{described}. The tag and the version that was built "
                     "disagree, so the manifest would name a version nobody has."
                 )
-            print(f"  no artifact for {key} (looked for {prefix}*{suffix})", file=sys.stderr)
+            print(f"  no artifact for {key} (looked for {described})", file=sys.stderr)
             missing.append(key)
             continue
         path = matches[0]

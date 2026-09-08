@@ -105,6 +105,31 @@ class TestPackageFromTheCommandLine:
         assert manifest["project"] == "job"
         assert zipfile.ZipFile(out).read("production-summary.pdf").startswith(b"%PDF")
 
+    def test_it_ignores_a_platform_left_in_the_environment(self, stamped, tmp_path):
+        """A QT_QPA_PLATFORM the machine cannot load aborts inside QGuiApplication.
+
+        The offscreen platform used to be set with ``setdefault``, so an ``xcb``
+        exported in a shell profile - and the same profile then used on a Mac -
+        took the whole process down with SIGABRT before the package was written.
+        There is nothing to catch and nothing printed that names the cause.
+        """
+        import os
+
+        project = save(stamped, tmp_path / "preset.stamp")
+        out = tmp_path / "preset.zip"
+        done = subprocess.run(
+            [
+                sys.executable, "-m", "stamp.main", "package",
+                "--project", str(project), "--output", str(out),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=900,
+            env={**os.environ, "QT_QPA_PLATFORM": "xcb"},
+        )
+        assert done.returncode == 0, done.stderr
+        assert out.exists()
+
 
 class TestNamesWithDotsInThem:
     """``Path.with_suffix`` replaces everything after the last dot."""
@@ -161,6 +186,26 @@ class TestOpeningAProjectThatIsWrong:
         assert not opened.work_dir.is_relative_to(folder)
         assert Path(opened.document.base.source_path).exists()
 
+    def test_opening_twice_does_not_leave_two_temporary_folders(
+        self, stamped, tmp_path
+    ):
+        """The fallback used to mkdtemp per open, and nothing ever removed them."""
+        import tempfile
+
+        folder = tmp_path / "readonly_twice"
+        folder.mkdir()
+        path = save(stamped, folder / "locked.stamp")
+        folder.chmod(stat.S_IRUSR | stat.S_IXUSR)
+        root = Path(tempfile.gettempdir())
+        before = set(root.glob("stamp-sources-*"))
+        try:
+            first = open_project(path)
+            second = open_project(path)
+        finally:
+            folder.chmod(stat.S_IRWXU)
+        assert first.work_dir == second.work_dir
+        assert len(set(root.glob("stamp-sources-*")) - before) == 1
+
 
 class TestSavingWithTheBaseGone:
     """A project saved without its part could never be opened again."""
@@ -189,6 +234,58 @@ class TestSavingWithTheBaseGone:
         opened.document.base.source_path = str(tmp_path / "elsewhere" / "bracket.step")
         again = save(opened.document, path)
         assert "base/part.step" in zipfile.ZipFile(again).namelist()
+
+    def test_the_copy_in_the_project_is_not_carried_for_a_different_part(
+        self, stamped, tmp_path, fixtures
+    ):
+        """Replace the part, move the new one away, save: the archive holds the old part.
+
+        ``save`` found the source missing, pulled ``base/part.step`` out of the
+        archive already at that path - the part the project used to be built on -
+        and wrote it under a manifest describing the new one.  Reopening handed
+        back the wrong geometry with nothing missing and nothing said.
+        """
+        import shutil
+
+        from stamp.io.part_import import import_part
+
+        path = save(stamped, tmp_path / "replaced.stamp")
+        original_hash = stamped.base.source_hash
+        opened = open_project(path)
+
+        moved = tmp_path / "rev_b.step"
+        shutil.copy(fixtures / "bracket_rev_b.step", moved)
+        opened.document.base = import_part(moved).part
+        moved.unlink()
+
+        with pytest.raises(ProjectError) as caught:
+            save(opened.document, path)
+        assert str(moved) in str(caught.value)
+        # And the project on disk is untouched, still describing the old part.
+        with zipfile.ZipFile(path) as archive:
+            manifest = json.loads(archive.read(project_io.MANIFEST))
+            assert manifest["base"]["source_hash"] == original_hash
+            assert file_hash(fixtures / "bracket.step") == original_hash
+
+    def test_save_as_over_another_project_does_not_borrow_its_part(
+        self, stamped, tmp_path, fixtures
+    ):
+        """The archive being written over belongs to something else entirely."""
+        from stamp.io.part_import import import_part
+
+        other = save(
+            Document(base=import_part(fixtures / "plate.step").part, name="plate"),
+            tmp_path / "other.stamp",
+        )
+        stamped.base.source_path = str(tmp_path / "gone" / "bracket.step")
+        with pytest.raises(ProjectError) as caught:
+            save(stamped, other)
+        assert "gone" in str(caught.value)
+        # The plate project is still a plate project.
+        assert open_project(other).document.name == "other"
+        with zipfile.ZipFile(other) as archive:
+            manifest = json.loads(archive.read(project_io.MANIFEST))
+            assert manifest["base"]["source_hash"] == file_hash(fixtures / "plate.step")
 
     def test_a_missing_base_is_named_when_opening(self, stamped, tmp_path):
         """A project mailed on without its part still has to open enough to relink."""
@@ -262,8 +359,11 @@ class TestAFailedWriteLeavesNothingBehind:
                 raise OSError("the disk filled up")
 
         monkeypatch.setattr(mesh_ops, "to_trimesh", lambda _g: BrokenMesh())
-        with pytest.raises(OSError):
+        # As an ExportError, not the raw OSError: the export dialog catches
+        # nothing else, so a full disk took the window down instead of saying so.
+        with pytest.raises(ExportError) as caught:
             export_stl(object(), target, mode="mesh")
+        assert "the disk filled up" in str(caught.value)
 
         assert target.read_bytes() == b"the good file"
         assert not list(tmp_path.glob("*.part"))
@@ -274,6 +374,35 @@ class TestAFailedWriteLeavesNothingBehind:
         out = export_stl(geometry, tmp_path / "good.stl", mode="mesh")
         assert out.path.exists()
         assert not list(tmp_path.glob("*.part"))
+
+    def test_a_folder_that_is_not_there_is_an_export_error(self, bracket_stl, tmp_path):
+        """trimesh raises a bare FileNotFoundError, which the export dialog does not catch."""
+        document = Document(base=bracket_stl)
+        geometry = result_geometry(document)
+        target = tmp_path / "nowhere" / "out.stl"
+        with pytest.raises(ExportError) as caught:
+            export_stl(geometry, target, mode="mesh")
+        assert "out.stl" in str(caught.value)
+        assert not list(tmp_path.glob("**/*.part"))
+
+    def test_a_name_that_is_already_a_folder_is_an_export_error(
+        self, bracket_stl, tmp_path
+    ):
+        """The write succeeds and only the rename fails, so this one used to leave the .part.
+
+        ``os.replace`` was outside the guard: its IsADirectoryError went straight
+        past the dialog, and the finished temporary file stayed next to the
+        folder it could not become.
+        """
+        document = Document(base=bracket_stl)
+        geometry = result_geometry(document)
+        target = tmp_path / "occupied.stl"
+        target.mkdir()
+        with pytest.raises(ExportError) as caught:
+            export_stl(geometry, target, mode="mesh")
+        assert "occupied.stl" in str(caught.value)
+        assert not list(tmp_path.glob("*.part"))
+        assert target.is_dir()
 
     def test_a_step_that_cannot_be_written_raises_and_leaves_nothing(
         self, bracket_step, tmp_path

@@ -461,13 +461,24 @@ class RebuildEngine:
         return document.index_of(feature.id)
 
     def _resume_point(self, document: Document, enabled: list[Feature]) -> tuple[object, int]:
-        """Find the longest cached prefix, so an edit to feature N only redoes N onward."""
-        for count in range(len(enabled), 0, -1):
-            last = enabled[count - 1]
-            key = self._chain_key(document, document.index_of(last.id) + 1)
-            if key in self._cache:
-                return self._cache[key][0], count
-        return document.base.runtime, 0
+        """Find the longest cached prefix, so an edit to feature N only redoes N onward.
+
+        Every feature up to the resume point has to still have its row, not only the
+        one the geometry is taken from.  The rows are what the tree, the export
+        preflight and the colour split read, and the FIFO drops the oldest keys
+        first - which are the prefixes of the early features an edit at the end
+        never touches.  Resuming past a dropped row published a blank, passing row
+        for a feature that was broken.
+        """
+        geometry, count = document.base.runtime, 0
+        for index, feature in enumerate(enabled):
+            entry = self._cache.get(
+                self._chain_key(document, document.index_of(feature.id) + 1)
+            )
+            if entry is None or entry[1] is None:
+                break
+            geometry, count = entry[0], index + 1
+        return geometry, count
 
     def _cached_row(self, document: Document, feature: Feature) -> FeatureResult | None:
         entry = self._cache.get(self._chain_key(document, document.index_of(feature.id) + 1))
@@ -559,7 +570,11 @@ class RebuildEngine:
                 to_face_distance=to_face_distance,
                 target_face=target_face,
             )
-        except ToolSolidError as exc:
+        except Exception as exc:
+            # ToolSolidError is what this is meant to raise, but OpenCascade throws
+            # Standard_Failure out of the kernel for a case no check in here caught -
+            # a cone whose two radii came out equal, say.  One feature that cannot be
+            # built is an error row; it is never the end of the whole rebuild.
             out.errors.append(f"{feature.name}: {exc}")
             return geometry, out
         out.tool = tool

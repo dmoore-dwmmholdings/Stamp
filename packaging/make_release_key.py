@@ -68,10 +68,27 @@ def main(argv: list[str] | None = None) -> int:
         target = args.private_key_out
         # Made empty and readable only by this user before anything is in it:
         # writing the key first and fixing the mode after leaves a moment when
-        # it is there for everybody.
-        handle = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, stat.S_IRUSR | stat.S_IWUSR)
+        # it is there for everybody.  O_EXCL because that mode is applied only
+        # when the file is created - writing over one that is already there,
+        # world-readable and checked into somebody's repository, kept its mode
+        # and published the key.
+        try:
+            handle = os.open(
+                target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, stat.S_IRUSR | stat.S_IWUSR
+            )
+        except FileExistsError:
+            print(
+                f"{target} already exists. A key is not written over an existing "
+                "file, because that file's permissions would be kept. Delete it "
+                "or choose another name.",
+                file=sys.stderr,
+            )
+            return 1
         with os.fdopen(handle, "w", encoding="utf-8") as stream:
             stream.write(secret + "\n")
+        # And again now it has something in it, for the file systems that did
+        # not take the mode the open asked for.
+        os.chmod(target, stat.S_IRUSR | stat.S_IWUSR)
         print(f"Private key written to {target}.")
         print("Paste it into the STAMP_RELEASE_KEY repository secret, then delete it.")
         print()

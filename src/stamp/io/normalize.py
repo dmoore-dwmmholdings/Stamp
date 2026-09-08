@@ -759,6 +759,9 @@ def _center(profile: Profile) -> None:
     for loop in profile.loops:
         loop.wire = TopoDS.Wire_s(BRepBuilderAPI_Transform(loop.wire, trsf, True).Shape())
         loop.polyline = [(x + dx, y + dy) for x, y in loop.polyline]
+    # The repair dialog draws these on top of the profile, so they move with it.
+    for issue in profile.issues:
+        issue.points = [(x + dx, y + dy) for x, y in issue.points]
 
 
 def _bbox(profile: Profile) -> None:
@@ -864,7 +867,13 @@ def _resolve_overlaps(profile: Profile, loop_component: Sequence[str] | None = N
         if not contours:
             return profile
         section = CrossSection(contours, FillRule.NonZero).simplify(1e-6)
-        merged = _profile_from_cross_section(section, profile.issues, profile.source_units)
+        # Not centred: the crossing loops carried back in are still in source
+        # coordinates, and re-centring the merged faces on their own bbox first
+        # would slide them out from under those.  normalize_wire_groups centres
+        # the whole thing once this returns.
+        merged = _profile_from_cross_section(
+            section, profile.issues, profile.source_units, center=False
+        )
         if not merged.faces:
             return profile
         merged.components = list(profile.components)

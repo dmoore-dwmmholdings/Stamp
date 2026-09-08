@@ -44,14 +44,25 @@ def font_substitution(spec: TextSpec, font) -> Issue | None:
     font nobody asked for, and when the substitute has none for a character the
     fallback glyphs cross themselves, so the user was shown a self-intersection
     in artwork they never drew.  Say which font is actually being used instead.
+
+    A family the machine actually has is never a substitution, whatever QFontInfo
+    calls it.  QFontInfo names the face Qt resolved to, and on some platforms
+    that is an alias of the family that was asked for rather than the name in the
+    family list - which came back as "the font is not installed" about a font the
+    user could see in the list on the panel next to it.  The family list is what
+    the user chose from, so it is what the answer is checked against, and
+    matching is case-insensitive at both steps because family names are.
     """
-    from PySide6.QtGui import QFontInfo
+    from PySide6.QtGui import QFontDatabase, QFontInfo
 
     wanted = (spec.family or "").strip()
     if not wanted:
         return None
+    key = wanted.lower()
+    if any(family.strip().lower() == key for family in QFontDatabase.families()):
+        return None
     actual = QFontInfo(font).family()
-    if actual.strip().lower() == wanted.lower():
+    if actual.strip().lower() == key:
         return None
     return Issue(
         IssueKind.UNSUPPORTED_ELEMENT,

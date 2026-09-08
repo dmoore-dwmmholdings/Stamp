@@ -50,10 +50,20 @@ class TestSvgSizing:
             ("size_px_viewbox.svg", 200 * MM_PER_PX, True),
             ("size_viewbox_only.svg", 400 * MM_PER_PX, True),
             ("size_bare.svg", 400 * MM_PER_PX, True),
-            # No viewBox: one user unit is one CSS pixel, whatever the width says.
-            ("size_mm_no_viewbox.svg", 100 * MM_PER_PX, False),
+            # No viewBox: one user unit is one CSS pixel, whatever the width
+            # says.  Spec-correct and still a surprise, so it is offered for
+            # correction rather than committed to.
+            ("size_mm_no_viewbox.svg", 100 * MM_PER_PX, True),
             # 100 x 50 drawn at scale(2) inside a 1000-unit viewBox of 100 mm.
             ("size_nested_transform.svg", 20.0, False),
+            # One of width and height, which is all svgelements needs to leave
+            # the viewport transform unapplied - so the size has to be put back.
+            ("size_width_only.svg", 200.0, False),
+            ("size_height_only.svg", 200.0, False),
+            ("size_px_width_only.svg", 200 * MM_PER_PX, True),
+            ("size_percent_height.svg", 200.0, False),
+            # CSS unit identifiers are case-insensitive: 2IN is two inches.
+            ("size_uppercase_units.svg", 50.8, False),
         ],
     )
     def test_the_imported_width_is_the_width_the_file_declares(
@@ -69,6 +79,21 @@ class TestSvgSizing:
         assert scale.geometry == pytest.approx(1.0)
         assert scale.user_unit_mm == pytest.approx(0.1)
         assert scale.unit == "mm"
+
+    @pytest.mark.parametrize(
+        "name,user_unit_mm",
+        [("size_width_only.svg", 2.0), ("size_height_only.svg", 2.0)],
+    )
+    def test_one_user_unit_is_measured_against_the_matching_viewbox_side(
+        self, fixtures, name, user_unit_mm
+    ):
+        """A height divided by the viewBox *width* is a ratio of two unrelated numbers.
+
+        Both files draw a 100 x 50 viewBox at twice its size, so one user unit is
+        2 mm either way round; against the wrong side the height-only one came out
+        at 1 mm and the stroke widths with it.
+        """
+        assert svg_scale(fixtures / name).user_unit_mm == pytest.approx(user_unit_mm)
 
     def test_a_unit_override_still_says_what_one_user_unit_is(self, fixtures):
         """Overriding to mm makes the 400-unit viewBox 400 mm wide."""
@@ -98,6 +123,21 @@ class TestDxfBlocks:
     def test_a_block_only_drawing_is_not_reported_as_empty(self, fixtures):
         result = import_profile(fixtures / "blocks.dxf", ImportOptions(layers=["PROFILE"]))
         assert len(result.profile.faces) == 5
+
+    def test_a_minsert_array_imports_every_cell(self, fixtures):
+        """A MINSERT is one INSERT that draws its block on a grid.
+
+        ``virtual_entities`` gives one cell's worth however big the array is, so
+        a 2 x 3 array of pads came in as a single pad a sixth of the right size.
+        """
+        result = import_profile(fixtures / "minsert.dxf")
+        assert len(result.profile.faces) == 6
+        # 6 mm cells on 10 mm columns, 4 mm cells on 10 mm rows.
+        assert result.profile.width == pytest.approx(26.0, abs=1e-3)
+        assert result.profile.height == pytest.approx(14.0, abs=1e-3)
+
+    def test_the_layer_list_sees_a_minsert(self, fixtures):
+        assert dxf_layers(fixtures / "minsert.dxf") == ["ARRAY"]
 
     def test_the_layer_list_counts_geometry_inside_blocks(self, fixtures):
         # Everything is drawn on layer 0 inside the blocks, which takes the layer
@@ -129,6 +169,43 @@ class TestCrossingLoopsSurviveResolution:
         assert not result.profile.blocked
         # 700 for the squares, plus the bow tie's two 56.25 mm2 lobes.
         assert face_area(result.profile) == pytest.approx(812.5, rel=1e-3)
+
+    @pytest.mark.parametrize(
+        "name", ["crossing_with_overlap.svg", "crossing_two_color.svg"]
+    )
+    def test_the_carried_loop_keeps_its_place_against_the_faces(self, fixtures, name):
+        """Both files draw the squares ending at x = 30 and the bow tie starting at 40.
+
+        The resolved faces used to be re-centred on their own bounding box while
+        the crossing loop was carried over in the source coordinates it was read
+        in, so the gap came out as 25 mm on the single-component path and 10 mm
+        on the other - and the union repair then merged lobes 15 mm from where
+        they were drawn.
+        """
+        profile = import_profile(fixtures / name).profile
+        crossing = [loop for loop in profile.loops if not loop.valid]
+        assert len(crossing) == 1
+        faces_right = max(x for loop in profile.loops if loop.valid for x, _y in loop.polyline)
+        bow_tie_left = min(x for x, _y in crossing[0].polyline)
+        assert bow_tie_left - faces_right == pytest.approx(10.0, abs=1e-3)
+
+    @pytest.mark.parametrize(
+        "name", ["crossing_with_overlap.svg", "crossing_two_color.svg"]
+    )
+    def test_the_union_repair_leaves_the_drawing_its_own_width(self, fixtures, name):
+        """0 to 30 for the squares and 40 to 55 for the bow tie: 55 mm across."""
+        result = import_profile(fixtures / name, ImportOptions(union_overlapping=True))
+        assert result.profile.width == pytest.approx(55.0, abs=1e-3)
+
+    def test_the_crossing_markers_move_with_the_profile(self, fixtures):
+        """The repair dialog draws these on top of the artwork, so they are its coordinates.
+
+        The bow tie crosses at (47.5, -7.5) as drawn and the profile is centred by
+        (-15, +15), which is where the marker has to end up.
+        """
+        profile = import_profile(fixtures / "crossing_with_overlap.svg").profile
+        issue = profile.issues_of(IssueKind.SELF_INTERSECTION)[0]
+        assert issue.points[0] == pytest.approx((32.5, 7.5), abs=1e-3)
 
 
 class TestUnionKeepsHoles:

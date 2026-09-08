@@ -219,18 +219,32 @@ def _atomic(path: str | Path):
     had been whenever the write failed part way - out of disk, a killed export -
     and the next thing to open it was a shop's slicer.  ``project.save`` has
     always done this; the geometry exporters had not.
+
+    Every filesystem refusal on the way through comes back out as
+    :class:`ExportError`, because that is the only thing the export dialog
+    catches: a folder deleted between choosing the name and pressing Export, or
+    a name that is already a directory, used to reach the window as a raw
+    ``FileNotFoundError`` or ``IsADirectoryError`` and take it down - with the
+    finished ``.part`` file still sitting next to the target.
     """
     path = Path(path)
     temp = path.with_name(path.name + ".part")
     temp.unlink(missing_ok=True)
     try:
         yield temp
+    except OSError as exc:
+        temp.unlink(missing_ok=True)
+        raise ExportError(f"Stamp could not write {path.name}: {exc}") from exc
     except BaseException:
         temp.unlink(missing_ok=True)
         raise
     if not temp.exists():
         raise ExportError(f"Stamp could not write {path.name}: nothing was produced.")
-    os.replace(temp, path)
+    try:
+        os.replace(temp, path)
+    except OSError as exc:
+        temp.unlink(missing_ok=True)
+        raise ExportError(f"Stamp could not write {path.name}: {exc}") from exc
 
 
 def default_filename(project_name: str, extension: str, *, suffix: str = "") -> str:

@@ -266,6 +266,12 @@ def build_tool_solid(
 #: face it lies on, far too little to read as a gap or to measure.
 DECAL_LIFT = 1e-4
 
+#: How far a wrapped segment may stray from axial or circumferential, in millimetres
+#: of the resulting 3D curve, and still be built as an exact line or arc.  A hair
+#: under OpenCascade's own confusion, so the exact curve still passes through both
+#: of the segment's vertices.
+EXACT_WRAP_TOLERANCE = 1e-9
+
 
 def _display_footprint(
     footprint: TopoDS_Shape, plane: Plane, part_diagonal: float
@@ -383,6 +389,14 @@ def _build_wrapped_tool(
         raise ToolSolidError("To-face depth is not available for wrapped artwork.")
     if operation.depth_mode is DepthMode.SYMMETRIC:
         raise ToolSolidError("Symmetric depth is not available for wrapped artwork.")
+    if operation.depth_mode is DepthMode.THROUGH_ALL and not operation.removes_material:
+        # Through-all means "past the far side of the part", which is a depth for a
+        # cut and nothing at all for a boss: it raised a radial fin one and a half
+        # part diagonals tall, silently.
+        raise ToolSolidError(
+            "Through-all is not available for wrapped artwork that adds material, "
+            "because it would raise a boss as tall as the part. Give it a height."
+        )
     depth = operation.depth if operation.depth_mode is DepthMode.BLIND else max(part_diagonal * 1.5, 1.0)
     if depth <= 0:
         raise ToolSolidError("The depth must be greater than zero.")
@@ -531,18 +545,49 @@ def _wrap_radii(
 def _wrap_wire(ring: list[tuple[float, float]], surface):
     """One ring of (u, v) parameters as a wire of exact curves on *surface*.
 
-    Every segment is a straight line in the surface's own parameter space, which on
-    a cylinder is a helix - so the wire lies exactly on the face, and the artwork
-    keeps its arc length rather than being flattened onto a chord.
+    A segment that runs along the axis is a straight line and one that runs round
+    the face is a circular arc; only a genuinely helical segment has to be
+    approximated.  Laying every segment down as a line in the surface's own
+    parameters and letting ``BuildCurves3d`` fit a B-spline to it left the whole
+    tool approximated - a 12 x 5 mm mark came out a part in ten million off its
+    arc-sector volume - and gave every wall between two of those edges a spline
+    surface to be built on.
     """
+    from OCP.BRep import BRep_Builder
     from OCP.BRepBuilderAPI import (
         BRepBuilderAPI_MakeEdge,
         BRepBuilderAPI_MakeVertex,
         BRepBuilderAPI_MakeWire,
     )
     from OCP.BRepLib import BRepLib
+    from OCP.Geom import Geom_Circle, Geom_Line
     from OCP.Geom2d import Geom2d_Line
     from OCP.gp import gp_Dir2d, gp_Pnt2d
+    from OCP.TopLoc import TopLoc_Location
+
+    cylinder = surface.Cylinder()
+    position = cylinder.Position()
+    radius = cylinder.Radius()
+    axis_dir = gp_Vec(position.Direction())
+    x_dir, y_dir = gp_Vec(position.XDirection()), gp_Vec(position.YDirection())
+    builder = BRep_Builder()
+
+    def exact_curve(u0: float, v0: float, du: float, dv: float):
+        """The 3D curve of a segment, parametrised to match its (u, v) line."""
+        if abs(du) * radius < EXACT_WRAP_TOLERANCE:
+            start = surface.Value(u0, v0)
+            return Geom_Line(start, gp_Dir(axis_dir.Multiplied(math.copysign(1.0, dv))))
+        if abs(dv) < EXACT_WRAP_TOLERANCE:
+            centre = position.Location().Translated(axis_dir.Multiplied(v0))
+            outward = x_dir.Multiplied(math.cos(u0)).Added(y_dir.Multiplied(math.sin(u0)))
+            around = y_dir.Multiplied(math.cos(u0)).Subtracted(x_dir.Multiplied(math.sin(u0)))
+            around = around.Multiplied(math.copysign(1.0, du))
+            # The frame is built from the two directions rather than from the
+            # surface's own, so it comes out right-handed whichever way the face
+            # winds and whichever way this segment runs.
+            frame = gp_Ax2(centre, gp_Dir(outward.Crossed(around)), gp_Dir(outward))
+            return Geom_Circle(frame, radius)
+        return None
 
     vertices = [BRepBuilderAPI_MakeVertex(surface.Value(u, v)).Vertex() for u, v in ring]
     maker = BRepBuilderAPI_MakeWire()
@@ -554,11 +599,17 @@ def _wrap_wire(ring: list[tuple[float, float]], surface):
         if length < 1e-12:
             continue
         line = Geom2d_Line(gp_Pnt2d(u0, v0), gp_Dir2d(du / length, dv / length))
-        maker.Add(
-            BRepBuilderAPI_MakeEdge(
+        curve = exact_curve(u0, v0, du, dv)
+        if curve is None:
+            edge = BRepBuilderAPI_MakeEdge(
                 line, surface, vertices[i], vertices[(i + 1) % count], 0.0, length
             ).Edge()
-        )
+        else:
+            edge = BRepBuilderAPI_MakeEdge(
+                curve, vertices[i], vertices[(i + 1) % count], 0.0, length
+            ).Edge()
+            builder.UpdateEdge(edge, line, surface, TopLoc_Location(), EXACT_WRAP_TOLERANCE)
+        maker.Add(edge)
     if not maker.IsDone():
         raise ToolSolidError("Stamp could not lay this artwork onto the curved face.")
     wire = maker.Wire()
@@ -598,16 +649,15 @@ def _wrap_solids(groups, axes, low: float, high: float) -> TopoDS_Shape:
     """Build the wrapped tool: two faces on the face's own surface, joined radially.
 
     The inner and outer faces are exact pieces of a cylinder, so the tool meets the
-    part on the part's own surface.  Between them the walls are ruled between
-    matching edges, and because the two rings differ only in radius each wall is
-    radial - which is the property that makes this a wrap rather than a shadow.
+    part on the part's own surface.  Between them the walls run between matching
+    edges, and because the two rings differ only in radius each wall is radial -
+    which is the property that makes this a wrap rather than a shadow.
     """
     from OCP.BRep import BRep_Builder
-    from OCP.BRepBuilderAPI import BRepBuilderAPI_MakeSolid, BRepBuilderAPI_Sewing
+    from OCP.BRepBuilderAPI import BRepBuilderAPI_Sewing
     from OCP.BRepCheck import BRepCheck_Analyzer
-    from OCP.BRepFill import BRepFill
-    from OCP.BRepLib import BRepLib
     from OCP.Geom import Geom_CylindricalSurface
+    from OCP.ShapeFix import ShapeFix_Solid
     from OCP.TopAbs import TopAbs_ShapeEnum
     from OCP.TopExp import TopExp_Explorer
     from OCP.TopoDS import TopoDS, TopoDS_Compound
@@ -625,30 +675,89 @@ def _wrap_solids(groups, axes, low: float, high: float) -> TopoDS_Shape:
         sewing.Add(inner_face)
         sewing.Add(outer_face)
         for wire_in, wire_out in zip(inner_wires, outer_wires, strict=True):
-            walls = BRepFill.Shell_s(wire_in, wire_out)
-            explorer = TopExp_Explorer(walls, TopAbs_ShapeEnum.TopAbs_FACE)
-            while explorer.More():
-                sewing.Add(TopoDS.Face_s(explorer.Current()))
-                explorer.Next()
+            for wall in _wall_faces(wire_in, wire_out):
+                sewing.Add(wall)
         sewing.Perform()
-        maker = BRepBuilderAPI_MakeSolid()
+        shells = []
         explorer = TopExp_Explorer(sewing.SewedShape(), TopAbs_ShapeEnum.TopAbs_SHELL)
-        shells = 0
         while explorer.More():
-            maker.Add(TopoDS.Shell_s(explorer.Current()))
-            shells += 1
+            shells.append(TopoDS.Shell_s(explorer.Current()))
             explorer.Next()
-        if not shells or not maker.IsDone():
+        if len(shells) != 1:
             raise ToolSolidError("Stamp could not close the wrapped tool on this face.")
-        solid = maker.Solid()
-        BRepLib.OrientClosedSolid_s(solid)
-        if not BRepCheck_Analyzer(solid).IsValid():
+        # Turn the shell the right way out rather than flagging the solid reversed,
+        # which is what ``OrientClosedSolid`` does.  A reversed solid measures the
+        # volume it should and passes every check, and then BRepFilletAPI reads it
+        # inside out: it reported IsDone on a shape BRepCheck rejected, at every
+        # radius, so no wrapped mark could take a fillet or a chamfer at all.
+        solid = ShapeFix_Solid().SolidFromShell(shells[0])
+        if solid.IsNull() or not BRepCheck_Analyzer(solid).IsValid():
             raise ToolSolidError(
                 "The wrapped artwork does not make a clean solid on this face. "
                 "Simplify the artwork, or make it smaller."
             )
         builder.Add(compound, solid)
     return compound
+
+
+def _wall_faces(inner, outer) -> list:
+    """The radial walls between two matching rings, exact wherever they can be.
+
+    Both rings were built from the same ring of parameters, so their edges pair off
+    in order.  The wall over an axial segment lies in a plane through the axis and
+    the one over a circumferential segment lies in a plane across it, so both are
+    built as planes; only a helical segment needs a ruled approximation.  Ruling
+    every wall, which is what ``BRepFill::Shell`` did for the whole ring at once,
+    made a spline surface of walls that are flat.
+    """
+    from OCP.BRepBuilderAPI import (
+        BRepBuilderAPI_MakeEdge,
+        BRepBuilderAPI_MakeFace,
+        BRepBuilderAPI_MakeWire,
+    )
+    from OCP.BRepFill import BRepFill
+    from OCP.BRepTools import BRepTools_WireExplorer
+    from OCP.TopAbs import TopAbs_ShapeEnum
+    from OCP.TopExp import TopExp, TopExp_Explorer
+    from OCP.TopoDS import TopoDS
+
+    def edges_of(wire) -> list:
+        walker = BRepTools_WireExplorer(wire)
+        out = []
+        while walker.More():
+            out.append(walker.Current())
+            walker.Next()
+        return out
+
+    def ruled(edge_in, edge_out) -> list:
+        shell = BRepFill.Shell_s(
+            BRepBuilderAPI_MakeWire(edge_in).Wire(),
+            BRepBuilderAPI_MakeWire(edge_out).Wire(),
+        )
+        explorer = TopExp_Explorer(shell, TopAbs_ShapeEnum.TopAbs_FACE)
+        out = []
+        while explorer.More():
+            out.append(TopoDS.Face_s(explorer.Current()))
+            explorer.Next()
+        return out
+
+    faces = []
+    for edge_in, edge_out in zip(edges_of(inner), edges_of(outer), strict=True):
+        maker = BRepBuilderAPI_MakeWire()
+        maker.Add(edge_in)
+        maker.Add(BRepBuilderAPI_MakeEdge(
+            TopExp.LastVertex_s(edge_in, True), TopExp.LastVertex_s(edge_out, True)
+        ).Edge())
+        maker.Add(edge_out)
+        maker.Add(BRepBuilderAPI_MakeEdge(
+            TopExp.FirstVertex_s(edge_out, True), TopExp.FirstVertex_s(edge_in, True)
+        ).Edge())
+        wall = BRepBuilderAPI_MakeFace(maker.Wire(), True) if maker.IsDone() else None
+        if wall is not None and wall.IsDone():
+            faces.append(wall.Face())
+        else:
+            faces.extend(ruled(edge_in, edge_out))
+    return faces
 
 
 def _cylindrical_wrap_shape(
@@ -776,10 +885,17 @@ def _conical_wrap_shape(
         location.Z() + direction.Z() * start * axial_scale,
     )
     inward = operation.direction is Direction.INTO
-    inner_start = max(1e-6, radius_start - (depth if inward else margin))
-    inner_end = max(1e-6, radius_end - (depth if inward else margin))
+    # A through cut, or any depth past the local radius, asks for a band that
+    # reaches the axis.  Clamped to a flat 1e-6 both ends land on the same number
+    # and OpenCascade throws "cone with two identic radii" straight out of the
+    # rebuild; clamped in proportion, as the cylinder does, the band stops just
+    # short of the axis and stays a cone.
+    inner_start = max(radius_start * 1e-3, radius_start - (depth if inward else margin))
+    inner_end = max(radius_end * 1e-3, radius_end - (depth if inward else margin))
     outer_start = radius_start + (margin if inward else depth)
     outer_end = radius_end + (margin if inward else depth)
+    if abs(inner_start - inner_end) < 1e-7 and abs(outer_start - outer_end) < 1e-7:
+        raise ToolSolidError("This cone is too close to a cylinder for wrapped artwork.")
     height = (end - start) * axial_scale
 
     flat = _placed_footprint(profile, placement, plane)

@@ -91,6 +91,23 @@ def _output_name(value: str | None, fmt: str, output_dir: Path | None = None) ->
     if not output:
         raise BatchError("output is empty")
     path = Path(output)
+    name = path.name
+    lowered = name.casefold()
+    # Judged on what the row typed, before the format suffix goes on.  After it
+    # every name has one - "stamp-batch-report.json" has become
+    # "stamp-batch-report.json.step" and ".step" has become ".step.step" - so a
+    # check made down there is a check that never matches anything.
+    if output[-1] in "/\\":
+        raise BatchError(f"output {output!r} names a folder rather than a file")
+    if (
+        not path.stem.strip(".")        # "", ".", ".."
+        or name.endswith(".")           # "part." would be written as "part..step"
+        or lowered in _MODEL_SUFFIXES   # ".step" would be written as ".step.step"
+        or lowered == "." + fmt
+    ):
+        raise BatchError(f"output {output!r} has no file name in front of the suffix")
+    if path.stem.casefold() == "stamp-batch-report" and len(path.parts) == 1:
+        raise BatchError(f"output {output!r} is the name the batch report is written under")
     suffix = path.suffix.casefold()
     if suffix != "." + fmt:
         # A row that says part.txt gets STEP written into it either way, so the
@@ -102,8 +119,6 @@ def _output_name(value: str | None, fmt: str, output_dir: Path | None = None) ->
             path = Path(str(path) + "." + fmt)
     if path.is_absolute() or ".." in path.parts:
         raise BatchError("the output path must stay inside the chosen output folder")
-    if path.name.casefold() == "stamp-batch-report.json" and len(path.parts) == 1:
-        raise BatchError("output name is reserved for the batch report")
     if output_dir is not None:
         # A CSV is data, not permission to write outside the selected folder.
         root = Path(output_dir).resolve()

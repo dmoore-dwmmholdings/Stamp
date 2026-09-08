@@ -1080,6 +1080,37 @@ class TestTheCacheKeepsWhatEachFeatureFound:
         assert row is not None and not row.ok
         assert row.errors == first.result_for(broken.id).errors
 
+    def test_a_broken_feature_stays_broken_once_the_cache_has_filled(
+        self, bracket_step, engine, fixtures, top_ref
+    ):
+        """The FIFO drops the oldest keys, which are the earliest features' rows.
+
+        Resuming needed only the last prefix to be in the cache, so an edit made
+        often enough to fill the cache evicted the broken feature's row and left
+        the resume point past it.  Its row came back blank, which reads as passing:
+        the tree went green, the rebuild said ok, and nothing had been fixed.
+        """
+        doc = Document(base=bracket_step)
+        broken = doc.add_feature(a_broken_feature("Broken", fixtures / "logo.svg"))
+        good = doc.add_feature(
+            a_feature("Good", fixtures / "serial.dxf", top_ref,
+                      kind=OperationKind.CUT, depth=0.5, direction=Direction.INTO)
+        )
+        first = engine.rebuild(doc)
+        assert not first.ok
+
+        for step in range(engine._cache_limit + 2):
+            good.operation.depth = 0.5 + 0.01 * (step + 1)
+            engine.rebuild(doc)
+            # A rebuild with nothing changed is the one that resumes past the
+            # broken feature and takes its row from the cache, and which edit
+            # evicts that row depends on how the keys fall, so every one is asked.
+            again = engine.rebuild(doc)
+            assert not again.ok, f"it went green after {step + 1} edits"
+            row = again.result_for(broken.id)
+            assert row is not None and not row.ok
+            assert row.errors == first.result_for(broken.id).errors
+
     def test_a_cached_feature_still_carries_its_tool_solid(
         self, bracket_step, engine, fixtures, top_ref
     ):
@@ -1286,3 +1317,98 @@ class TestAPartThatIsNotLoaded:
         assert not result.ok
         assert len(result.features) == 1
         assert any("re-imported" in e for e in result.errors), result.errors
+
+
+class TestAFeatureTheKernelWillNotBuild:
+    """One feature that cannot be built is an error row, never a dead rebuild.
+
+    A conical wrap with a through cut reached BRepPrimAPI_MakeCone with two equal
+    radii and OpenCascade threw a raw Standard_Failure, which is not a
+    ToolSolidError and so went straight out through RebuildEngine.rebuild - taking
+    the other features, the geometry and the whole result with it.
+    """
+
+    @pytest.fixture
+    def cone(self, tmp_path):
+        from OCP.BRepPrimAPI import BRepPrimAPI_MakeCone
+
+        from stamp.io.export import export_step
+        from stamp.io.part_import import import_part
+
+        path = tmp_path / "cone.step"
+        export_step(BRepPrimAPI_MakeCone(8.0, 4.0, 20.0).Shape(), path)
+        return import_part(path).part
+
+    def a_wrapped_cut(self, part, source, *, depth_mode, depth=0.0) -> Feature:
+        from stamp.core.document import PlacementMode
+
+        face = next(f for f in faces_of(part.runtime) if surface_kind(f) == "cone")
+        ref = make_face_ref(face, (6.0, 0.0, 10.0))
+        return Feature(
+            name="Mark",
+            profile=ProfileRef(source_path=str(source), source_hash=file_hash(source)),
+            placement=Placement(
+                mode=PlacementMode.WRAP,
+                scale=(0.05, 0.05),
+                anchor=Anchor(kind=AnchorKind.FACE,
+                              face_ref=FaceRef.from_dict(ref.to_dict())),
+            ),
+            operation=Operation(kind=OperationKind.CUT, depth_mode=depth_mode,
+                                depth=depth, direction=Direction.INTO),
+        )
+
+    def test_a_blind_cut_on_a_cone_rebuilds(self, cone, engine, fixtures):
+        doc = Document(base=cone)
+        doc.add_feature(self.a_wrapped_cut(cone, fixtures / "logo.svg",
+                                           depth_mode=DepthMode.BLIND, depth=0.4))
+
+        result = engine.rebuild(doc)
+
+        assert result.ok, [e for r in result.features for e in r.errors]
+        assert result.volume < cone.volume
+
+    def test_a_through_cut_on_a_cone_rebuilds_as_well(self, cone, engine, fixtures):
+        """It used to throw "cone with two identic radii" out of the engine."""
+        doc = Document(base=cone)
+        doc.add_feature(self.a_wrapped_cut(cone, fixtures / "logo.svg",
+                                           depth_mode=DepthMode.THROUGH_ALL))
+
+        result = engine.rebuild(doc)
+
+        assert result.ok, [e for r in result.features for e in r.errors]
+        assert result.volume < cone.volume
+
+    def test_and_so_does_a_depth_past_the_local_radius(self, cone, engine, fixtures):
+        doc = Document(base=cone)
+        doc.add_feature(self.a_wrapped_cut(cone, fixtures / "logo.svg",
+                                           depth_mode=DepthMode.BLIND, depth=12.0))
+
+        result = engine.rebuild(doc)
+
+        assert result.ok, [e for r in result.features for e in r.errors]
+
+    def test_a_raw_kernel_failure_becomes_one_error_row(
+        self, bracket_step, engine, fixtures, top_ref, monkeypatch
+    ):
+        """Whatever the kernel throws, the rest of the document still builds."""
+        from OCP.Standard import Standard_Failure
+
+        from stamp.core import rebuild as rebuild_module
+
+        doc = Document(base=bracket_step)
+        thrower = doc.add_feature(
+            a_feature("Thrower", fixtures / "logo.svg", top_ref,
+                      kind=OperationKind.ADD, depth=0.8, direction=Direction.OUT_OF)
+        )
+
+        def boom(*args, **kwargs):
+            raise Standard_Failure("cone with two identic radii")
+
+        monkeypatch.setattr(rebuild_module, "build_tool_solid", boom)
+        result = engine.rebuild(doc)
+
+        assert not result.ok
+        row = result.result_for(thrower.id)
+        assert row is not None and not row.ok
+        assert "identic radii" in row.errors[0]
+        assert result.geometry is not None

@@ -194,8 +194,20 @@ def build_body(report: Report, attachment: Path | None, budget: int | None = Non
     Sections go in by importance and stop when the budget is spent, thus a report
     that is too long loses the least useful part rather than its last half.
     """
+    # The path of the complete copy is short, and it is how the full detail is
+    # found, thus its room comes off the budget before the first section is
+    # measured rather than after the earlier ones have already spent it.  The
+    # newline that joins it to the body counts too - three characters once
+    # escaped, which is how a link measured to fit came out three over.
+    footer: list[str] = []
+    if attachment is not None:
+        footer = ["", f"Full log: {attachment}"]
+    body_budget = budget
+    if body_budget is not None:
+        body_budget = max(body_budget - _encoded_length("\n".join(["", *footer])), 0)
+
     def fits(candidate: list[str]) -> bool:
-        return budget is None or _encoded_length("\n".join(candidate)) <= budget
+        return body_budget is None or _encoded_length("\n".join(candidate)) <= body_budget
 
     lines: list[str] = []
     if report.kind == "crash":
@@ -208,6 +220,7 @@ def build_body(report: Report, attachment: Path | None, budget: int | None = Non
     lines.append("")
 
     # 1. What the person actually said.  Nothing replaces it.
+    said_at: int | None = None
     for caption, value in (
         ("What happened", report.detail),
         ("What was expected", report.expected),
@@ -223,6 +236,8 @@ def build_body(report: Report, attachment: Path | None, budget: int | None = Non
             candidate = [*lines, f"{caption}: {text[:room]}..."]
             if not fits(candidate):
                 continue
+        if said_at is None:
+            said_at = len(lines)
         lines = candidate
     lines.append("")
 
@@ -231,22 +246,13 @@ def build_body(report: Report, attachment: Path | None, budget: int | None = Non
     if fits(candidate):
         lines = candidate
 
-    # 3. Keep room for the path of the complete copy before the log takes the
-    #    rest, because that path is short and it is how the full detail is found.
-    footer: list[str] = []
-    if attachment is not None:
-        footer = ["", f"Full log: {attachment}"]
-        if budget is not None:
-            # The newline that joins the footer to the body counts too: it is
-            # three characters once encoded, and leaving it out is how a link
-            # that was measured to fit comes out three over.
-            budget -= _encoded_length("\n" + "\n".join(footer))
-
-    # 4. The log, newest last.  Take as many lines as the rest of the budget holds.
+    # 3. The log, newest last.  Take as many lines as the rest of the budget holds.
+    log_at: int | None = None
     tail = _log_tail(source_log(report), BODY_TAIL_LINES)
     if tail and tail != ["(no log)"]:
         header = [*lines, "Log, last lines:"]
         if fits(header):
+            log_at = len(lines)
             lines = header
             kept: list[str] = []
             for line in reversed(tail):
@@ -257,7 +263,20 @@ def build_body(report: Report, attachment: Path | None, budget: int | None = Non
                     break
             lines.extend(kept)
 
-    # 5. The path, on the room kept for it above.
+    # 4. Measured again on what actually goes out, footer and all, rather than
+    #    on the pieces it was built from.  A body over the limit loses log lines
+    #    first and the words the user typed last, because that is the order they
+    #    are worth in.
+    while budget is not None and _encoded_length("\n".join([*lines, *footer])) > budget:
+        if log_at is not None and len(lines) > log_at:
+            del lines[-1]
+            continue
+        if said_at is not None and len(lines[said_at]) > 24:
+            said = lines[said_at]
+            lines[said_at] = said[: len(said) * 3 // 4].rstrip() + "..."
+            continue
+        break
+
     lines.extend(footer)
     return "\n".join(lines)
 

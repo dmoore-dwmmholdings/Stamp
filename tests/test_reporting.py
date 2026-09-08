@@ -107,6 +107,28 @@ class TestMailtoLink:
         body = reporting.build_body(report, target, budget=reporting.MAX_URL)
         assert str(target) in body
 
+    def test_no_length_of_report_pushes_the_link_over_the_limit(self, started, tmp_path):
+        """The footer used to be added after the budget had already been spent.
+
+        Every section was measured against the whole budget, the path of the
+        full copy was subtracted only once the log was reached, and the footer
+        went on at the end whether or not there was room - so a bug report of
+        about 1600 characters came out ninety over a limit Windows enforces by
+        dropping the link on the floor.  Swept over every length rather than
+        the one that was found, because the one that was found was an accident.
+        """
+        for line in range(300):
+            diagnostics.breadcrumb("import: part=bracket-%d.step faces=482", line)
+        attachment = tmp_path / "stamp-bug-20260101-120000.txt"
+        for length in range(0, 3001, 50):
+            report = reporting.Report(kind="bug", summary="s" * 80, detail="w" * length)
+            url = reporting.mailto_url(report, attachment)
+            assert len(url) <= reporting.MAX_URL, length
+            body = reporting.build_body(
+                report, attachment, budget=reporting.MAX_URL
+            )
+            assert "Full log:" in body, length
+
     def test_the_environment_fits_on_one_line(self, started):
         line = reporting.environment_line()
         assert "\n" not in line

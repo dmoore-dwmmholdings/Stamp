@@ -14,6 +14,7 @@ rather than guessed at.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import shutil
 import tempfile
@@ -84,7 +85,7 @@ def save(
             # The project may already hold a verbatim copy of the part, from
             # the archive it was opened from.  A source that has since moved is
             # then no reason to refuse the save.
-            carried_base = _archived_base(path)
+            carried_base = _archived_base(path, document.base.source_hash)
             if carried_base is None:
                 raise ProjectError(
                     f"Stamp cannot save {path.name}: the part it was built from is "
@@ -129,23 +130,54 @@ def save(
     return path
 
 
-def _archived_base(path: Path) -> tuple[str, bytes] | None:
+def _archived_base(path: Path, source_hash: str) -> tuple[str, bytes] | None:
     """The base part copy already inside the project at *path*, if there is one.
 
     Saving over a project that was opened from an archive can reuse the copy the
     archive carries, so a part file that has moved on disk since does not block
     the save.  The name is preserved so the manifest still points at it.
+
+    Only the copy of *this* part will do.  Whatever is already at *path* may be
+    a different project entirely - a "Save As" over an unrelated file - or the
+    same project from before the part was replaced, and writing either one under
+    the new manifest saves geometry the document is not describing, with nothing
+    to say so on reopen.  The archived bytes are hashed the way
+    :func:`~stamp.io.profile_import.file_hash` hashes the source, and anything
+    that does not match is treated as no copy at all: the caller then asks for a
+    relink, which is the truthful answer.
     """
-    if not path.exists():
+    if not path.exists() or not source_hash:
         return None
     try:
         with zipfile.ZipFile(path) as archive:
             for name in archive.namelist():
                 if name.startswith(f"{BASE_DIR}/part"):
-                    return name, archive.read(name)
+                    data = archive.read(name)
+                    if hashlib.sha256(data).hexdigest()[:32] != source_hash:
+                        return None
+                    return name, data
     except (OSError, zipfile.BadZipFile):
         return None
     return None
+
+
+def _fallback_work_dir(path: Path) -> Path:
+    """Somewhere writable to unpack the sources of a project we cannot write beside.
+
+    One directory per archive rather than one per open, keyed on the archive's
+    own path: a read-only project that is opened, closed and opened again used
+    to leave a fresh ``stamp-sources-*`` behind on every open, and nothing ever
+    removed them.  Reusing the directory also means the extracted sources are
+    already there the second time.
+    """
+    key = hashlib.sha256(str(path.absolute()).encode("utf-8")).hexdigest()[:16]
+    work = Path(tempfile.gettempdir()) / f"stamp-sources-{key}"
+    try:
+        work.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        # Somebody else's directory of the same name, on a shared machine.
+        return Path(tempfile.mkdtemp(prefix="stamp-sources-"))
+    return work
 
 
 def open_project(path: str | Path, work_dir: str | Path | None = None) -> OpenResult:
@@ -165,7 +197,7 @@ def open_project(path: str | Path, work_dir: str | Path | None = None) -> OpenRe
     except OSError:
         # A project on a read-only volume, a CD, or somebody else's share still
         # has to open.  The sources go somewhere writable instead.
-        work = Path(tempfile.mkdtemp(prefix="stamp-sources-"))
+        work = _fallback_work_dir(path)
 
     missing_base: str | None = None
     try:
