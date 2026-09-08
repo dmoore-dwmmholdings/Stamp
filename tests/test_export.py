@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import copy
 import json
-import stat
 import subprocess
 import sys
 import zipfile
@@ -154,6 +153,23 @@ class TestNamesWithDotsInThem:
         assert written.exists()
 
 
+def _refuse_writes_under(folder: Path, monkeypatch) -> None:
+    """Make every mkdir under *folder* fail as it would in a read-only folder.
+
+    ``chmod`` is not enough: on Windows a directory's mode bits do not stop
+    anyone creating things inside it, so the fallback never ran there and the
+    test failed for the wrong reason.
+    """
+    real_mkdir = Path.mkdir
+
+    def refuse(self, *args, **kwargs):
+        if self.is_relative_to(folder):
+            raise PermissionError(f"read-only: {self}")
+        return real_mkdir(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "mkdir", refuse)
+
+
 class TestOpeningAProjectThatIsWrong:
     """Everything open_project can hit has to arrive as a ProjectError."""
 
@@ -172,22 +188,19 @@ class TestOpeningAProjectThatIsWrong:
         assert "damaged" in str(caught.value)
 
     def test_a_read_only_folder_falls_back_to_a_temporary_work_dir(
-        self, stamped, tmp_path
+        self, stamped, tmp_path, monkeypatch
     ):
         folder = tmp_path / "readonly"
         folder.mkdir()
         path = save(stamped, folder / "locked.stamp")
-        folder.chmod(stat.S_IRUSR | stat.S_IXUSR)
-        try:
-            opened = open_project(path)
-        finally:
-            folder.chmod(stat.S_IRWXU)
+        _refuse_writes_under(folder, monkeypatch)
+        opened = open_project(path)
         assert opened.work_dir is not None
         assert not opened.work_dir.is_relative_to(folder)
         assert Path(opened.document.base.source_path).exists()
 
     def test_opening_twice_does_not_leave_two_temporary_folders(
-        self, stamped, tmp_path
+        self, stamped, tmp_path, monkeypatch
     ):
         """The fallback used to mkdtemp per open, and nothing ever removed them."""
         import tempfile
@@ -195,14 +208,11 @@ class TestOpeningAProjectThatIsWrong:
         folder = tmp_path / "readonly_twice"
         folder.mkdir()
         path = save(stamped, folder / "locked.stamp")
-        folder.chmod(stat.S_IRUSR | stat.S_IXUSR)
+        _refuse_writes_under(folder, monkeypatch)
         root = Path(tempfile.gettempdir())
         before = set(root.glob("stamp-sources-*"))
-        try:
-            first = open_project(path)
-            second = open_project(path)
-        finally:
-            folder.chmod(stat.S_IRWXU)
+        first = open_project(path)
+        second = open_project(path)
         assert first.work_dir == second.work_dir
         assert len(set(root.glob("stamp-sources-*")) - before) == 1
 
