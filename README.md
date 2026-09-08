@@ -506,8 +506,9 @@ delete the file afterwards:
 ```
 uv run python packaging/make_release_key.py --private-key-out stamp-release.key
 ```
- The release workflow then writes and signs `latest.json`
-after the installers are built, and attaches it to the release.
+
+The release workflow then writes and signs `latest.json` after the installers
+are built, and attaches it to the release.
 
 Without the secret the workflow skips the feed with a warning and everything
 else still builds — nobody is offered the release automatically, which is the

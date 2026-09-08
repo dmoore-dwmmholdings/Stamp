@@ -765,6 +765,60 @@ with no output, which looks exactly like a wedged test suite and is not one.
 The package root is `src/stamp/` (uv's default layout); section 13 says `app/`.
 Module names inside the root match section 13.
 
+## v1.6.1 - what an adversarial review found
+
+Before using 1.6.0 in anger, every area was reviewed by someone whose only job
+was to break it, each defect was reproduced with a script before it was
+believed, and each fix was reviewed the same way. Around seventy defects were
+verified; the ones worth recording are the ones that shipped wrong geometry or
+lost work without saying so.
+
+Wrap stamped both walls of a tube. The band was a full ring and the selector
+prism ran straight through the part, so a cut on the near wall was mirrored on
+the far one. Wrap was also a projection, not a wrap: the flat artwork was
+extruded along the tangent-plane normal and clipped at the silhouette, so an
+18 mm mark on a 20 mm tube spanned 64° instead of the 52° its arc length gives.
+Cylinders now get a true wrap - each loop is mapped by arc length onto the
+face's own parameterization and built as exact faces on the cylinder with
+radial walls - and cones keep the projection with a size limit and a message
+saying so. The wrapped solid is closed with `ShapeFix_Solid` rather than
+`BRepLib.OrientClosedSolid`, which produced a reversed solid that measured the
+right volume, passed `BRepCheck`, and failed every fillet.
+
+The draft neutral plane sat at the start of the sweep, not on the sketch plane,
+so a through-all cut with 1° of draft was already 30 % undersized where it met
+the face and pinched to nothing at 2°.
+
+A multi-part 3MF rebuilt to nothing in the app. `restore()` and the worker's
+copy carried the base's geometry across the JSON round trip but not the parts',
+so every part looked like it had nothing to do. `BasePart.adopt_runtime` copies
+both now, and a part with features and no geometry reports itself instead of
+staying silent.
+
+The rebuild cache replayed a bare passing row for anything it had cached, so a
+broken feature turned green on the next edit, preflight lost its warnings, and
+colour export lost its tools. It now caches the row with the geometry. The
+second review found it could still skip a feature whose row the FIFO had
+evicted after thirty edits; a resume now needs every row before it.
+
+SVGs were scaled twice. ocpsvg applies the viewBox transform itself, and Stamp
+multiplied by it again, so any file whose viewBox did not equal its physical
+width - every Illustrator export - came in at the wrong size with no prompt.
+The rule now comes from svgelements' own parse, and a file with no viewBox
+asks.
+
+Opening a part or project threw unsaved work away without asking. The preset
+picker crashed on every QR preset. Keys 1 to 7 were bound twice, so Qt fired
+neither. Selecting a feature that had a pattern replaced the pattern with a
+default one. Dragging a feature in the tree did nothing, because `QTreeWidget`
+moves rows without ever calling `moveRows`.
+
+Fit to face, rewritten during this work to measure the face in the sketch
+plane, measured only its vertices, so a round face fitted the artwork to zero.
+`face_extent_in_plane` transforms the face into the plane's frame and takes its
+bounding box there. That one is here as a reminder that a fix needs the same
+review as the bug.
+
 ## What a release is allowed to publish
 
 A signed feed is only worth the care taken over what gets signed, and four ways
