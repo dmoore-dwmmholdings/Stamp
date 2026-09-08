@@ -41,11 +41,11 @@ uv run pyinstaller packaging/stamp.spec --noconfirm
 | M5 | Polish: error messages, packaging. | Done |
 
 Version 1 is complete. The seven-step acceptance flow from section 14 exists as a
-single test, and it passes. The suite is 606 tests (plus one marked `opens_email`,
-deselected by default), all passing, with a clean ruff run. Under
-`QT_QPA_PLATFORM=offscreen` the whole suite runs and 59 of them skip — 57 in
+single test, and it passes. The suite is about 800 tests (plus one marked
+`opens_email`, deselected by default), all passing, with a clean ruff run. Under
+`QT_QPA_PLATFORM=offscreen` the whole suite runs and 68 of them skip — 66 in
 `test_ui.py` and the two acceptance tests, the ones that need a real window with
-an OpenGL context. That is what CI does; `docker/` runs those 59 as well.
+an OpenGL context. That is what CI does; `docker/` runs those 68 as well.
 
 ## Modules
 
@@ -734,11 +734,13 @@ smaller box is the more specific answer.
 ## Testing without a desktop
 
 Many tests build a real window, so a local run takes over the screen.
-`QT_QPA_PLATFORM=offscreen` is the way out for all but 59 of them: those need a
+`QT_QPA_PLATFORM=offscreen` is the way out for all but 68 of them: those need a
 real GL surface for the OCC viewport and skip themselves, and the rest — the text
-tests included — run offscreen. That is what CI does.
+tests included — run offscreen. That is what CI does. Note that
+`tests/test_acceptance.py` builds a real window too, so `--ignore=tests/test_ui.py`
+alone is not enough to keep a run off the screen; set the platform as well.
 
-`docker/` runs the whole suite, those 59 included, under Xvfb with Mesa's
+`docker/` runs the whole suite, those 68 included, under Xvfb with Mesa's
 software renderer instead. Two things
 cost an hour between them and are worth recording. `python:3.12-slim` has no
 glib, so PySide6 would not import - and the failure showed up as a container

@@ -527,12 +527,12 @@ and takes focus while it goes.
 QT_QPA_PLATFORM=offscreen uv run pytest
 ```
 
-runs the whole suite without touching the screen, which is what CI does. The 59
-tests that need a genuine GL surface skip themselves there — 57 in
+runs the whole suite without touching the screen, which is what CI does. The 68
+tests that need a genuine GL surface skip themselves there — 66 in
 `tests/test_ui.py` and the two acceptance tests — because OpenCascade's viewport
 needs a real one. Everything else, the text tests included, runs offscreen.
 
-To run those 59 as well without a desktop, run the suite in the container, which
+To run those 68 as well without a desktop, run the suite in the container, which
 gives it an Xvfb display and Mesa's software renderer of its own:
 
 ```

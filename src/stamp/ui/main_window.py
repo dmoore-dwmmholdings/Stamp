@@ -1282,11 +1282,27 @@ class MainWindow(QMainWindow):
             self.settings.setValue(
                 "update/skipped_version", self._update_release.version
             )
+        self._discard_update_download()
         self.update_bar.hide_bar()
 
     def _on_update_cancel(self) -> None:
         self.updater.cancel()
+        self._discard_update_download()
         self.update_bar.hide_bar()
+
+    def _discard_update_download(self) -> None:
+        """Throw away a downloaded installer nobody is going to run.
+
+        Skipping a version, cancelling, or closing without having asked for the
+        install all leave a verified installer in the temporary folder; it is
+        a hundred megabytes a time, and nothing else would clear it before the
+        next download.
+        """
+        if self._update_installer is None or self._installing_update:
+            return
+        update.discard(self._update_installer)
+        self._update_installer = None
+        self._update_sha256 = None
 
     def _apply_update(self, now: bool) -> None:
         """Start the installer and close, in that order and only in that order.
@@ -3929,6 +3945,8 @@ class MainWindow(QMainWindow):
         # agreed to close, and this is the moment nobody is waiting on Stamp.
         if self._install_on_quit and not self._installing_update:
             self._apply_update(now=False)
+        if not self._install_on_quit:
+            self._discard_update_download()
         if self._batch_thread is not None and self._batch_thread.isRunning():
             self._batch_thread.quit()
             self._batch_thread.wait(5000)
