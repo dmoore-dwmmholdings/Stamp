@@ -16,6 +16,7 @@ Two constraints shape the implementation:
 from __future__ import annotations
 
 import math
+from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum, auto
 
@@ -106,6 +107,10 @@ class HandleOverlay(QObject):
         self.snap_targets: list[SnapTarget] = []
         #: What the last snap landed on, for the status line.
         self.last_snap: SnapTarget | None = None
+        #: Asked before every drag.  While the window is waiting for a click of
+        #: its own - a face to place a profile on, a target face, a re-pick -
+        #: the overlay stands down and lets the click reach the viewport.
+        self.pick_pending: Callable[[], bool] | None = None
 
         self._drag: _Drag | None = None
         self._handles: list[tuple[Mode, int, tuple[float, float]]] = []
@@ -388,6 +393,8 @@ class HandleOverlay(QObject):
         return False
 
     def _begin_drag(self, event: QMouseEvent) -> bool:
+        if self.pick_pending is not None and self.pick_pending():
+            return False
         position = event.position().toPoint()
         uv = self._uv_at(position)
         if uv is None:
@@ -478,6 +485,15 @@ class HandleOverlay(QObject):
         drag, self._drag = self._drag, None
         self._clear_snap()
         if drag is None:
+            return
+        placement = self.feature.placement if self.feature else None
+        if placement is None or (
+            placement.offset_2d == drag.start_offset
+            and placement.scale == drag.start_scale
+            and placement.rotation == drag.start_rotation
+        ):
+            # A press and a release with nothing between them.  Committing that
+            # put an undo entry and a rebuild behind every click on the profile.
             return
         label = {
             Mode.TRANSLATE: "move",

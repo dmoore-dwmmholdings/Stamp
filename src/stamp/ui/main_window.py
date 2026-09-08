@@ -13,12 +13,20 @@ of them with no working path at all.  See :mod:`stamp.ui.ribbon`.
 from __future__ import annotations
 
 import math
-import tempfile
 import time
 from dataclasses import replace
 from pathlib import Path
 
-from PySide6.QtCore import QSettings, Qt, QTimer, QUrl, Signal
+from PySide6.QtCore import (
+    QEvent,
+    QObject,
+    QSettings,
+    Qt,
+    QThread,
+    QTimer,
+    QUrl,
+    Signal,
+)
 from PySide6.QtGui import (
     QAction,
     QDesktopServices,
@@ -27,6 +35,8 @@ from PySide6.QtGui import (
     QKeySequence,
 )
 from PySide6.QtWidgets import (
+    QAbstractButton,
+    QApplication,
     QComboBox,
     QDoubleSpinBox,
     QFileDialog,
@@ -35,6 +45,7 @@ from PySide6.QtWidgets import (
     QLabel,
     QMainWindow,
     QProgressBar,
+    QProgressDialog,
     QPushButton,
     QSplitter,
     QStackedWidget,
@@ -163,6 +174,25 @@ CLEARANCE_OK_COLOR = (0.94, 0.70, 0.18)
 CLEARANCE_WARN_COLOR = (0.88, 0.28, 0.22)
 
 
+class _BatchWorker(QObject):
+    """Runs one batch on a worker thread.  See MainWindow.start_batch."""
+
+    finished = Signal(object)
+    failed = Signal(str)
+
+    def __init__(self, template, csv_path, output_dir, fmt) -> None:
+        super().__init__()
+        self._args = (template, csv_path, output_dir, fmt)
+
+    def run(self) -> None:
+        try:
+            report = run_batch(*self._args)
+        except Exception as exc:  # noqa: BLE001 - the window reports whatever went wrong
+            self.failed.emit(str(exc))
+            return
+        self.finished.emit(report)
+
+
 class MainWindow(QMainWindow):
     """Owns the document and drives everything else."""
 
@@ -183,6 +213,9 @@ class MainWindow(QMainWindow):
         diagnostics.error_reporter = self._report_uncaught
 
         self._project_path: Path | None = None
+        #: Where the base part actually is, when that differs from what the
+        #: document records - a relinked part, waiting to be archived on save.
+        self._base_path: str | None = None
         self._last_result: RebuildResult | None = None
         self._pending_profile: ProfileRef | None = None
         self._pending_profile_size: tuple[float, float] = (0.0, 0.0)
@@ -206,6 +239,11 @@ class MainWindow(QMainWindow):
         self._auto_value_attempts: dict[str, int] = {}
         self._auto_value_note = ""
         self._mesh_region = None
+        #: The batch, while one is running off the GUI thread.
+        self._batch_thread: QThread | None = None
+        self._batch_worker: QObject | None = None
+        self._batch_progress = None
+        self._batch_report = None
         #: Why the 3D view could not start, or None while it is fine.
         self._viewport_error: str | None = None
         #: The per-component decals currently on screen, to erase next time.
@@ -218,6 +256,8 @@ class MainWindow(QMainWindow):
         #: on at the end rather than now.
         self._update_release = None
         self._update_installer: Path | None = None
+        #: What the fetched installer has to hash to, re-checked at install time.
+        self._update_sha256: str | None = None
         self._install_on_quit = False
         self._installing_update = False
         #: Whether this check was asked for.  An automatic one that fails says
@@ -594,8 +634,10 @@ class MainWindow(QMainWindow):
             lambda: self.viewport.set_selection_mode(self.selection_box.currentData())
         )
 
-        self.action_preview.setShortcut(QKeySequence("Space"))
-        self.addAction(self.action_preview)
+        # Space through a hidden action of its own, so the slot can stand aside
+        # for a focused button - a shortcut on action_preview itself would fire
+        # before the button ever saw the key.
+        self._hidden_action("Toggle preview", self._space_pressed, "Space")
         self.addAction(self.action_draft)
 
         # The report commands stay off the ribbon and live in the status bar,
@@ -639,11 +681,17 @@ class MainWindow(QMainWindow):
         self._hidden_action("Delete feature", self.delete_selected_feature, "Del")
         self._hidden_action("Duplicate feature", self.duplicate_selected_feature, "Ctrl+D")
         self._hidden_action("Frame selection", self.viewport.fit_all, "F")
-        for index, name in enumerate(
-            ["front", "back", "left", "right", "top", "bottom", "iso"], start=1
+        # One action per preset view, keyed by preset.  The View menu shows these
+        # same objects: a second action carrying the same digit made Qt report an
+        # ambiguous shortcut and fire neither.
+        self._view_actions: dict[str, QAction] = {}
+        for key, label, preset in (
+            ("1", "Front", "front"), ("2", "Back", "back"), ("3", "Left", "left"),
+            ("4", "Right", "right"), ("5", "Top", "top"), ("6", "Bottom", "bottom"),
+            ("7", "Isometric", "iso"),
         ):
-            self._hidden_action(
-                f"View {name}", lambda _=False, n=name: self.viewport.set_preset_view(n), str(index)
+            self._view_actions[preset] = self._hidden_action(
+                label, lambda _=False, v=preset: self.viewport.set_preset_view(v), key
             )
         # Rolling and "normal to" from the window rather than the 3D view, so they
         # answer wherever the keyboard focus happens to be.  Orbiting with the
@@ -687,6 +735,17 @@ class MainWindow(QMainWindow):
         self.menuBar().setStyleSheet(sheet)
         self._ribbon_holder_bar.setStyleSheet(sheet)
         self.update_bar.apply_theme(self.ribbon.theme)
+
+    def changeEvent(self, event) -> None:  # noqa: N802
+        """Follow the desktop switching between light and dark.
+
+        The ribbon re-themes itself on the same event; the menu bar, the ribbon's
+        holder and the update bar are painted from _build_menus, which runs once.
+        Without this the top of the window kept the old palette's colours.
+        """
+        super().changeEvent(event)
+        if event.type() == QEvent.Type.PaletteChange:
+            self._apply_header_theme()
 
     def _set_ribbon_collapsed(self, collapsed: bool) -> None:
         self.ribbon.set_collapsed(collapsed)
@@ -859,6 +918,9 @@ class MainWindow(QMainWindow):
         file_menu = bar.addMenu("&File")
         file_menu.addAction(self.action_open_part)
         file_menu.addAction(self.action_open_project)
+        self.recent_menu = file_menu.addMenu("Open recent")
+        self.recent_menu.aboutToShow.connect(self._fill_recent_menu)
+        self._fill_recent_menu()
         file_menu.addAction(self.action_save)
         file_menu.addSeparator()
         file_menu.addAction(self.action_replace_part)
@@ -908,16 +970,8 @@ class MainWindow(QMainWindow):
 
         view_menu = bar.addMenu("&View")
         orient = view_menu.addMenu("Orientation")
-        for name, key in (
-            ("Isometric", "7"), ("Front", "1"), ("Back", "2"), ("Left", "3"),
-            ("Right", "4"), ("Top", "5"), ("Bottom", "6"),
-        ):
-            preset = name.lower().replace("isometric", "iso")
-            entry = orient.addAction(name)
-            entry.setShortcut(QKeySequence(key))
-            entry.triggered.connect(
-                lambda _checked=False, v=preset: self.viewport.set_preset_view(v)
-            )
+        for preset in ("iso", "front", "back", "left", "right", "top", "bottom"):
+            orient.addAction(self._view_actions[preset])
         view_menu.addAction(self.action_view_normal)
         view_menu.addAction(self.action_fit)
         view_menu.addSeparator()
@@ -955,6 +1009,22 @@ class MainWindow(QMainWindow):
         # Last, because the ribbon has to be built before it can change size.
         if self.settings.value("ui/large_ribbon", False, type=bool):
             self.action_large_ribbon.setChecked(True)
+
+    def _fill_recent_menu(self) -> None:
+        """The last ten projects opened, minus the ones that are gone."""
+        self.recent_menu.clear()
+        recent = self.recent_projects()
+        if not recent:
+            empty = self.recent_menu.addAction("No recent projects")
+            empty.setEnabled(False)
+            return
+        for path in recent:
+            entry = self.recent_menu.addAction(Path(path).name)
+            entry.setStatusTip(path)
+            entry.setToolTip(path)
+            entry.triggered.connect(
+                lambda _checked=False, p=path: self.open_project(Path(p))
+            )
 
     def _hidden_action(self, text: str, slot, shortcut: str) -> QAction:
         action = QAction(text, self)
@@ -1016,6 +1086,7 @@ class MainWindow(QMainWindow):
         self.properties.pick_to_face_requested.connect(self._start_to_face_pick)
         self.properties.repick_face_requested.connect(self._start_repick)
 
+        self.handles.pick_pending = self._pick_waiting
         self.handles.placement_changed.connect(self._on_handle_moved)
         self.handles.placement_committed.connect(self._on_handle_committed)
 
@@ -1121,7 +1192,7 @@ class MainWindow(QMainWindow):
             return
         # Once a day is plenty for a program somebody opens to do a job.
         last = int(self.settings.value("update/last_check", 0, type=int))
-        if time.time() - last < 20 * 60 * 60:
+        if time.time() - last < 24 * 60 * 60:
             return
         self._check_for_updates(announce=False)
 
@@ -1179,11 +1250,18 @@ class MainWindow(QMainWindow):
             return
         self._update_announce = True
         self.update_bar.downloading(release.version)
-        self.updater.fetch(release, Path(tempfile.gettempdir()) / "stamp-update")
+        # No directory: update.download makes a fresh one with permissions of
+        # its own.  A verified installer at a name anybody could guess is an
+        # invitation to swap it between the hash check and the run.
+        self.updater.fetch(release)
 
     def _on_update_ready(self, path: str) -> None:
         self._update_installer = Path(path)
-        version = self._update_release.version if self._update_release else ""
+        release = self._update_release
+        self._update_sha256 = (
+            release.artifact.sha256 if release is not None and release.artifact else None
+        )
+        version = release.version if release is not None else ""
         self.update_bar.ready(version)
 
     def _on_update_later(self) -> None:
@@ -1238,7 +1316,7 @@ class MainWindow(QMainWindow):
         # is how somebody ends up answering "no" to a close that happens anyway.
         self._installing_update = True
         try:
-            update.install(self._update_installer)
+            update.install(self._update_installer, sha256=self._update_sha256)
         except update.UpdateError as exc:
             self._installing_update = False
             self._update_announce = True
@@ -1257,6 +1335,20 @@ class MainWindow(QMainWindow):
         if not self.interactive:
             return True
         return dialogs.confirm(self, title, message)
+
+    def _confirm_discard(self) -> bool:
+        """Ask before throwing away unsaved work, and report whether to go on.
+
+        Every path that replaces the document - opening a part or a project, a
+        drop, a part swap - loses the undo stack with it, so each one asks the
+        same question closeEvent asks.
+        """
+        if not self._dirty or self.document.base is None:
+            return True
+        return self._confirm(
+            "Close without saving?",
+            "This project has changes that are not saved. Close it anyway?",
+        )
 
     # ---------------------------------------------------------------- document
 
@@ -1428,9 +1520,21 @@ class MainWindow(QMainWindow):
         return abs(offset) <= 1e-3
 
     def relink_sources(self) -> None:
-        """Point a feature at a source file that moved, and rebuild (§10)."""
+        """Point a feature or the part at a source file that moved, and rebuild (§10)."""
         if self.document.base is None:
             return
+        base = self.document.base
+        base_source = Path(self._base_path or base.source_path)
+        if base.source_path and not base_source.exists():
+            found = self._find_missing_base(base_source)
+            if found is not None:
+                result = self._import_part(found, unit_scale=base.unit_scale)
+                if result is not None:
+                    base.adopt_runtime(result.part, require_match=False)
+                    base.source_path = str(found)
+                    self._base_path = str(found)
+                    self._remember_dir("part", found)
+
         missing = [
             f.profile.source_path
             for f in self.document.features
@@ -1457,6 +1561,24 @@ class MainWindow(QMainWindow):
                     feature.profile.source_path = chosen
         self.engine.invalidate()
         self.request_rebuild(immediate=True)
+
+    def _find_missing_base(self, original: Path) -> Path | None:
+        """Ask where the base part went, or None when the user gave up."""
+        patterns = " ".join(f"*{ext}" for ext in sorted(PART_EXTS))
+        if not self.interactive:
+            return None
+        chosen, _ = QFileDialog.getOpenFileName(
+            self,
+            f"Find {original.name}",
+            self._last_dir("part"),
+            f"3D parts ({patterns})",
+        )
+        if not chosen:
+            self.statusBar().showMessage(
+                f"{original.name} is missing, so the project cannot be opened.", 8000
+            )
+            return None
+        return Path(chosen)
 
     def _warn_profile_larger_than_face(self, feature: Feature) -> None:
         """A cut hanging off an edge is legitimate, so this warns and allows it (§10)."""
@@ -1517,6 +1639,8 @@ class MainWindow(QMainWindow):
         return not solids_intersect(result.solids)
 
     def open_part(self, path: Path) -> None:
+        if not self._confirm_discard():
+            return
         result = self._import_part(path)
         if result is None:
             return
@@ -1557,6 +1681,7 @@ class MainWindow(QMainWindow):
         self._mesh_pick_cache = None
         self._mesh_region = None
         self._project_path = None
+        self._base_path = None
         self._last_result = None
         self._dirty = False
         self._undo_baseline = self.document.snapshot()
@@ -1596,6 +1721,8 @@ class MainWindow(QMainWindow):
         """
         if self.document.base is None:
             self._notify("There is no part to replace", "Open a part first.")
+            return
+        if not self._confirm_discard():
             return
 
         result = self._import_part(path)
@@ -1932,6 +2059,16 @@ class MainWindow(QMainWindow):
             )
             if not self._ask(dialog):
                 return
+            if dialog.scale() != 1.0:
+                # Re-read at the size the user just gave.  The answer used to be
+                # thrown away: whatever unit was picked, the artwork stayed at
+                # the 96 dpi reading the dialog was complaining about.
+                options.extra_scale = dialog.scale()
+                try:
+                    result = import_profile(path, options)
+                except Exception as exc:
+                    self._notify("Stamp cannot read this profile", str(exc))
+                    return
 
         ref = ProfileRef(
             source_path=str(path),
@@ -1942,6 +2079,9 @@ class MainWindow(QMainWindow):
             outline_strokes=options.outline_stroke_width,
             union_overlapping=options.union_overlapping,
             close_open_loops=options.close_open_loops,
+            join_tolerance=options.join_tolerance,
+            unit_scale=options.extra_scale,
+            keep_background=options.keep_background,
         )
         self.profiles.put(ref, result.profile)
         self._remember_dir("profile", path)
@@ -2090,26 +2230,10 @@ class MainWindow(QMainWindow):
                 direction=self._default_direction(),
             ),
         )
-        if self._pending_feature_template is not None:
-            template = self._pending_feature_template.copy_with_new_id()
-            feature.name = template.name
-            feature.operation = template.operation
-            feature.modifiers = template.modifiers
-            feature.pattern = template.pattern
-            feature.metadata = template.metadata
-            feature.inspection = template.inspection
-            feature.placement.offset_2d = template.placement.offset_2d
-            feature.placement.rotation = template.placement.rotation
-            feature.placement.scale = template.placement.scale
-            feature.placement.uniform_scale = template.placement.uniform_scale
-            feature.placement.mirror_u = template.placement.mirror_u
-            feature.placement.mirror_v = template.placement.mirror_v
-            feature.placement.lift = template.placement.lift
-            feature.placement.mode = template.placement.mode
+        self._apply_pending_template(feature)
         self._push_undo("add feature")
         self.document.add_feature(feature)
         self._pending_profile = None
-        self._pending_feature_template = None
         # The prompt that asked for this click has been answered.  Left up, it goes
         # on telling the user to click a face to place something already placed.
         self.statusBar().showMessage(f"Placed {feature.name}.")
@@ -2128,6 +2252,32 @@ class MainWindow(QMainWindow):
         from stamp.core.document import Direction
 
         return Direction.INTO
+
+    def _apply_pending_template(self, feature: Feature) -> None:
+        """Carry a preset's settings onto the feature that was just placed.
+
+        Everything but the anchor: the anchor is the face or region that was
+        clicked, which is the whole point of the click.  Clears the template, so
+        the next profile placed without one starts from the defaults again.
+        """
+        template, self._pending_feature_template = self._pending_feature_template, None
+        if template is None:
+            return
+        template = template.copy_with_new_id()
+        feature.name = template.name
+        feature.operation = template.operation
+        feature.modifiers = template.modifiers
+        feature.pattern = template.pattern
+        feature.metadata = template.metadata
+        feature.inspection = template.inspection
+        feature.placement.offset_2d = template.placement.offset_2d
+        feature.placement.rotation = template.placement.rotation
+        feature.placement.scale = template.placement.scale
+        feature.placement.uniform_scale = template.placement.uniform_scale
+        feature.placement.mirror_u = template.placement.mirror_u
+        feature.placement.mirror_v = template.placement.mirror_v
+        feature.placement.lift = template.placement.lift
+        feature.placement.mode = template.placement.mode
 
     def _start_to_face_pick(self) -> None:
         self._picking_to_face = True
@@ -2165,13 +2315,39 @@ class MainWindow(QMainWindow):
             self._notify("Note about this face", "\n\n".join(warnings))
         self.request_rebuild(immediate=True)
 
+    def _pick_waiting(self) -> bool:
+        """Whether the window is waiting for a click in the 3D view.
+
+        The handle overlay asks before it starts a drag: a press inside the
+        selected feature's frame used to be swallowed as a move, so the face the
+        user clicked to place the next profile on never registered.
+        """
+        return (
+            self._pending_profile is not None
+            or self._picking_to_face
+            or self._repicking
+            or self._picking_alignment_edge
+            or self._picking_origin_vertex
+            or self._picking_hole_center
+        )
+
     def _cancel_pending(self) -> None:
-        if self._pending_profile is not None:
-            self._pending_profile = None
-            self.statusBar().showMessage("Cancelled.")
+        """Esc: put every pick that is waiting for a click back the way it was."""
+        waiting = self._pick_waiting()
+        self._pending_profile = None
+        self._pending_profile_size = (0.0, 0.0)
+        self._pending_feature_template = None
         self._picking_to_face = False
         self._repicking = False
+        self._picking_alignment_edge = False
+        self._picking_origin_vertex = False
+        self._picking_hole_center = False
+        # Edge and vertex picking each switch the filter; faces is where it lives.
+        self.selection_box.setCurrentIndex(self.selection_box.findData("face"))
+        self.viewport.set_selection_mode("face")
         self.handles.cancel_drag()
+        if waiting:
+            self.statusBar().showMessage("Cancelled.")
 
     # ------------------------------------------------------------ tree actions
 
@@ -2251,6 +2427,16 @@ class MainWindow(QMainWindow):
             self.warning_label.setText(region.warnings[0])
 
     def _on_mesh_picked(self) -> None:
+        if self._picking_to_face:
+            # There are no faces to cut up to in mesh mode, so the pick can never
+            # be answered.  Say so and drop it rather than swallowing the click.
+            self._picking_to_face = False
+            self._notify(
+                "To-face depth needs a solid part",
+                "This part is a mesh, which has no faces to cut up to. Use a "
+                "blind depth, or open the STEP the mesh was made from.",
+            )
+            return
         region = self._find_mesh_region()
         if region is None:
             return
@@ -2280,6 +2466,8 @@ class MainWindow(QMainWindow):
         if ref.is_text:
             first = (ref.text.text.strip().splitlines() or ["Text"])[0]
             name = (first[:24] or "Text")
+        elif ref.is_code:
+            name = "QR code" if str(ref.code.kind) == "qr" else "Data Matrix"
         else:
             name = Path(ref.source_path).stem or "Feature"
         feature = Feature(
@@ -2298,9 +2486,11 @@ class MainWindow(QMainWindow):
                 kind=OperationKind.CUT, depth=0.5, direction=self._default_direction()
             ),
         )
+        self._apply_pending_template(feature)
         self._push_undo("add feature")
         self.document.add_feature(feature)
         self._pending_profile = None
+        self.statusBar().showMessage(f"Placed {feature.name}.")
 
         self._refresh_tree()
         self.tree.select_feature(feature.id)
@@ -2481,11 +2671,30 @@ class MainWindow(QMainWindow):
             face = resolve_face_ref(feature.placement.anchor.face_ref, self.document.base.runtime).face
         except Exception:
             return None
-        from stamp.io.part_import import bounding_box
+        # Measured in the sketch plane's own axes, not the world's.  A world-axis
+        # bounding box on a tilted face is the box the face sits in, which is
+        # bigger than the face in both directions and in neither of the two the
+        # profile is actually scaled along.
+        from OCP.BRep import BRep_Tool
+        from OCP.TopAbs import TopAbs_ShapeEnum
+        from OCP.TopExp import TopExp_Explorer
+        from OCP.TopoDS import TopoDS
 
-        x0, y0, z0, x1, y1, z1 = bounding_box(face)
-        extents = sorted([x1 - x0, y1 - y0, z1 - z0], reverse=True)
-        return (extents[0], extents[1])
+        ox, oy, oz = plane.origin
+        ux, uy, uz = plane.u_axis
+        vx, vy, vz = snapping.v_axis(plane)
+        us: list[float] = []
+        vs: list[float] = []
+        explorer = TopExp_Explorer(face, TopAbs_ShapeEnum.TopAbs_VERTEX)
+        while explorer.More():
+            point = BRep_Tool.Pnt_s(TopoDS.Vertex_s(explorer.Current()))
+            dx, dy, dz = point.X() - ox, point.Y() - oy, point.Z() - oz
+            us.append(dx * ux + dy * uy + dz * uz)
+            vs.append(dx * vx + dy * vy + dz * vz)
+            explorer.Next()
+        if not us:
+            return None
+        return (max(us) - min(us), max(vs) - min(vs))
 
     def _on_handle_moved(self, _label: str) -> None:
         snapped = self.handles.last_snap
@@ -2777,10 +2986,12 @@ class MainWindow(QMainWindow):
         if part is None or part.visible == visible:
             return
         part.visible = bool(visible)
-        self._display_geometry(
-            self._last_result.geometry if self._last_result else None,
-            base.mode,
-        )
+        if self._last_result is None or self._last_result.geometry is None:
+            # Nothing has been rebuilt yet, and display_shape on None raises in
+            # solid mode.  The tick is recorded; the next rebuild draws it.
+            self._refresh_tree()
+            return
+        self._display_geometry(self._last_result.geometry, base.mode)
         self._refresh_tree()
 
     def isolate_part(self, index: int) -> None:
@@ -2790,9 +3001,8 @@ class MainWindow(QMainWindow):
             return
         for part in base.parts:
             part.visible = index < 0 or part.index == index
-        self._display_geometry(
-            self._last_result.geometry if self._last_result else None, base.mode
-        )
+        if self._last_result is not None and self._last_result.geometry is not None:
+            self._display_geometry(self._last_result.geometry, base.mode)
         self._refresh_tree()
         if index >= 0:
             named = next((p for p in base.parts if p.index == index), None)
@@ -2825,6 +3035,18 @@ class MainWindow(QMainWindow):
 
     def toggle_preview(self) -> None:
         self.action_preview.setChecked(not self.action_preview.isChecked())
+
+    def _space_pressed(self) -> None:
+        """Space toggles the preview, except where Space already means something.
+
+        It is a window shortcut, so without this it fired instead of the focused
+        button's own Space - a checkbox in the properties panel could not be
+        ticked from the keyboard at all.
+        """
+        focused = QApplication.focusWidget()
+        if isinstance(focused, (QAbstractButton, QComboBox)):
+            return
+        self.action_preview.toggle()
 
     def set_preview_visible(self, on: bool) -> None:
         """Show or hide the translucent tool solid over the part."""
@@ -2974,25 +3196,47 @@ class MainWindow(QMainWindow):
         snapshot = self.undo_stack.undo(self.document.snapshot())
         if snapshot is None:
             return
-        self.document.restore(snapshot)
-        self._undo_baseline = self.document.snapshot()
-        self.engine.invalidate()
-        self._refresh_tree()
-        self._refresh_properties()
-        self._update_enabled_state()
-        self.request_rebuild(immediate=True)
+        self._restore(snapshot)
 
     def redo(self) -> None:
         snapshot = self.undo_stack.redo(self.document.snapshot())
         if snapshot is None:
             return
+        self._restore(snapshot)
+
+    def _restore(self, snapshot) -> None:
+        """Put a snapshot back on screen.
+
+        A snapshot is JSON, so the restored base part carries no geometry.  Where
+        the restore replaced the part - a replace-part undone, say - the runtime
+        has to come back from the file, or every following rebuild has nothing to
+        cut into.
+        """
         self.document.restore(snapshot)
+        self._reload_base_runtime()
         self._undo_baseline = self.document.snapshot()
         self.engine.invalidate()
+        self._dirty = True
+        self._update_title()
         self._refresh_tree()
         self._refresh_properties()
         self._update_enabled_state()
         self.request_rebuild(immediate=True)
+
+    def _reload_base_runtime(self) -> None:
+        base = self.document.base
+        if base is None or base.runtime is not None or not base.source_path:
+            return
+        source = Path(self._base_path or base.source_path)
+        try:
+            reloaded = import_part_for_ui(
+                self, source, draft=self._draft_display, unit_scale=base.unit_scale
+            )
+        except (ImportCancelled, PartImportError):
+            # The rebuild engine reports a part it cannot build from, on its own
+            # error row.  Nothing more useful can be said from here.
+            return
+        base.adopt_runtime(reloaded.part, require_match=False)
 
     # ------------------------------------------------------------ project file
 
@@ -3004,6 +3248,8 @@ class MainWindow(QMainWindow):
             self.open_project(Path(path))
 
     def open_project(self, path: Path) -> None:
+        if not self._confirm_discard():
+            return
         try:
             opened = project_io.open_project(path)
         except project_io.ProjectError as exc:
@@ -3015,8 +3261,22 @@ class MainWindow(QMainWindow):
             self._notify("This project has no part", "The project records no base part.")
             return
         source = Path(document.base.source_path)
+        base_path: str | None = None
+        if opened.missing_base:
+            # Without the part there is nothing to open at all, so it is the first
+            # thing asked for - before the per-feature relink prompt.
+            found = self._find_missing_base(Path(opened.missing_base))
+            if found is None:
+                return
+            source = found
+            base_path = str(found)
+            document.base.source_path = str(found)
         try:
-            reloaded = import_part_for_ui(self, source, draft=self._draft_display)
+            reloaded = import_part_for_ui(
+                self, source,
+                draft=self._draft_display,
+                unit_scale=document.base.unit_scale,
+            )
         except ImportCancelled:
             self.statusBar().showMessage(f"Opening {path.name} was stopped.", 5000)
             return
@@ -3039,6 +3299,7 @@ class MainWindow(QMainWindow):
         self._undo_baseline = self.document.snapshot()
         self._remember_dir("project", path)
         self._remember_recent(path)
+        self._base_path = base_path
 
         if opened.missing:
             if self.interactive:
@@ -3070,7 +3331,9 @@ class MainWindow(QMainWindow):
 
         thumbnail = self._thumbnail()
         try:
-            written = project_io.save(self.document, path, thumbnail=thumbnail)
+            written = project_io.save(
+                self.document, path, thumbnail=thumbnail, base_path=self._base_path
+            )
         except project_io.ProjectError as exc:
             self._notify("Stamp could not save", str(exc))
             return
@@ -3169,6 +3432,19 @@ class MainWindow(QMainWindow):
             return self._last_result.geometry
         return self.document.base.runtime if self.document.base else None
 
+    def _result_is_current(self) -> bool:
+        """Whether the rebuilt geometry matches the document as it is now.
+
+        An export started inside the debounce window, or while the worker is
+        still going, would otherwise write the shape from before the last edit.
+        """
+        if self.rebuilder.busy or self.rebuilder.pending:
+            self.statusBar().showMessage(
+                "Stamp is still rebuilding - try again in a moment.", 5000
+            )
+            return False
+        return True
+
     def _export_geometry(self):
         """What an export writes: the rebuilt part with the part transform applied.
 
@@ -3186,7 +3462,7 @@ class MainWindow(QMainWindow):
         return self.document.transform.suffix()
 
     def export_step(self) -> None:
-        if self.document.base is None:
+        if self.document.base is None or not self._result_is_current():
             return
         if self.document.base.mode != "solid":
             self._notify("There is no STEP to write", export_io.MESH_MODE_NO_STEP)
@@ -3232,7 +3508,7 @@ class MainWindow(QMainWindow):
         self._report_export(result)
 
     def export_stl(self) -> None:
-        if self.document.base is None:
+        if self.document.base is None or not self._result_is_current():
             return
         mode = self.document.base.mode
         geometry = self._export_geometry()
@@ -3277,7 +3553,7 @@ class MainWindow(QMainWindow):
 
     def export_3mf(self) -> None:
         """Write one body per feature plus the base, for multi-color printing."""
-        if self.document.base is None:
+        if self.document.base is None or not self._result_is_current():
             return
         if self._last_result is None or self._last_result.geometry is None:
             self._notify("Nothing to export", "Rebuild the part first.")
@@ -3352,7 +3628,7 @@ class MainWindow(QMainWindow):
         self._report_export(result)
 
     def export_for_quote(self) -> None:
-        if self.document.base is None:
+        if self.document.base is None or not self._result_is_current():
             return
         fmt = "step" if self.document.base.mode == "solid" else "stl"
         preflight = export_io.preflight_export(self.document, self._last_result, fmt)
@@ -3379,6 +3655,7 @@ class MainWindow(QMainWindow):
                 units=self.document.units,
                 volume_mm3=self._last_result.volume if self._last_result else 0.0,
                 bbox=self.document.base.bbox,
+                document=self.document,
             )
         except Exception as exc:
             self._notify("Stamp could not write the quote files", str(exc))
@@ -3392,7 +3669,7 @@ class MainWindow(QMainWindow):
 
     def export_proof_sheet(self) -> None:
         """Write the compact, reviewable production sheet without exporting geometry."""
-        if self.document.base is None:
+        if self.document.base is None or not self._result_is_current():
             return
         path, _ = QFileDialog.getSaveFileName(
             self,
@@ -3413,7 +3690,7 @@ class MainWindow(QMainWindow):
         self._report_export(result)
 
     def export_job_package(self) -> None:
-        if self.document.base is None:
+        if self.document.base is None or not self._result_is_current():
             return
         fmt = "step" if self.document.base.mode == "solid" else "stl"
         preflight = export_io.preflight_export(self.document, self._last_result, fmt)
@@ -3459,8 +3736,15 @@ class MainWindow(QMainWindow):
         fmt, accepted = QInputDialog.getItem(self, "Batch format", "Export format", ["step", "stl", "3mf"], 0, False)
         if not accepted:
             return
+        # The folder first, because the dry run checks output containment against
+        # it.  Asked afterwards, the simulation passed rows the real run refused.
+        folder = QFileDialog.getExistingDirectory(
+            self, "Choose batch output folder", self._last_dir("export")
+        )
+        if not folder:
+            return
         try:
-            simulation = simulate_batch(template, csv_path, fmt)
+            simulation = simulate_batch(template, csv_path, fmt, output_dir=folder)
         except BatchError as exc:
             self._notify("Batch simulation could not start", str(exc))
             return
@@ -3469,26 +3753,67 @@ class MainWindow(QMainWindow):
             first = failed[0]
             self._notify("Batch simulation found a problem", f"Row {first.index}: {first.detail}")
             return
-        folder = QFileDialog.getExistingDirectory(
-            self, "Choose batch output folder", self._last_dir("export")
-        )
-        if not folder:
-            return
         if not self._confirm(
             "Batch simulation", f"{len(simulation.rows)} row(s) are ready. Start the batch?"
         ):
             return
-        try:
-            report = run_batch(template, csv_path, folder, fmt)
-        except BatchError as exc:
-            self._notify("Batch could not start", str(exc))
-            return
+        self.start_batch(template, csv_path, folder, fmt, rows=len(simulation.rows))
+
+    def start_batch(self, template, csv_path, folder, fmt, *, rows: int = 0) -> QThread:
+        """Run the batch on a worker thread and report when it finishes.
+
+        A batch is a rebuild and an export per row, minutes of it on a long CSV.
+        Run on the GUI thread it froze the window solid, which every desktop
+        answers by offering to kill the program.
+        """
+        self._batch_report = None
+        thread = QThread(self)
+        worker = _BatchWorker(template, csv_path, folder, fmt)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.finished.connect(lambda report: self._on_batch_finished(report, folder))
+        worker.failed.connect(self._on_batch_failed)
+        for signal in (worker.finished, worker.failed):
+            signal.connect(thread.quit)
+        thread.finished.connect(worker.deleteLater)
+        thread.finished.connect(self._close_batch_progress)
+
+        if self.interactive:
+            progress = QProgressDialog("Running the batch…", "", 0, 0, self)
+            progress.setWindowTitle("Batch")
+            progress.setWindowModality(Qt.WindowModality.WindowModal)
+            # No cancel: run_batch has no per-row check to stop at, so a button
+            # here could only lie about what it does.  See the note in PROGRESS.
+            progress.setCancelButton(None)
+            progress.setLabelText(
+                f"Running {rows} row(s)…" if rows else "Running the batch…"
+            )
+            progress.show()
+            self._batch_progress = progress
+
+        # Held, not just connected: a worker with no parent and no reference is
+        # collected the moment start_batch returns, and the batch never starts.
+        self._batch_worker = worker
+        self._batch_thread = thread
+        thread.start()
+        return thread
+
+    def _close_batch_progress(self) -> None:
+        if self._batch_progress is not None:
+            self._batch_progress.close()
+            self._batch_progress = None
+
+    def _on_batch_finished(self, report, folder: str) -> None:
+        self._batch_report = report
         self._remember_dir("export", Path(folder))
         if report.stopped:
             failed = report.rows[-1]
             self._notify("Batch stopped", f"Row {failed.index}: {failed.detail}\n\nA report was written to {folder}.")
         else:
             self._notify("Batch complete", f"Exported {len(report.rows)} part(s).\n\nA report was written to {folder}.")
+
+    def _on_batch_failed(self, message: str) -> None:
+        self._notify("Batch could not start", message)
 
     def _report_export(self, result: export_io.ExportResult) -> None:
         parts = [f"{result.path.name} · {result.size_text}"]
@@ -3501,7 +3826,11 @@ class MainWindow(QMainWindow):
     # -------------------------------------------------------------- misc slots
 
     def _on_units_changed(self) -> None:
-        self.document.units = self.units_box.currentData()
+        units = self.units_box.currentData()
+        if units == self.document.units:
+            return
+        self._push_undo("units")
+        self.document.units = units
         self._refresh_properties()
 
     def recent_projects(self) -> list[str]:
@@ -3600,6 +3929,9 @@ class MainWindow(QMainWindow):
         # agreed to close, and this is the moment nobody is waiting on Stamp.
         if self._install_on_quit and not self._installing_update:
             self._apply_update(now=False)
+        if self._batch_thread is not None and self._batch_thread.isRunning():
+            self._batch_thread.quit()
+            self._batch_thread.wait(5000)
         self.updater.shutdown()
         self.rebuilder.shutdown()
         # This run ended because the user closed it, thus the next start must not

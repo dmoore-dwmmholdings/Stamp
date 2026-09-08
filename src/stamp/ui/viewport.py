@@ -47,7 +47,7 @@ from OCP.V3d import (
     V3d_Viewer,
 )
 from PySide6.QtCore import QElapsedTimer, QPoint, Qt, QTimer, Signal
-from PySide6.QtGui import QMouseEvent, QResizeEvent, QWheelEvent
+from PySide6.QtGui import QGuiApplication, QMouseEvent, QResizeEvent, QWheelEvent
 from PySide6.QtWidgets import QApplication, QWidget
 
 from stamp import diagnostics
@@ -262,7 +262,18 @@ class Viewport(QWidget):
         QTimer.singleShot(60, lambda: self._sync_window_size(refit=True))
         self.ready.emit()
 
+    NATIVE_PLATFORMS = ("cocoa", "windows", "xcb")
+
     def _start_viewer(self) -> None:
+        # Qt's offscreen and minimal platforms hand out a window id that is not a
+        # native handle, and OCC's Cocoa_Window dereferences it and takes the
+        # process down with it.  Refuse before any OCC object exists, so
+        # _init_viewer disables the viewport the same way it does for any other
+        # startup failure.
+        name = QGuiApplication.platformName()
+        if name not in self.NATIVE_PLATFORMS:
+            raise RuntimeError(f"There is no native window under Qt's {name} platform")
+
         self._display_connection = Aspect_DisplayConnection()
         self._driver = OpenGl_GraphicDriver(self._display_connection)
 

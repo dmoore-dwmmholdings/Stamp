@@ -110,6 +110,10 @@ class RebuildController(QObject):
         #: Every dispatch gets a number, so a late reply can be recognized.
         self._generation = 0
         self._running = 0
+        #: Generations at or below this one were cancelled.  A worker that had
+        #: already passed its last cancel check still delivers a result, and
+        #: without this it was applied over the document that replaced it.
+        self._stale_through = 0
 
         self._timer = QTimer(self)
         self._timer.setSingleShot(True)
@@ -132,6 +136,11 @@ class RebuildController(QObject):
     def busy(self) -> bool:
         return self._busy
 
+    @property
+    def pending(self) -> bool:
+        """Whether an edit is waiting - in the debounce, or behind the worker."""
+        return self._pending is not None or self._timer.isActive()
+
     def request(self, document: Document, *, immediate: bool = False) -> None:
         """Ask for a rebuild.  Coalesces with anything already waiting."""
         self._pending = Document.from_dict(document.to_dict())
@@ -150,6 +159,7 @@ class RebuildController(QObject):
         self._timer.stop()
         self._pending = None
         self._worker.cancel_through(self._running)
+        self._stale_through = self._running
         self._set_busy(False)
 
     def shutdown(self) -> None:
@@ -166,6 +176,7 @@ class RebuildController(QObject):
             # Cancel what is in flight and wait.  The worker reports the
             # cancellation, and _on_cancelled dispatches the pending document.
             self._worker.cancel_through(self._running)
+            self._stale_through = self._running
             return
         document, self._pending = self._pending, None
         self._generation += 1
@@ -178,6 +189,12 @@ class RebuildController(QObject):
         if generation != self._running:
             return  # a reply from a rebuild that was already thrown away
         self._set_busy(False)
+        if generation <= self._stale_through:
+            # Cancelled after the worker's last check, so this is the old
+            # document's answer.  Drop it and get on with the new one.
+            if self._pending is not None:
+                self._dispatch()
+            return
         self.finished.emit(result)
         if self._pending is not None:
             self._dispatch()
@@ -186,6 +203,10 @@ class RebuildController(QObject):
         if generation != self._running:
             return
         self._set_busy(False)
+        if generation <= self._stale_through:
+            if self._pending is not None:
+                self._dispatch()
+            return
         self.failed.emit(message)
         if self._pending is not None:
             self._dispatch()

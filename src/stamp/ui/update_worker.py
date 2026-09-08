@@ -62,7 +62,7 @@ class _Worker(QObject):
         try:
             path = update.download(
                 artifact,
-                Path(into),
+                Path(into) if into else None,
                 progress=lambda done, total: self.progress.emit(done, total),
                 cancelled=self._cancel.is_set,
             )
@@ -127,9 +127,9 @@ class UpdateController(QObject):
         else:
             self._check_requested.emit(current)
 
-    def fetch(self, release, into: Path) -> None:
+    def fetch(self, release, into: Path | None = None) -> None:
         self._ensure_running()
-        self._fetch_requested.emit(release, str(into))
+        self._fetch_requested.emit(release, str(into) if into is not None else "")
 
     def cancel(self) -> None:
         self._worker.cancel()

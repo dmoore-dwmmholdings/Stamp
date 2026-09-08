@@ -90,7 +90,7 @@ class PresetLibraryDialog(QDialog):
         if "text" in tags:
             letter, color = "T", "#4f86c6"
         elif "code" in tags:
-            letter, color = "#7a5db4"
+            letter, color = "▦", "#7a5db4"
         elif "add" in tags:
             letter, color = "+", "#4f9a62"
         else:
