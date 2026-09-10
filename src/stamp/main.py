@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 from pathlib import Path
 
@@ -19,6 +20,44 @@ from stamp.io import export as export_io
 from stamp.io.import_process import WORKER_COMMAND, run_worker
 from stamp.io.part_import import PART_EXTS, import_part
 from stamp.io.project import open_project
+
+
+def _offscreen_qt_application():
+    """A Qt application with no display, for the command line.
+
+    Writing a PDF goes through QPainter, which does not raise without a
+    QGuiApplication - it aborts the interpreter - so ``stamp package`` could
+    never produce a package at all.  The offscreen platform plugin ships with Qt
+    on every system Stamp runs on and needs no display, no window server and no
+    logged-in session, which is what a build machine has.
+
+    The platform is forced rather than defaulted.  A QT_QPA_PLATFORM already in
+    the environment is usually left over from something else - ``xcb`` exported
+    in a shell profile, then the same profile used on a Mac - and Qt aborts
+    inside the QGuiApplication constructor when the named plugin will not load,
+    which is not something the command line can catch or report.  Only a process
+    that has no QGuiApplication yet is affected; one that does keeps whatever
+    platform it started with.
+    """
+    from PySide6.QtGui import QGuiApplication
+
+    existing = QGuiApplication.instance()
+    if existing is not None:
+        return existing
+    os.environ["QT_QPA_PLATFORM"] = "offscreen"
+    return QGuiApplication([sys.argv[0]])
+
+
+def _package_resource(name: str):
+    """A file from ``stamp/resources``, found the same way in a frozen build.
+
+    ``__file__`` is ``_internal/main.py`` inside a one-folder bundle, so its
+    parent is not the package directory and the icon was looked for in the wrong
+    place on macOS and Linux.
+    """
+    from importlib.resources import as_file, files
+
+    return as_file(files("stamp") / "resources" / name)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -61,7 +100,13 @@ def main(argv: list[str] | None = None) -> int:
             opened = open_project(args.project)
             if opened.missing or opened.document.base is None:
                 raise RuntimeError("The project has missing sources or no base part.")
-            opened.document.base = import_part(opened.document.base.source_path).part
+            # Held, not discarded: the package writes a PDF, and QPdfWriter
+            # aborts the process outright when no QGuiApplication exists.
+            _qt = _offscreen_qt_application()  # noqa: F841
+            base = opened.document.base
+            opened.document.base = import_part(
+                base.source_path, unit_scale=base.unit_scale
+            ).part
             result = RebuildEngine(ProfileCache().get).rebuild(opened.document)
             written = export_io.export_job_package(
                 opened.document, result.geometry, args.output, fmt=args.format, rebuild=result
@@ -86,9 +131,9 @@ def main(argv: list[str] | None = None) -> int:
     app.setApplicationVersion(__version__)
     app.setOrganizationName("Stamp")
 
-    icon = Path(__file__).resolve().parent / "resources" / "stamp.ico"
-    if icon.exists():
-        app.setWindowIcon(QIcon(str(icon)))
+    with _package_resource("stamp.ico") as icon:
+        if icon.exists():
+            app.setWindowIcon(QIcon(str(icon)))
 
     window = MainWindow()
     window.show()

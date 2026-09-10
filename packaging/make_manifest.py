@@ -44,6 +44,10 @@ PLATFORMS = {
 }
 
 
+class ManifestError(RuntimeError):
+    """A reason not to sign anything."""
+
+
 def _sha256(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as handle:
@@ -52,13 +56,47 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def build(version: str, tag: str, assets: Path, repo: str) -> tuple[dict, list[Path]]:
+def build(
+    version: str,
+    tag: str,
+    assets: Path,
+    repo: str,
+    allow_missing: bool = False,
+) -> tuple[dict, list[Path]]:
+    """The manifest for *version*, over the installers that carry that version.
+
+    Named rather than sorted.  A release folder can hold more than one build of
+    a platform - a rerun that left the previous tag's installer behind, a manual
+    run over a tag whose installer was built from a different ref - and picking
+    the first by name signs whichever one sorts first, which is a signature over
+    a file nobody chose.
+    """
+    prefix = f"Stamp-{version}-"
     found: list[Path] = []
+    missing: list[str] = []
     artifacts: dict[str, dict] = {}
     for key, suffix in PLATFORMS.items():
-        matches = sorted(assets.glob(f"*{suffix}"))
+        # Spelled out rather than shown as "Stamp-1.6.0-*-Setup.exe": the match
+        # is a prefix and a suffix, and Stamp-1.6.0-Setup.exe - the name the
+        # Windows job produces - has nothing in the middle for a star.
+        described = f"a name starting with {prefix} and ending with {suffix}"
+        candidates = sorted(assets.glob(f"*{suffix}"))
+        matches = [path for path in candidates if path.name.startswith(prefix)]
+        if len(matches) > 1:
+            raise ManifestError(
+                f"{key}: more than one file in {assets} has {described} "
+                f"({', '.join(path.name for path in matches)}). "
+                "Refusing to guess which one to sign."
+            )
         if not matches:
-            print(f"  no artifact for {key} (looked for *{suffix})", file=sys.stderr)
+            if candidates:
+                raise ManifestError(
+                    f"{key}: none of {', '.join(p.name for p in candidates)} has "
+                    f"{described}. The tag and the version that was built "
+                    "disagree, so the manifest would name a version nobody has."
+                )
+            print(f"  no artifact for {key} (looked for {described})", file=sys.stderr)
+            missing.append(key)
             continue
         path = matches[0]
         found.append(path)
@@ -80,6 +118,13 @@ def build(version: str, tag: str, assets: Path, repo: str) -> tuple[dict, list[P
         "revoked": [],
         "minimum_supported": None,
     }
+    if missing and not allow_missing:
+        raise ManifestError(
+            "No installer for " + ", ".join(missing) + ". A feed published over "
+            "a failed build offers people a download that is not there, or the "
+            "one a previous run left on the tag. Pass --allow-missing to "
+            "publish anyway."
+        )
     return manifest, found
 
 
@@ -90,6 +135,11 @@ def main() -> int:
     parser.add_argument("--assets", required=True, type=Path)
     parser.add_argument("--repo", required=True)
     parser.add_argument("--output", required=True, type=Path)
+    parser.add_argument(
+        "--allow-missing",
+        action="store_true",
+        help="publish a manifest that names fewer than every platform",
+    )
     args = parser.parse_args()
 
     secret = os.environ.get("STAMP_RELEASE_KEY", "").strip()
@@ -107,7 +157,13 @@ def main() -> int:
         print(f"STAMP_RELEASE_KEY is not a usable Ed25519 key: {exc}", file=sys.stderr)
         return 2
 
-    manifest, found = build(args.version, args.tag, args.assets, args.repo)
+    try:
+        manifest, found = build(
+            args.version, args.tag, args.assets, args.repo, args.allow_missing
+        )
+    except ManifestError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
     if not found:
         print("No artifacts found; nothing to publish.", file=sys.stderr)
         return 2

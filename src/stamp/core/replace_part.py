@@ -27,11 +27,23 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass, field
 
-from stamp.core.document import Anchor, AnchorKind, BasePart, Document, FaceRef, Plane
+from stamp.core.document import (
+    Anchor,
+    AnchorKind,
+    BasePart,
+    Document,
+    EdgeRef,
+    FaceRef,
+    Plane,
+    PointRef,
+)
 from stamp.core.refs import (
     ReferenceError,
-    plane_from_face,
+    make_face_ref,
+    resolve_anchor,
+    resolve_edge_ref,
     resolve_face_ref,
+    resolve_point_ref,
 )
 
 #: Past this, the face is treated as having moved rather than stayed put, in mm.
@@ -122,24 +134,93 @@ def _shifted_ref(ref: FaceRef, delta) -> FaceRef:
     return moved
 
 
+def _shifted_anchor(anchor: Anchor, delta) -> Anchor:
+    """A copy of *anchor* with every stored point moved by *delta*.
+
+    All three references have to travel together.  Shifting the face alone left a
+    feature that was oriented by an edge or started at a hole looking for that edge
+    where the old part had it, so the replacement reported "kept" and the very next
+    rebuild said the alignment edge no longer matches this part.
+    """
+    moved = Anchor.from_dict(anchor.to_dict())
+    if anchor.face_ref is not None:
+        moved.face_ref = _shifted_ref(anchor.face_ref, delta)
+    if anchor.alignment_ref is not None:
+        moved.alignment_ref = EdgeRef(
+            _shift(anchor.alignment_ref.midpoint, delta),
+            anchor.alignment_ref.tangent,
+            anchor.alignment_ref.length,
+        )
+    if anchor.origin_ref is not None:
+        origin = anchor.origin_ref
+        moved.origin_ref = PointRef(
+            _shift(origin.point, delta),
+            origin.kind,
+            _shifted_ref(origin.face_ref, delta) if origin.face_ref else None,
+        )
+    moved.plane = None
+    return moved
+
+
+def _recaptured_origin(ref: PointRef, shape) -> PointRef:
+    """The placement origin, found on the new part and written down again."""
+    point = resolve_point_ref(ref, shape)
+    face_ref = ref.face_ref
+    if ref.kind == "hole" and ref.face_ref is not None:
+        face_ref = make_face_ref(resolve_face_ref(ref.face_ref, shape).face, point)
+    return PointRef(point, ref.kind, face_ref)
+
+
 def _match_face_anchor(anchor: Anchor, shape, delta) -> tuple[Plane | None, float, str]:
     """Resolve a face anchor against *shape*, returning the plane it landed on."""
     ref = anchor.face_ref
     if ref is None:
         return None, 0.0, "This feature has no face reference."
+    moved = _shifted_anchor(anchor, delta)
     try:
-        resolved = resolve_face_ref(_shifted_ref(ref, delta), shape)
+        resolved = resolve_face_ref(moved.face_ref, shape)
     except ReferenceError as exc:
         return None, 0.0, str(exc)
-    point = _shift(ref.point, delta)
     try:
-        plane, _warnings = plane_from_face(resolved.face, point)
-    except Exception as exc:  # a face that resolves but cannot give a plane
+        # The whole anchor, exactly as the rebuild will resolve it - a feature whose
+        # face is there but whose alignment edge is not is lost, not kept.
+        plane, _warnings = resolve_anchor(moved, shape)
+    except Exception as exc:
         return None, resolved.score, str(exc)
     detail = ""
     if resolved.ambiguous:
         detail = "Two faces matched equally well, so check where this one landed."
     return plane, resolved.score, detail
+
+
+def _region_as_face_ref(plane: Plane) -> FaceRef:
+    """The plane a mesh region was fitted to, written as a face reference.
+
+    A region is a patch of triangles; a solid has a face where that patch was.  The
+    point and the normal are what the resolver really scores on, and the area of a
+    fitted patch is not the area of the face it stands for, so it is left at zero
+    rather than dragging the score down with a number that means nothing here.
+    """
+    return FaceRef(point=plane.origin, normal=plane.normal, surface_type="plane",
+                   bbox_center=plane.origin)
+
+
+def _match_region_on_solid(anchor: Anchor, shape, delta) -> tuple[Plane | None, float, str]:
+    """Land a mesh-region anchor on a face of the solid that replaced the mesh.
+
+    Replacing a printed mesh with the STEP it was sliced from is an ordinary thing
+    to do, and it used to raise: the mesh matcher was handed a ``TopoDS_Shape`` and
+    asked it for triangles.  What a region says is "here, facing this way", which is
+    what a face reference says, so it is asked as one.
+    """
+    stored = anchor.plane
+    if stored is None:
+        return None, 0.0, "This feature has no plane, so there is nothing to find on the new part."
+    probe = Anchor(kind=AnchorKind.FACE, face_ref=_region_as_face_ref(stored))
+    plane, score, detail = _match_face_anchor(probe, shape, delta)
+    if plane is None:
+        return None, score, detail or "No face on the new part is where this mark sat."
+    return plane, score, detail
 
 
 def _match_mesh_anchor(anchor: Anchor, manifold, delta) -> tuple[Plane | None, float, str]:
@@ -170,6 +251,12 @@ def _match_mesh_anchor(anchor: Anchor, manifold, delta) -> tuple[Plane | None, f
     return region.plane, float(max(0.0, dot)), ""
 
 
+def _captured_face(ref: FaceRef, point, shape, origin_feature_id: str | None) -> FaceRef:
+    """Resolve *ref* on *shape* and write down what it landed on."""
+    resolved = resolve_face_ref(ref, shape)
+    return make_face_ref(resolved.face, point, origin_feature_id=origin_feature_id)
+
+
 def _classify(old_plane: Plane | None, new_plane: Plane) -> tuple[str, float]:
     if old_plane is None:
         return "kept", 0.0
@@ -191,8 +278,10 @@ def _match_all(document: Document, new_part: BasePart, delta) -> ReplaceReport:
             )
             continue
 
-        if new_part.mode == "mesh" or anchor.kind is AnchorKind.MESH_REGION:
+        if new_part.mode == "mesh":
             plane, score, detail = _match_mesh_anchor(anchor, shape, delta)
+        elif anchor.kind is AnchorKind.MESH_REGION:
+            plane, score, detail = _match_region_on_solid(anchor, shape, delta)
         else:
             plane, score, detail = _match_face_anchor(anchor, shape, delta)
 
@@ -259,29 +348,66 @@ def replace_part(document: Document, new_part: BasePart) -> ReplaceReport:
         anchor = feature.placement.anchor
         if anchor.kind is AnchorKind.DATUM:
             continue
-        if new_part.mode == "mesh" or anchor.kind is AnchorKind.MESH_REGION:
+        if new_part.mode == "mesh":
             plane, _score, _detail = _match_mesh_anchor(anchor, shape, delta)
-            if plane is not None:
-                anchor.plane = plane
+            if plane is None:
+                continue
+            # The mark now sits on triangles, so it is a mesh-region anchor from here
+            # on, the mirror of what a region becomes when a solid replaces the mesh.
+            # Left as a face anchor it kept the old solid's face, edge and origin
+            # references, and the next replacement resolved references two revisions
+            # out of date against the part in hand.
+            anchor.plane = plane
+            anchor.kind = AnchorKind.MESH_REGION
+            anchor.mesh_seed = plane.origin
+            anchor.face_ref = None
+            anchor.alignment_ref = None
+            anchor.origin_ref = None
+            continue
+        if anchor.kind is AnchorKind.MESH_REGION:
+            plane, _score, _detail = _match_region_on_solid(anchor, shape, delta)
+            if plane is None:
+                continue
+            # The mark now sits on a real face, so it is a face anchor from here on
+            # and follows that face through the next revision like any other.
+            anchor.plane = plane
+            anchor.kind = AnchorKind.FACE
+            anchor.face_ref = _captured_face(
+                _region_as_face_ref(plane), plane.origin, shape, None
+            )
             continue
         plane, _score, _detail = _match_face_anchor(anchor, shape, delta)
         if plane is None:
             continue
-        anchor.plane = plane
-        # Re-capture the reference against the new part, so the next replacement
-        # starts from where the face is now rather than from where it once was.
-        if anchor.face_ref is not None:
-            try:
-                resolved = resolve_face_ref(_shifted_ref(anchor.face_ref, delta), shape)
-            except ReferenceError:
-                continue
-            from stamp.core.refs import make_face_ref
-
-            anchor.face_ref = make_face_ref(
-                resolved.face,
-                _shift(anchor.face_ref.point, delta),
-                origin_feature_id=anchor.face_ref.origin_feature_id,
+        # Re-capture every reference against the new part, so the next replacement
+        # starts from where things are now rather than from where they once were.
+        moved = _shifted_anchor(anchor, delta)
+        try:
+            face_ref = (
+                _captured_face(moved.face_ref, moved.face_ref.point, shape,
+                               anchor.face_ref.origin_feature_id)
+                if anchor.face_ref is not None else None
             )
+            alignment = (
+                resolve_edge_ref(moved.alignment_ref, shape)
+                if anchor.alignment_ref is not None else None
+            )
+            origin = (
+                _recaptured_origin(moved.origin_ref, shape)
+                if anchor.origin_ref is not None else None
+            )
+        except ReferenceError:
+            # plan_replacement already resolved all three, so this is not expected.
+            # Writing none of them back is what keeps the anchor whole, rather than
+            # half from the old part and half from the new.
+            continue
+        anchor.plane = plane
+        if face_ref is not None:
+            anchor.face_ref = face_ref
+        if alignment is not None:
+            anchor.alignment_ref = alignment
+        if origin is not None:
+            anchor.origin_ref = origin
 
     document.base = new_part
     return report

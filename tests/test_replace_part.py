@@ -306,3 +306,223 @@ class TestEdgeCases:
         assert report.matches == []
         assert doc.base is rev_b
         assert "no artwork" in report.summary()
+
+
+def longest_edge_of(face_ref, part):
+    """The longest edge of the face *face_ref* names - a natural alignment edge."""
+    from OCP.TopAbs import TopAbs_ShapeEnum
+    from OCP.TopExp import TopExp_Explorer
+    from OCP.TopoDS import TopoDS
+
+    from stamp.core.refs import make_edge_ref, resolve_face_ref
+
+    face = resolve_face_ref(face_ref, part.runtime).face
+    edges = []
+    explorer = TopExp_Explorer(face, TopAbs_ShapeEnum.TopAbs_EDGE)
+    while explorer.More():
+        edges.append(make_edge_ref(TopoDS.Edge_s(explorer.Current())))
+        explorer.Next()
+    assert edges, "the face should have edges"
+    return max(edges, key=lambda e: e.length)
+
+
+class TestAnAnchorWithMoreThanAFace:
+    """A placement can be oriented by an edge and started at a vertex (§8.2).
+
+    All three references are resolved on every rebuild, so all three have to
+    survive a replacement.  Shifting only the face left the other two looking for
+    the old part's origin: the report said "kept", and the very next rebuild said
+    the alignment edge no longer matches this part.
+    """
+
+    def a_document_with_an_edge(self, part, fixtures):
+        from stamp.core.refs import resolve_anchor
+
+        ref = top_face_ref(part, 8.0)
+        anchor = Anchor(
+            kind=AnchorKind.FACE,
+            face_ref=FaceRef.from_dict(ref.to_dict()),
+            alignment_ref=longest_edge_of(ref, part),
+        )
+        anchor.plane, _warnings = resolve_anchor(anchor, part.runtime)
+        doc = Document(base=part)
+        doc.add_feature(Feature(
+            name="logo",
+            profile=ProfileRef(source_path=str(fixtures / "logo.svg"),
+                               source_hash=file_hash(fixtures / "logo.svg")),
+            placement=Placement(anchor=anchor),
+            operation=Operation(kind=OperationKind.CUT, depth_mode=DepthMode.BLIND,
+                                depth=0.6, direction=Direction.INTO),
+        ))
+        return doc
+
+    def test_the_alignment_edge_moves_with_the_part(self, bracket, fixtures):
+        moved = import_part(fixtures / "bracket_moved.step").part
+        doc = self.a_document_with_an_edge(bracket, fixtures)
+        before = doc.features[0].placement.anchor.alignment_ref.midpoint
+
+        report = replace_part(doc, moved)
+
+        assert report.ok, [m.detail for m in report.lost]
+        after = doc.features[0].placement.anchor.alignment_ref.midpoint
+        assert after != before
+        for was, now, shift in zip(before, after, report.alignment, strict=True):
+            assert now == pytest.approx(was + shift, abs=0.05)
+
+    def test_it_still_rebuilds_after_the_move(self, bracket, fixtures):
+        """The whole point: the next rebuild resolves all three, not just the face."""
+        moved = import_part(fixtures / "bracket_moved.step").part
+        doc = self.a_document_with_an_edge(bracket, fixtures)
+
+        replace_part(doc, moved)
+
+        result = RebuildEngine(ProfileCache().get).rebuild(doc)
+        assert result.ok, result.errors
+
+    def test_a_missing_edge_is_reported_as_lost_rather_than_kept(self, bracket, fixtures):
+        """Saying "kept" and breaking on the next rebuild is the worst of both."""
+        from stamp.core.document import EdgeRef
+
+        plate = import_part(fixtures / "plate.step").part
+        doc = self.a_document_with_an_edge(bracket, fixtures)
+        doc.features[0].placement.anchor.alignment_ref = EdgeRef(
+            midpoint=(1e5, 1e5, 1e5), tangent=(1.0, 0.0, 0.0), length=80.0
+        )
+
+        report = plan_replacement(doc, plate)
+
+        assert len(report.lost) == 1
+        assert "edge" in report.lost[0].detail.lower()
+
+
+class TestSwappingBetweenMeshAndSolid:
+    """A printed mesh and the STEP it came from are two views of one part."""
+
+    def a_mesh_document(self, part, fixtures):
+        doc = Document(base=part)
+        doc.add_feature(Feature(
+            name="logo",
+            profile=ProfileRef(source_path=str(fixtures / "logo.svg"),
+                               source_hash=file_hash(fixtures / "logo.svg")),
+            placement=Placement(anchor=Anchor(
+                kind=AnchorKind.MESH_REGION,
+                mesh_seed=(30.0, 20.0, 8.0),
+                mesh_tolerance=25.0,
+                plane=Plane(origin=(30.0, 20.0, 8.0), normal=(0.0, 0.0, 1.0),
+                            u_axis=(1.0, 0.0, 0.0)),
+            )),
+            operation=Operation(kind=OperationKind.CUT, depth_mode=DepthMode.BLIND,
+                                depth=0.5, direction=Direction.INTO),
+        ))
+        return doc
+
+    def test_replacing_a_mesh_with_a_step_finds_the_face(self, fixtures):
+        """It used to ask a TopoDS_Shape for its triangles and raise."""
+        mesh = import_part(fixtures / "bracket.stl").part
+        solid = import_part(fixtures / "bracket.step").part
+        doc = self.a_mesh_document(mesh, fixtures)
+
+        report = replace_part(doc, solid)
+
+        assert report.ok, [m.detail for m in report.lost]
+        anchor = doc.features[0].placement.anchor
+        assert anchor.kind is AnchorKind.FACE, "it sits on a real face now"
+        assert anchor.face_ref is not None
+        assert anchor.plane.origin[2] == pytest.approx(8.0, abs=1e-6)
+        assert anchor.plane.normal[2] > 0.9
+
+    def test_and_the_result_rebuilds(self, fixtures):
+        mesh = import_part(fixtures / "bracket.stl").part
+        solid = import_part(fixtures / "bracket.step").part
+        doc = self.a_mesh_document(mesh, fixtures)
+
+        replace_part(doc, solid)
+
+        result = RebuildEngine(ProfileCache().get).rebuild(doc)
+        assert result.ok, result.errors
+        assert result.geometry is not None
+
+    def test_a_region_with_nowhere_to_land_is_lost_not_a_crash(self, fixtures):
+        mesh = import_part(fixtures / "bracket.stl").part
+        plate = import_part(fixtures / "plate.step").part
+        doc = self.a_mesh_document(mesh, fixtures)
+        doc.features[0].placement.anchor.plane = Plane(
+            origin=(1e5, 1e5, 1e5), normal=(0.0, 0.0, 1.0), u_axis=(1.0, 0.0, 0.0)
+        )
+
+        report = plan_replacement(doc, plate)
+
+        assert len(report.lost) == 1
+        assert report.lost[0].detail
+
+    def a_solid_document_with_references(self, part, fixtures):
+        """A face anchor carrying everything a solid can give it."""
+        from stamp.core.refs import resolve_anchor
+
+        ref = top_face_ref(part, 8.0)
+        anchor = Anchor(
+            kind=AnchorKind.FACE,
+            face_ref=FaceRef.from_dict(ref.to_dict()),
+            alignment_ref=longest_edge_of(ref, part),
+        )
+        anchor.plane, _warnings = resolve_anchor(anchor, part.runtime)
+        doc = Document(base=part)
+        doc.add_feature(Feature(
+            name="logo",
+            profile=ProfileRef(source_path=str(fixtures / "logo.svg"),
+                               source_hash=file_hash(fixtures / "logo.svg")),
+            placement=Placement(anchor=anchor),
+            operation=Operation(kind=OperationKind.CUT, depth_mode=DepthMode.BLIND,
+                                depth=0.6, direction=Direction.INTO),
+        ))
+        return doc
+
+    def test_a_mesh_leaves_no_references_to_the_solid_behind(self, bracket, fixtures):
+        """A mesh has no faces and no edges, so keeping them is keeping stale data."""
+        mesh = import_part(fixtures / "bracket.stl").part
+        doc = self.a_solid_document_with_references(bracket, fixtures)
+
+        replace_part(doc, mesh)
+
+        anchor = doc.features[0].placement.anchor
+        assert anchor.kind is AnchorKind.MESH_REGION
+        assert anchor.face_ref is None
+        assert anchor.alignment_ref is None
+        assert anchor.origin_ref is None
+        assert anchor.mesh_seed is not None
+
+    def test_a_solid_mesh_solid_round_trip_lands_on_the_new_part(self, bracket, fixtures):
+        """The mark went out to a print and came back to the model it was cut from.
+
+        Left as a face anchor on the way out, the second replacement resolved the
+        references captured two revisions ago rather than asking the mesh where the
+        mark actually sits.
+        """
+        mesh = import_part(fixtures / "bracket.stl").part
+        rev_b = import_part(fixtures / "bracket_rev_b.step").part
+        doc = self.a_solid_document_with_references(bracket, fixtures)
+
+        replace_part(doc, mesh)
+        report = replace_part(doc, rev_b)
+
+        assert report.ok, [m.detail for m in report.lost]
+        anchor = doc.features[0].placement.anchor
+        assert anchor.kind is AnchorKind.FACE
+        assert anchor.face_ref is not None
+        assert anchor.plane.origin[2] == pytest.approx(8.0, abs=0.2)
+        result = RebuildEngine(ProfileCache().get).rebuild(doc)
+        assert result.ok, result.errors
+
+    def test_replacing_a_step_with_a_mesh_keeps_the_plane(self, bracket, fixtures):
+        """The other direction: a mesh has no faces, so the fitted plane is it."""
+        mesh = import_part(fixtures / "bracket.stl").part
+        doc = a_document(bracket, fixtures, top_face_ref(bracket, 8.0))
+
+        report = replace_part(doc, mesh)
+
+        assert report.ok, [m.detail for m in report.lost]
+        plane = doc.features[0].placement.anchor.plane
+        assert plane is not None
+        assert plane.origin[2] == pytest.approx(8.0, abs=0.2)
+        result = RebuildEngine(ProfileCache().get).rebuild(doc)
+        assert result.ok, result.errors

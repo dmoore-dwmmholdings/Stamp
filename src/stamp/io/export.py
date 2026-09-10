@@ -7,9 +7,11 @@ reconstruction, so a document that started from an STL cannot produce a STEP.
 from __future__ import annotations
 
 import base64
+import contextlib
 import datetime as _dt
 import html
 import json
+import os
 import tempfile
 import zipfile
 from dataclasses import dataclass, field
@@ -21,6 +23,7 @@ from OCP.TopoDS import TopoDS_Shape
 from stamp.core.document import COLOR_STAMP_MIN_DEPTH, OperationKind
 from stamp.core.inspection import inspect_document
 from stamp.geom import mesh_ops, solid_ops
+from stamp.io import with_extension
 
 if TYPE_CHECKING:
     from stamp.core.document import Document
@@ -208,6 +211,42 @@ class ExportResult:
         return f"{size:.1f} GB"
 
 
+@contextlib.contextmanager
+def _atomic(path: str | Path):
+    """Yield a sibling temp path, and move it onto *path* only once the write worked.
+
+    Writing straight to the target left a truncated STEP or STL where a good one
+    had been whenever the write failed part way - out of disk, a killed export -
+    and the next thing to open it was a shop's slicer.  ``project.save`` has
+    always done this; the geometry exporters had not.
+
+    Every filesystem refusal on the way through comes back out as
+    :class:`ExportError`, because that is the only thing the export dialog
+    catches: a folder deleted between choosing the name and pressing Export, or
+    a name that is already a directory, used to reach the window as a raw
+    ``FileNotFoundError`` or ``IsADirectoryError`` and take it down - with the
+    finished ``.part`` file still sitting next to the target.
+    """
+    path = Path(path)
+    temp = path.with_name(path.name + ".part")
+    temp.unlink(missing_ok=True)
+    try:
+        yield temp
+    except OSError as exc:
+        temp.unlink(missing_ok=True)
+        raise ExportError(f"Stamp could not write {path.name}: {exc}") from exc
+    except BaseException:
+        temp.unlink(missing_ok=True)
+        raise
+    if not temp.exists():
+        raise ExportError(f"Stamp could not write {path.name}: nothing was produced.")
+    try:
+        os.replace(temp, path)
+    except OSError as exc:
+        temp.unlink(missing_ok=True)
+        raise ExportError(f"Stamp could not write {path.name}: {exc}") from exc
+
+
 def default_filename(project_name: str, extension: str, *, suffix: str = "") -> str:
     """The suggested name for an export.
 
@@ -325,7 +364,7 @@ def export_proof_sheet(
     fmt = "step" if document.base.mode == "solid" else "stl"
     report = preflight_export(document, rebuild, fmt, path)
     report.require_ok()
-    path = Path(path).with_suffix(".pdf")
+    path = with_extension(path, ".pdf")
     _require_qt_application()
     try:
         from PySide6.QtCore import QSizeF
@@ -351,9 +390,7 @@ def export_job_package(document, geometry: object, path: str | Path, *, fmt: str
     fmt = (fmt or ("step" if document.base.mode == "solid" else "stl")).lower().lstrip(".")
     report = preflight_export(document, rebuild, fmt, path)
     report.require_ok()
-    path = Path(path)
-    if path.suffix.lower() != ".zip":
-        path = path.with_suffix(".zip")
+    path = with_extension(path, ".zip")
     with tempfile.TemporaryDirectory(prefix="stamp-package-") as temp_name:
         temp = Path(temp_name)
         model = temp / default_filename(
@@ -452,9 +489,12 @@ def export_step(
 
     writer = STEPControl_Writer()
     writer.Transfer(out_shape, STEPControl_AsIs)
-    status = writer.Write(str(path))
-    if status != IFSelect_ReturnStatus.IFSelect_RetDone:
-        raise ExportError(f"Stamp could not write {path.name}. Check the folder and permissions.")
+    with _atomic(path) as temp:
+        status = writer.Write(str(temp))
+        if status != IFSelect_ReturnStatus.IFSelect_RetDone:
+            raise ExportError(
+                f"Stamp could not write {path.name}. Check the folder and permissions."
+            )
 
     return ExportResult(path=path, size_bytes=path.stat().st_size, warnings=warnings)
 
@@ -482,7 +522,8 @@ def export_stl(
                 "This mesh is not watertight. A slicer may refuse it or produce "
                 "unexpected results."
             )
-        mesh.export(path, file_type="stl_ascii" if ascii_format else "stl")
+        with _atomic(path) as temp:
+            mesh.export(temp, file_type="stl_ascii" if ascii_format else "stl")
         return ExportResult(
             path=path,
             size_bytes=path.stat().st_size,
@@ -502,7 +543,8 @@ def export_stl(
         warnings.append(
             "The tessellated result is not watertight. Try a finer quality setting."
         )
-    mesh.export(path, file_type="stl_ascii" if ascii_format else "stl")
+    with _atomic(path) as temp:
+        mesh.export(temp, file_type="stl_ascii" if ascii_format else "stl")
     return ExportResult(
         path=path,
         size_bytes=path.stat().st_size,
@@ -533,42 +575,54 @@ def export_for_quote(
     volume_mm3: float = 0.0,
     bbox: tuple[float, float, float, float, float, float] | None = None,
     quality: str = "normal",
+    document=None,
 ) -> list[ExportResult]:
     """STEP + STL + a screenshot + a dimensions note, in one folder (§9).
 
     This is exactly what gets emailed to a machine shop.
+
+    *document* carries the part transform.  The geometry handed in is already
+    mirrored and scaled, so without it the note quoted the size of the part
+    before the transform and the files were named as though there had been none
+    - a mirrored copy landing straight on top of the original in the same
+    folder, with dimensions belonging to neither.
     """
     folder = Path(folder)
     folder.mkdir(parents=True, exist_ok=True)
     results: list[ExportResult] = []
+    transform = getattr(document, "transform", None)
+    tag = transform.suffix() if transform is not None else ""
 
     if mode == "solid":
         results.append(
-            export_step(geometry, folder / default_filename(project_name, "step"))
+            export_step(geometry, folder / default_filename(project_name, "step", suffix=tag))
         )
     results.append(
         export_stl(
             geometry,
-            folder / default_filename(project_name, "stl"),
+            folder / default_filename(project_name, "stl", suffix=tag),
             mode=mode,
             quality=quality,
         )
     )
 
     if screenshot:
-        png = folder / default_filename(project_name, "png")
+        png = folder / default_filename(project_name, "png", suffix=tag)
         png.write_bytes(screenshot)
         results.append(ExportResult(path=png, size_bytes=png.stat().st_size))
 
-    note = folder / default_filename(project_name, "txt")
+    note = folder / default_filename(project_name, "txt", suffix=tag)
     lines = [f"{project_name}", f"Exported {_dt.date.today().isoformat()}", ""]
     if bbox:
         x0, y0, z0, x1, y1, z1 = bbox
-        lines.append(
-            f"Bounding box: {x1 - x0:.2f} x {y1 - y0:.2f} x {z1 - z0:.2f} mm"
-        )
+        size = (x1 - x0, y1 - y0, z1 - z0)
+        if transform is not None:
+            size = transform.size_from(size)
+        lines.append("Bounding box: " + " x ".join(f"{v:.2f}" for v in size) + " mm")
     lines.append(f"Volume: {volume_mm3:.1f} mm3 ({volume_mm3 / 1000.0:.2f} cm3)")
     lines.append(f"Units: {units}")
+    if transform is not None and not transform.is_identity:
+        lines.append(f"Mirror and scale: {transform_summary(document)}")
     if mode == "mesh":
         lines.append("")
         lines.append("Source was a mesh, so there is no STEP file. " + MESH_MODE_NO_STEP)
@@ -765,7 +819,7 @@ def export_3mf(
         "</Relationships>\n"
     )
 
-    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as archive:
+    with _atomic(path) as temp, zipfile.ZipFile(temp, "w", zipfile.ZIP_DEFLATED) as archive:
         archive.writestr("[Content_Types].xml", content_types)
         archive.writestr("_rels/.rels", rels)
         archive.writestr("3D/3dmodel.model", "".join(parts))

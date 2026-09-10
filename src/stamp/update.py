@@ -14,8 +14,10 @@ Two signatures' worth of trust, in order:
    not enough: it says the bytes came from GitHub, not that they are the bytes we
    published.
 2. The **artifact's own SHA-256**, checked against the signed manifest after the
-   download and before anything is executed.  A file that does not match is
-   deleted rather than kept.
+   download and again immediately before anything is executed.  A file that does
+   not match is deleted rather than kept.  Twice because the two moments can be
+   an afternoon apart - "install when I quit" is a real choice people make - and
+   what matters is the file as it is when it runs.
 
 Until a key is generated and pasted into :data:`RELEASE_PUBLIC_KEY`, the whole
 feature reports itself unconfigured and does nothing.  A version check that
@@ -31,8 +33,10 @@ import hashlib
 import json
 import os
 import platform
+import shutil
 import subprocess
 import sys
+import tempfile
 import urllib.error
 import urllib.request
 from collections.abc import Callable
@@ -70,6 +74,10 @@ MAX_MANIFEST_BYTES = 64 * 1024
 #: cancelling feels immediate.
 CHUNK = 256 * 1024
 
+#: The most that is read when the manifest names no size.  An installer is tens
+#: of megabytes; without a bound, a feed that streams forever fills the disk.
+MAX_ARTIFACT_BYTES = 1024 * 1024 * 1024
+
 USER_AGENT = f"Stamp/{__version__}"
 
 
@@ -79,14 +87,26 @@ class UpdateError(RuntimeError):
 
 # --------------------------------------------------------------------------
 # Configuration.  Both are overridable so that the tests can stand up a feed of
-# their own and exercise the real verification rather than a mock of it.
+# their own and exercise the real verification rather than a mock of it - but
+# only in a source checkout.  In a shipped build an environment variable is not
+# a trusted thing: anything that can set one could otherwise point Stamp at a
+# feed of its own, signed with a key of its own, and the two signatures this
+# module exists for would both check out.
 # --------------------------------------------------------------------------
 
+def _frozen() -> bool:
+    return bool(getattr(sys, "frozen", False))
+
+
 def feed_url() -> str:
+    if _frozen():
+        return FEED_URL
     return os.environ.get("STAMP_UPDATE_FEED") or FEED_URL
 
 
 def public_key() -> str:
+    if _frozen():
+        return RELEASE_PUBLIC_KEY
     return os.environ.get("STAMP_UPDATE_PUBLIC_KEY") or RELEASE_PUBLIC_KEY
 
 
@@ -111,22 +131,60 @@ def can_install() -> bool:
 # Versions and platforms
 # --------------------------------------------------------------------------
 
-def parse_version(text: str) -> tuple[int, int, int, int]:
+def parse_version(text: str) -> tuple[int, int, int, int, str, int]:
     """A comparable version.
 
     String comparison gets 1.10.0 wrong against 1.9.0, which is the classic way
-    to strand everyone on an old release.  The fourth number carries "is this a
-    final release": a 0 for 1.5.0-rc1 sorts it below the 1 for 1.5.0.
+    to strand everyone on an old release, so the three numbers come out as
+    numbers.  What follows them is a pre-release tail, and it is kept whole
+    rather than flattened to a yes-or-no: the fourth field says whether this is
+    a final release, and the two after it order the pre-releases of one triple
+    among themselves.  Flattening made every pre-release of 1.6.0 equal, so
+    1.6.0-rc2 was not an update from 1.6.0-rc1 and a withdrawn rc1 revoked rc2
+    along with it.
+
+    A letter anywhere means the same thing as the dash does, thus 1.6.0rc1 and
+    1.6.0.rc1 are the pre-release that 1.6.0-rc1 is.  "+build5" is metadata
+    about how a release was built, not a different release, thus it is dropped.
     """
     cleaned = str(text).strip().lstrip("vV")
-    head, _, pre = cleaned.partition("-")
+    cleaned = cleaned.partition("+")[0]
+    head, _, tail = cleaned.partition("-")
     numbers: list[int] = []
-    for piece in head.split(".")[:3]:
-        digits = "".join(ch for ch in piece if ch.isdigit())
-        numbers.append(int(digits) if digits else 0)
+    for index, piece in enumerate(head.split(".")):
+        digits = ""
+        for ch in piece:
+            if not ch.isdigit():
+                break
+            digits += ch
+        if index < 3:
+            numbers.append(int(digits) if digits else 0)
+        rest = piece[len(digits):]
+        # The first letters in the head are where the version stops and its
+        # pre-release begins, whether they are stuck to a number or a piece of
+        # their own.  A tail after the dash is only reached when there are none.
+        if rest and not tail:
+            tail = rest
     while len(numbers) < 3:
         numbers.append(0)
-    return (numbers[0], numbers[1], numbers[2], 0 if pre else 1)
+
+    if not tail:
+        return (numbers[0], numbers[1], numbers[2], 1, "", 0)
+    # alpha, beta, rc happen to sort that way as words, which is the order they
+    # are released in.  The number after the tag is a number, so rc10 follows
+    # rc9 rather than rc1.
+    tag = ""
+    for ch in tail:
+        if not ch.isalpha():
+            break
+        tag += ch
+    digits = ""
+    for ch in tail[len(tag):]:
+        if ch.isdigit():
+            digits += ch
+        elif digits or ch not in ".-_":
+            break
+    return (numbers[0], numbers[1], numbers[2], 0, tag.lower(), int(digits or 0))
 
 
 def platform_key() -> str:
@@ -212,7 +270,10 @@ def read_manifest(payload: bytes, signature: bytes, key: str | None = None) -> d
 
 def _open(url: str, timeout: float = TIMEOUT_S):
     request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
-    if not url.startswith(("https://", "file://")):
+    # file:// is how the tests serve a real signed feed.  A shipped build has no
+    # business reading one off the disk, so there it is refused with the rest.
+    allowed = ("https://",) if _frozen() else ("https://", "file://")
+    if not url.startswith(allowed):
         raise UpdateError("Stamp only fetches updates over HTTPS.")
     return urllib.request.urlopen(request, timeout=timeout)  # noqa: S310 - checked above
 
@@ -243,14 +304,16 @@ def check(current: str = __version__, url: str | None = None) -> Release | None:
 
     version = str(manifest["version"])
     running = parse_version(current)
-    revoked = {str(v) for v in manifest.get("revoked", [])}
+    # Compared as versions rather than as strings: a manifest that withdraws
+    # "v1.6.0" is talking about the build that calls itself "1.6.0".
+    revoked = {parse_version(v) for v in manifest.get("revoked", [])}
     minimum = manifest.get("minimum_supported")
-    urgent = current in revoked or (
+    urgent = running in revoked or (
         bool(minimum) and running < parse_version(str(minimum))
     )
     if parse_version(version) <= running and not urgent:
         return None
-    if version in revoked:
+    if parse_version(version) in revoked:
         # The newest release was withdrawn after it was published.
         return None
 
@@ -275,16 +338,104 @@ def check(current: str = __version__, url: str | None = None) -> Release | None:
 # Fetching, and running what was fetched
 # --------------------------------------------------------------------------
 
+#: What each downloaded file was verified to hash to, by absolute path.  The
+#: install is a separate decision from the download - "install when I quit" can
+#: be hours later - and this is what lets that later step check the file again
+#: rather than trust that nothing touched it in between.
+_verified: dict[str, str] = {}
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(CHUNK), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+#: The prefix every download's directory is made with, and what a later
+#: download recognises the earlier ones by.
+TEMP_PREFIX = "stamp-update-"
+
+
+def _forget_missing() -> None:
+    """Drop what was verified about files that are no longer on disk."""
+    for key in [name for name in _verified if not Path(name).exists()]:
+        _verified.pop(key, None)
+
+
+def _sweep(parent: Path) -> None:
+    """Remove the directories earlier downloads left behind.
+
+    An installer is around a hundred megabytes, and every offer that is skipped,
+    put off, or quit out of used to leave one where it fell.  Errors are
+    ignored on purpose: on Windows a directory an installer is still running
+    out of cannot be removed, and failing to tidy up is not a reason to refuse
+    the download that was actually asked for.
+    """
+    try:
+        stale = [entry for entry in parent.glob(TEMP_PREFIX + "*") if entry.is_dir()]
+    except OSError:
+        stale = []
+    for entry in stale:
+        shutil.rmtree(entry, ignore_errors=True)
+    _forget_missing()
+
+
+def discard(path: Path) -> None:
+    """Throw away a downloaded installer, directory and all.
+
+    The download and the install are separate decisions, so there is a state
+    where a verified installer sits in the temporary folder and nobody is going
+    to run it - the user skipped the version, or closed the window without
+    installing.  The UI says so here rather than leaving it for the next
+    download to sweep.
+    """
+    target = Path(path)
+    keys = {str(target)}
+    try:
+        keys.add(str(target.resolve()))
+    except OSError:
+        pass
+    for key in keys:
+        _verified.pop(key, None)
+    directory = target.parent
+    if directory.name.startswith(TEMP_PREFIX):
+        shutil.rmtree(directory, ignore_errors=True)
+    else:
+        # Somewhere Stamp did not make: take the file and leave the folder.
+        try:
+            target.unlink(missing_ok=True)
+        except OSError:
+            pass
+    _forget_missing()
+
+
 def download(
     artifact: Artifact,
-    into: Path,
+    into: Path | None = None,
     progress: Callable[[int, int], None] | None = None,
     cancelled: Callable[[], bool] | None = None,
 ) -> Path:
-    """Fetch *artifact*, and delete it unless its hash is the promised one."""
-    into.mkdir(parents=True, exist_ok=True)
-    target = into / Path(artifact.name).name
+    """Fetch *artifact*, and delete it unless its hash is the promised one.
+
+    The file lands in a directory made fresh for it, never at a name anybody
+    could work out in advance.  A verified installer sitting at
+    ``%TEMP%\\stamp-update\\Stamp-Setup.exe`` until the user quits is an
+    invitation to replace it between the check and the run; a directory created
+    with the permissions :func:`tempfile.mkdtemp` gives it is not.
+    """
+    if into is not None:
+        into.mkdir(parents=True, exist_ok=True)
+    # Before, not after: what the last download left is dead weight the moment a
+    # new one starts, and this is the only moment Stamp is certainly running.
+    _sweep(into if into is not None else Path(tempfile.gettempdir()))
+    directory = Path(tempfile.mkdtemp(prefix=TEMP_PREFIX, dir=into))
+    target = directory / Path(artifact.name).name
     digest = hashlib.sha256()
+    # What the manifest promised, or the ceiling for an artifact of no stated
+    # size: reading to EOF is reading as much as the server wants to send.
+    limit = artifact.size or MAX_ARTIFACT_BYTES
     done = 0
     try:
         with _open(artifact.url) as response, target.open("wb") as handle:
@@ -298,27 +449,32 @@ def download(
                 handle.write(chunk)
                 digest.update(chunk)
                 done += len(chunk)
+                if done > limit:
+                    raise UpdateError(
+                        "The download is longer than the manifest promised."
+                    )
                 if progress is not None:
                     progress(done, total)
     except UpdateError:
-        target.unlink(missing_ok=True)
+        shutil.rmtree(directory, ignore_errors=True)
         raise
     except (urllib.error.URLError, OSError, ValueError) as exc:
-        target.unlink(missing_ok=True)
+        shutil.rmtree(directory, ignore_errors=True)
         raise UpdateError(f"The download did not finish: {exc}") from exc
 
     if artifact.size and done != artifact.size:
-        target.unlink(missing_ok=True)
+        shutil.rmtree(directory, ignore_errors=True)
         raise UpdateError("The download is not the size the manifest promised.")
     if digest.hexdigest() != artifact.sha256:
-        target.unlink(missing_ok=True)
+        shutil.rmtree(directory, ignore_errors=True)
         raise UpdateError(
             "The download does not match the signed manifest, so it was deleted."
         )
+    _verified[str(target.resolve())] = artifact.sha256
     return target
 
 
-def install(path: Path, relaunch: bool = True) -> None:
+def install(path: Path, relaunch: bool = True, sha256: str | None = None) -> None:
     """Start the installer and return, so the caller can quit.
 
     Stamp has to be gone before its own files can be replaced.  The installer is
@@ -326,11 +482,32 @@ def install(path: Path, relaunch: bool = True) -> None:
     the Inno script covers the moment in between.  ``/RELAUNCH=1`` is Stamp's
     own switch, read by a Check in the script, because Inno's own "start the
     application" entry is deliberately skipped in a silent install.
+
+    *sha256* is what the file has to hash to, and it is re-checked here rather
+    than taken on trust from the download: the user may have chosen to install
+    on the way out, and a verified file that then sits on disk for an afternoon
+    has only been verified as it was that morning.  Left out, the hash
+    :func:`download` recorded for that path is used, and a path with no recorded
+    hash is refused rather than run.
     """
     if not sys.platform.startswith("win"):
         raise UpdateError("Stamp can only install an update on Windows.")
     if not path.exists():
         raise UpdateError("The downloaded installer is no longer there.")
+    expected = (sha256 or _verified.get(str(path.resolve())) or "").lower()
+    if not expected:
+        raise UpdateError(
+            "Stamp does not know what this installer should contain, so it will "
+            "not run it."
+        )
+    # Checked again here rather than trusting the check the download made.  The
+    # two can be hours apart, and it is the file as it is now that gets run.
+    if _sha256_file(path) != expected:
+        path.unlink(missing_ok=True)
+        raise UpdateError(
+            "The installer changed after it was downloaded, so it was deleted "
+            "instead of run."
+        )
     flags = ["/SILENT", "/SUPPRESSMSGBOXES", "/NORESTART"]
     if relaunch:
         flags.append("/RELAUNCH=1")
@@ -350,9 +527,11 @@ __all__ = [
     "FEED_URL",
     "RELEASE_PUBLIC_KEY",
     "Release",
+    "MAX_ARTIFACT_BYTES",
     "UpdateError",
     "can_install",
     "check",
+    "discard",
     "download",
     "feed_url",
     "install",

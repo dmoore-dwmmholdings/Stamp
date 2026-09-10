@@ -1,6 +1,6 @@
 [project]
 name = "stamp"
-version = "1.6.0"
+version = "1.6.1"
 description = "Put 2D artwork onto 3D parts as real geometry"
 readme = "README.md"
 license = "MIT"
@@ -14,6 +14,7 @@ dependencies = [
     "cadquery-ocp-novtk>=7.9.3.1.1",
     "cryptography>=46.0.3",
     "ezdxf>=1.4.4",
+    "fast-simplification>=0.2.0",
     "lxml>=6.1.2",
     "manifold3d>=3.5.2",
     "networkx>=3.6.1",
@@ -47,7 +48,14 @@ dev = [
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["tests"]
-addopts = "-q"
+# opens_email is deselected here rather than in CI, because the reason to skip it
+# is the developer sitting in front of the machine: it hands a real mailto: to
+# the desktop and a compose window steals focus.  Run it deliberately with
+#   uv run pytest -m opens_email
+addopts = "-q -m 'not opens_email'"
+markers = [
+    "opens_email: opens a real email in the desktop mail client; not run by default",
+]
 
 [tool.ruff]
 line-length = 96

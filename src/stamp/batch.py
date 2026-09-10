@@ -18,7 +18,14 @@ from stamp.io import export as export_io
 from stamp.io.part_import import import_part
 from stamp.io.project import open_project
 
-_TOKEN = re.compile(r"\{\{([A-Za-z_][A-Za-z0-9_]*)\}\}")
+#: ``{{anything}}``.  A CSV column is whatever the person typed in the header
+#: row - "serial-no", "Part Number" - and a pattern that only matched
+#: identifiers left those placeholders in the part, unsubstituted and unreported.
+_TOKEN = re.compile(r"\{\{([^{}]+)\}\}")
+
+#: Suffixes that name a model format.  One of these that is not the format being
+#: written is a mistake to correct; anything else is part of the name.
+_MODEL_SUFFIXES = {".step", ".stp", ".stl", ".3mf"}
 
 
 class BatchError(RuntimeError):
@@ -44,9 +51,24 @@ class BatchReport:
         return {"stopped": self.stopped, "rows": [r.__dict__ for r in self.rows]}
 
 
+def placeholders(document: Document) -> set[str]:
+    """Every ``{{name}}`` the template asks the CSV to fill in."""
+    found: set[str] = set()
+    for feature in document.features:
+        if feature.profile.text is not None:
+            found.update(_TOKEN.findall(feature.profile.text.text))
+        if feature.profile.code is not None:
+            found.update(_TOKEN.findall(feature.profile.code.payload))
+    return {name.strip() for name in found}
+
+
 def _substitute(document: Document, values: dict[str, str]) -> None:
+    # Headers and placeholders are typed by hand, so "{{ serial }}" and a
+    # column called " serial" are the same column.
+    values = {str(key).strip(): value for key, value in values.items()}
+
     def replace(match: re.Match[str]) -> str:
-        key = match.group(1)
+        key = match.group(1).strip()
         if key not in values:
             raise BatchError(f"CSV is missing a value for {{{{{key}}}}}.")
         return values[key]
@@ -58,22 +80,65 @@ def _substitute(document: Document, values: dict[str, str]) -> None:
             feature.profile.code.payload = _TOKEN.sub(replace, feature.profile.code.payload)
 
 
-def _output_name(value: str | None, fmt: str) -> Path:
+def _output_name(value: str | None, fmt: str, output_dir: Path | None = None) -> Path:
+    """The name a row writes to, decided once for the dry run and the real one.
+
+    Both go through this, so a row the simulation calls ready is a row the run
+    accepts.  *output_dir*, when it is known, adds the check that survives
+    symlinks: the lexical one below cannot see where a link points.
+    """
     output = (value or "").strip()
     if not output:
         raise BatchError("output is empty")
     path = Path(output)
-    if not path.suffix:
-        path = path.with_suffix("." + fmt)
+    name = path.name
+    lowered = name.casefold()
+    # Judged on what the row typed, before the format suffix goes on.  After it
+    # every name has one - "stamp-batch-report.json" has become
+    # "stamp-batch-report.json.step" and ".step" has become ".step.step" - so a
+    # check made down there is a check that never matches anything.
+    if output[-1] in "/\\":
+        raise BatchError(f"output {output!r} names a folder rather than a file")
+    if (
+        not path.stem.strip(".")        # "", ".", ".."
+        or name.endswith(".")           # "part." would be written as "part..step"
+        or lowered in _MODEL_SUFFIXES   # ".step" would be written as ".step.step"
+        or lowered == "." + fmt
+    ):
+        raise BatchError(f"output {output!r} has no file name in front of the suffix")
+    if path.stem.casefold() == "stamp-batch-report" and len(path.parts) == 1:
+        raise BatchError(f"output {output!r} is the name the batch report is written under")
+    suffix = path.suffix.casefold()
+    if suffix != "." + fmt:
+        # A row that says part.txt gets STEP written into it either way, so the
+        # name is made to say so.  A wrong model suffix is replaced; anything
+        # else is part of the name - "PN-1234.5" must not lose its ".5".
+        if suffix in _MODEL_SUFFIXES:
+            path = path.with_suffix("." + fmt)
+        else:
+            path = Path(str(path) + "." + fmt)
     if path.is_absolute() or ".." in path.parts:
         raise BatchError("the output path must stay inside the chosen output folder")
-    if path.name.casefold() == "stamp-batch-report.json" and len(path.parts) == 1:
-        raise BatchError("output name is reserved for the batch report")
+    if output_dir is not None:
+        # A CSV is data, not permission to write outside the selected folder.
+        root = Path(output_dir).resolve()
+        if not (root / path).resolve().is_relative_to(root):
+            raise BatchError("the output path must stay inside the chosen output folder")
     return path
 
 
-def simulate_batch(template: str | Path, csv_path: str | Path, fmt: str) -> BatchReport:
-    """Validate CSV substitutions and output collisions without importing or writing parts."""
+def simulate_batch(
+    template: str | Path,
+    csv_path: str | Path,
+    fmt: str,
+    output_dir: str | Path | None = None,
+) -> BatchReport:
+    """Validate CSV substitutions and output collisions without importing or writing parts.
+
+    Given the folder the real run would write to, it checks containment the same
+    way that run does, thus a row called ready here is a row that gets written
+    there.
+    """
     fmt = fmt.lower().lstrip(".")
     if fmt not in {"step", "stl", "3mf"}:
         raise BatchError("Batch format must be step, stl, or 3mf.")
@@ -90,10 +155,22 @@ def simulate_batch(template: str | Path, csv_path: str | Path, fmt: str) -> Batc
             raise BatchError("The template has no base part.")
         report = BatchReport()
         seen: set[str] = set()
+        root = Path(output_dir) if output_dir is not None else None
         with Path(csv_path).open(newline="", encoding="utf-8-sig") as handle:
             reader = csv.DictReader(handle)
             if not reader.fieldnames or not {"input", "output"}.issubset(reader.fieldnames):
                 raise BatchError("CSV must have input and output columns.")
+            columns = {(name or "").strip() for name in reader.fieldnames}
+            # Said once, before the rows: a placeholder no column fills would
+            # otherwise fail every row with the same message, and a CSV with no
+            # rows at all would not mention it.
+            unknown = sorted(placeholders(opened.document) - columns)
+            if unknown:
+                raise BatchError(
+                    "The CSV has no column for "
+                    + ", ".join("{{" + name + "}}" for name in unknown)
+                    + "."
+                )
             for index, values in enumerate(reader, start=2):
                 try:
                     document = Document.from_dict(opened.document.to_dict())
@@ -101,7 +178,7 @@ def simulate_batch(template: str | Path, csv_path: str | Path, fmt: str) -> Batc
                     source = (values["input"] or "").strip()
                     if not source:
                         raise BatchError("input is empty")
-                    output = _output_name(values["output"], fmt)
+                    output = _output_name(values["output"], fmt, root)
                     output_text = str(output)
                     if output_text.casefold() in seen:
                         raise BatchError(f"duplicate output {output_text!r}")
@@ -145,7 +222,7 @@ def run_batch(template: str | Path, csv_path: str | Path, output_dir: str | Path
                 source_text = (values["input"] or "").strip()
                 if not source_text:
                     raise BatchError("input is empty")
-                output_name = _output_name(values["output"], fmt)
+                output_name = _output_name(values["output"], fmt, output_dir)
                 output_key = str(output_name).casefold()
                 if output_key in seen_outputs:
                     raise BatchError(f"duplicate output {str(output_name)!r}")
@@ -160,11 +237,8 @@ def run_batch(template: str | Path, csv_path: str | Path, output_dir: str | Path
                 profiles = ProfileCache()
                 engine = RebuildEngine(profiles.get)
                 rebuilt = engine.rebuild(document)
-                output = output_dir / output_name
-                # A CSV is data, not permission to write outside the selected folder.
-                output = output.resolve()
-                if not output.is_relative_to(output_dir.resolve()):
-                    raise BatchError("The output path must stay inside the chosen output folder.")
+                # Containment is checked in _output_name, against this folder.
+                output = (output_dir / output_name).resolve()
                 output.parent.mkdir(parents=True, exist_ok=True)
                 preflight = export_io.preflight_export(document, rebuilt, fmt, output)
                 preflight.require_ok()

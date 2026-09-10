@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import math
+
 import pytest
 
 from stamp.core.document import (
@@ -148,6 +150,31 @@ class TestToolSolid:
         )
         assert solid_ops.volume(drafted.shape) < solid_ops.volume(straight.shape)
 
+    def test_the_footprint_stays_on_the_sketch_plane(
+        self, logo_profile, top_plane, bracket_step
+    ):
+        """The flat decal says where the artwork lands, not where the sweep began.
+
+        Taken after the start shift it floats most of a part diagonal above the face
+        for a through cut, sits two millimetres up for a symmetric one, and lands a
+        micron inside the part for a blind add, where it z-fights with the face.
+        """
+        from stamp.io.part_import import bounding_box
+
+        for operation in (
+            cut_op(mode=DepthMode.THROUGH_ALL),
+            cut_op(4.0, DepthMode.SYMMETRIC),
+            add_op(1.0),
+        ):
+            tool = build_tool_solid(
+                logo_profile, Placement(), operation, top_plane,
+                part_diagonal=bracket_step.diagonal,
+            )
+            box = bounding_box(tool.footprint)
+            assert box[2] == pytest.approx(box[5], abs=1e-6), "the decal stays flat"
+            # Just clear of the face at z = 8, on the outside of it.
+            assert 8.0 < box[2] < 8.05, operation.depth_mode
+
     def test_zero_depth_is_refused(self, logo_profile, top_plane, bracket_step):
         with pytest.raises(ToolSolidError):
             build_tool_solid(
@@ -161,6 +188,103 @@ class TestToolSolid:
                 logo_profile, Placement(scale=(0.0, 1.0)), add_op(), top_plane,
                 part_diagonal=bracket_step.diagonal,
             )
+
+
+class TestDraft:
+    """A draft pivots on the sketch plane, so the mark keeps its drawn size (§6.3).
+
+    Placed at the start of the sweep instead, the wall arrives at the face already
+    tapered by the start offset times the tangent of the angle - which is half a part
+    diagonal for a through cut.  A 512 mm2 logo came out 431 mm2 at half a degree and
+    351 mm2 at one, and by two degrees the tool had pinched out entirely and the only
+    complaint was that the cut did not touch the part.
+    """
+
+    def _area_at_the_face(self, shape, z: float = 8.0, slice_mm: float = 0.01) -> float:
+        from OCP.BRepAlgoAPI import BRepAlgoAPI_Common
+        from OCP.BRepPrimAPI import BRepPrimAPI_MakeBox
+        from OCP.gp import gp_Pnt
+
+        box = BRepPrimAPI_MakeBox(
+            gp_Pnt(-500, -500, z - slice_mm), gp_Pnt(500, 500, z + slice_mm)
+        ).Shape()
+        common = BRepAlgoAPI_Common(shape, box)
+        common.Build()
+        assert common.IsDone()
+        return solid_ops.volume(common.Shape()) / (2 * slice_mm)
+
+    @pytest.mark.parametrize("angle", [0.5, 1.0, 2.0])
+    def test_a_through_cut_is_full_size_at_the_face(
+        self, logo_profile, top_plane, bracket_step, angle
+    ):
+        tool = build_tool_solid(
+            logo_profile, Placement(),
+            Operation(kind=OperationKind.CUT, depth_mode=DepthMode.THROUGH_ALL,
+                      depth=1.0, direction=Direction.INTO, draft_angle=angle),
+            top_plane, part_diagonal=bracket_step.diagonal, contact_overlap=0.0,
+        )
+        assert self._area_at_the_face(tool.shape) == pytest.approx(PROFILE_AREA, rel=1e-3)
+
+    @pytest.mark.parametrize("angle", [1.0, 5.0])
+    def test_a_symmetric_cut_is_full_size_at_the_face(
+        self, logo_profile, top_plane, bracket_step, angle
+    ):
+        tool = build_tool_solid(
+            logo_profile, Placement(),
+            Operation(kind=OperationKind.CUT, depth_mode=DepthMode.SYMMETRIC,
+                      depth=4.0, direction=Direction.INTO, draft_angle=angle),
+            top_plane, part_diagonal=bracket_step.diagonal, contact_overlap=0.0,
+        )
+        assert self._area_at_the_face(tool.shape) == pytest.approx(PROFILE_AREA, rel=1e-3)
+
+    def test_the_taper_still_happens_below_the_face(
+        self, logo_profile, top_plane, bracket_step
+    ):
+        """Full size just under the face, and clearly narrower two millimetres in."""
+        tool = build_tool_solid(
+            logo_profile, Placement(),
+            Operation(kind=OperationKind.CUT, depth_mode=DepthMode.BLIND, depth=4.0,
+                      direction=Direction.INTO, draft_angle=5.0),
+            top_plane, part_diagonal=bracket_step.diagonal, contact_overlap=0.0,
+        )
+        # A blind cut stops at the face, so the slice is taken just inside it.
+        assert self._area_at_the_face(tool.shape, z=7.99) == pytest.approx(
+            PROFILE_AREA, rel=1e-3
+        )
+        # Two millimetres down, every wall has moved in by 2 mm x tan 5 degrees: the
+        # rectangle shrinks by that on each side and the hole grows by it.
+        inset = 2.0 * math.tan(math.radians(5.0))
+        expected = (36 - 2 * inset) * (16 - 2 * inset) - (8 + 2 * inset) ** 2
+        assert expected < PROFILE_AREA * 0.96, "the check has to be able to fail"
+        assert self._area_at_the_face(tool.shape, z=6.0) == pytest.approx(expected, rel=1e-3)
+
+
+class TestToFaceDepth:
+    def test_a_target_behind_the_tool_is_refused(self, logo_profile, top_plane, bracket_step):
+        """A cut set Into, with the target above the sketch plane, is a mistake.
+
+        The distance is signed and the direction is not, so taking the absolute value
+        drives the cut into the part to a depth nobody asked for and says nothing.
+        """
+        with pytest.raises(ToolSolidError, match="other side of the sketch plane"):
+            build_tool_solid(
+                logo_profile, Placement(), cut_op(1.0, DepthMode.TO_FACE), top_plane,
+                part_diagonal=bracket_step.diagonal, to_face_distance=5.0,
+            )
+
+    def test_a_target_ahead_of_the_tool_is_the_depth(
+        self, logo_profile, top_plane, bracket_step
+    ):
+        from stamp.io.part_import import bounding_box
+
+        tool = build_tool_solid(
+            logo_profile, Placement(), cut_op(1.0, DepthMode.TO_FACE), top_plane,
+            part_diagonal=bracket_step.diagonal, to_face_distance=-5.0,
+            contact_overlap=0.0,
+        )
+        box = bounding_box(tool.shape)
+        assert box[2] == pytest.approx(3.0, abs=1e-6)
+        assert box[5] == pytest.approx(8.0, abs=1e-6)
 
 
 class TestContactOverlap:
@@ -363,6 +487,31 @@ class TestMeshMode:
         )
         assert rounded.manifold.volume() < plain.manifold.volume()
 
+    def test_a_tool_that_will_not_tessellate_says_so(self):
+        """An open shape makes an empty manifold, not an exception, unless asked.
+
+        Left unchecked it reaches the boolean as an empty solid, and every cut then
+        reports that the feature removed the whole part - which sends the user off
+        checking a depth and a direction that were never the problem.
+        """
+        from OCP.BRepBuilderAPI import BRepBuilderAPI_MakeFace
+        from OCP.gp import gp_Pln
+
+        open_shape = BRepBuilderAPI_MakeFace(gp_Pln(), -5.0, 5.0, -5.0, 5.0).Face()
+        with pytest.raises(ValueError, match="closed shape"):
+            mesh_ops.shape_to_manifold(open_shape)
+
+    def test_display_decimation_actually_reduces_the_mesh(self):
+        """trimesh 5 takes a fraction first, so the count went in as a multiplier."""
+        from OCP.BRepPrimAPI import BRepPrimAPI_MakeSphere
+
+        sphere = mesh_ops.shape_to_manifold(BRepPrimAPI_MakeSphere(10.0).Shape(), 0.02)
+        before = len(mesh_ops.to_trimesh(sphere).faces)
+        assert before > 2000, "the fixture has to be big enough to be worth reducing"
+        reduced = mesh_ops.decimate_for_display(sphere, 1000)
+        assert len(reduced.faces) <= 1000
+        assert len(reduced.faces) > 0
+
     def test_weld_closes_a_tessellated_box(self):
         from OCP.BRepPrimAPI import BRepPrimAPI_MakeBox
 
@@ -439,3 +588,61 @@ class TestWorkingValueSearch:
         result, _ = self._suggestion(tool, ModifierKind.FILLET, 0.2)
         assert result.applied
         assert result.suggested_value is None
+
+
+class TestMeasuringAFaceInItsSketchPlane:
+    """A face's size decides what "Fit to face" scales the artwork to.
+
+    Measuring the vertices alone got this wrong on anything bounded by arcs: a
+    face bounded by a full circle has one seam vertex, so it measured nothing
+    at all and the fit collapsed the profile to zero.
+    """
+
+    @staticmethod
+    def _extent(face):
+        from stamp.core.refs import face_center, face_extent_in_plane, plane_from_face
+
+        plane, _ = plane_from_face(face, face_center(face))
+        return face_extent_in_plane(face, plane)
+
+    def test_a_full_circle_measures_its_diameter(self):
+        from OCP.BRepPrimAPI import BRepPrimAPI_MakeCylinder
+
+        from stamp.core.refs import faces_of, surface_kind
+
+        shape = BRepPrimAPI_MakeCylinder(10.0, 30.0).Shape()
+        flat = [f for f in faces_of(shape) if surface_kind(f) == "plane"]
+        assert flat, "a cylinder has two flat ends"
+        assert self._extent(flat[0]) == pytest.approx((20.0, 20.0), abs=1e-6)
+
+    def test_a_tilted_slab_measures_its_own_sides_not_the_world_box(self):
+        """A 60 x 20 face turned 45 degrees sits in a world box of about
+        56.6 x 56.6, which is the wrong number in both directions."""
+        import math
+
+        from OCP.BRepBuilderAPI import BRepBuilderAPI_Transform
+        from OCP.BRepPrimAPI import BRepPrimAPI_MakeBox
+        from OCP.gp import gp_Ax1, gp_Dir, gp_Pnt, gp_Trsf
+
+        from stamp.core.refs import face_center, face_normal_at, faces_of
+
+        box = BRepPrimAPI_MakeBox(gp_Pnt(0, 0, 0), gp_Pnt(60, 20, 10)).Shape()
+        turn = gp_Trsf()
+        turn.SetRotation(gp_Ax1(gp_Pnt(0, 0, 0), gp_Dir(0, 0, 1)), math.radians(45))
+        shape = BRepBuilderAPI_Transform(box, turn, True).Shape()
+
+        top = next(
+            f for f in faces_of(shape)
+            if face_normal_at(f, face_center(f))[2] > 0.99
+        )
+        assert sorted(self._extent(top)) == pytest.approx([20.0, 60.0], abs=1e-6)
+
+    def test_the_bracket_top_face_measures_the_part(self, bracket_step):
+        from stamp.core.refs import face_area, face_center, face_normal_at, faces_of
+
+        flat = [
+            f for f in faces_of(bracket_step.runtime)
+            if face_normal_at(f, face_center(f))[2] > 0.99
+        ]
+        top = max(flat, key=face_area)
+        assert sorted(self._extent(top)) == pytest.approx([40.0, 80.0], abs=1e-6)

@@ -27,9 +27,22 @@ from pathlib import Path
 
 LOG_NAME = "stamp.log"
 
-#: Made at start and removed at a clean exit.  It holds the process id, thus a
-#: second window that runs at the same time is not mistaken for a crash.
+#: Made at start and removed at a clean exit, one per process.  The process id
+#: is in the name rather than only in the file, because a single shared file is
+#: overwritten by the second window to start and takes the first window's crash
+#: with it.
+RUNNING_PREFIX = "running-"
+RUNNING_SUFFIX = ".flag"
+
+#: What versions before the per-process flags wrote: a single file holding the
+#: process id.  Still read at start so that an upgrade over a crashed run still
+#: reports that crash, and cleared with the rest.
 RUNNING_NAME = "running.flag"
+
+
+def running_flag(directory: Path, pid: int | None = None) -> Path:
+    """This process's flag file."""
+    return directory / f"{RUNNING_PREFIX}{pid or os.getpid()}{RUNNING_SUFFIX}"
 
 #: Bytes above which the log is moved to ``stamp.log.1`` at start.
 ROTATE_BYTES = 2_000_000
@@ -102,6 +115,10 @@ def _pid_alive(pid: int) -> bool:
             kernel32.CloseHandle(handle)
     try:
         os.kill(pid, 0)
+    except PermissionError:
+        # The process exists; it just belongs to somebody else.  Reading that as
+        # "not running" turns another user's session into a crash report.
+        return True
     except OSError:
         return False
     return True
@@ -125,12 +142,13 @@ def mark_clean_exit() -> None:
     if _log_path is None:
         return
     try:
-        flag = _log_path.parent / RUNNING_NAME
-        # Only clear our own flag.  Another window that is still open owns its.
-        if flag.exists():
-            owner = flag.read_text(encoding="utf-8").strip()
+        # Only our own flag.  Another window that is still open owns its.
+        running_flag(_log_path.parent).unlink(missing_ok=True)
+        legacy = _log_path.parent / RUNNING_NAME
+        if legacy.exists():
+            owner = legacy.read_text(encoding="utf-8").strip()
             if owner in ("", str(os.getpid())):
-                flag.unlink(missing_ok=True)
+                legacy.unlink(missing_ok=True)
         _log.info("Stamp stops cleanly.")
     except Exception:
         pass
@@ -154,16 +172,27 @@ def start() -> Path | None:
             backup = path.with_suffix(path.suffix + ".1")
             backup.unlink(missing_ok=True)
             path.rename(backup)
-        flag = directory / RUNNING_NAME
-        owner = 0
-        if flag.exists():
+        # Every flag left behind, not one shared file: two windows each leave
+        # their own, and the first one's crash is still there to be found after
+        # the second one has started.
+        stale: list[Path] = []
+        for flag in sorted(directory.glob(f"{RUNNING_PREFIX}*{RUNNING_SUFFIX}")):
+            name = flag.name[len(RUNNING_PREFIX):-len(RUNNING_SUFFIX)]
             try:
-                owner = int(flag.read_text(encoding="utf-8").strip() or 0)
+                owner = int(name)
+            except ValueError:
+                owner = 0
+            if owner != os.getpid() and not _pid_alive(owner):
+                stale.append(flag)
+        legacy = directory / RUNNING_NAME
+        if legacy.exists():
+            try:
+                owner = int(legacy.read_text(encoding="utf-8").strip() or 0)
             except Exception:
                 owner = 0
-        # A flag whose process is still alive belongs to another window, not to
-        # a run that crashed.
-        if flag.exists() and not _pid_alive(owner):
+            if not _pid_alive(owner):
+                stale.append(legacy)
+        if stale:
             _crashed_before = True
             # Keep that run's log, because this run appends to the same file.
             try:
@@ -175,7 +204,11 @@ def start() -> Path | None:
                     shutil.copy2(path, previous)
             except Exception:
                 pass
-        flag.write_text(str(os.getpid()), encoding="utf-8")
+            # Cleared now that it has been counted, so that the run after this
+            # one does not report the same crash again.
+            for flag in stale:
+                flag.unlink(missing_ok=True)
+        running_flag(directory).write_text(str(os.getpid()), encoding="utf-8")
         _stream = open(path, "a", encoding="utf-8", buffering=1)
         _log_path = path
     except Exception:  # a read-only home must not stop the application
@@ -257,6 +290,8 @@ def _thread_excepthook(args) -> None:
 
 
 __all__ = [
+    "RUNNING_PREFIX",
+    "RUNNING_SUFFIX",
     "breadcrumb",
     "log_dir",
     "log_path",
@@ -264,6 +299,7 @@ __all__ = [
     "note_exception",
     "recent_lines",
     "previous_log",
+    "running_flag",
     "previous_run_crashed",
     "start",
 ]

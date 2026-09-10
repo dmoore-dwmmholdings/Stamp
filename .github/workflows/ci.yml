@@ -18,7 +18,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [windows-latest, ubuntu-latest]
+        # macOS is in here because two of the four installers are macOS ones,
+        # and a platform nothing runs on is a platform nobody knows is broken.
+        os: [windows-latest, ubuntu-latest, macos-14]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 40
     env:
@@ -36,5 +38,5 @@ jobs:
       - name: Point Qt at the system fonts
         if: runner.os == 'Windows'
         run: echo "QT_QPA_FONTDIR=C:\Windows\Fonts" >> $env:GITHUB_ENV
-      - run: uv sync
+      - run: uv sync --frozen
       - run: uv run pytest

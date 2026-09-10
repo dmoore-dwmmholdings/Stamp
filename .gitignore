@@ -20,3 +20,6 @@ packaging/assets/
 
 # Screenshots taken by docker/shot.sh
 shots/
+
+# Private release keys - packaging/make_release_key.py --private-key-out
+*.key

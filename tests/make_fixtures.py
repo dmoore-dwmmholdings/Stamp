@@ -206,6 +206,133 @@ SVG_KNOCKOUT = """<?xml version="1.0" encoding="UTF-8"?>
 """
 
 
+#: Sizing cases.  ocpsvg applies the width/viewBox viewport transform itself, so
+#: what it hands back is millimetres for a document with a viewBox and a
+#: physical width and CSS pixels for everything else.  Every one of these used to
+#: import at the wrong size except the first, whose viewBox happens to equal its
+#: width in millimetres.  Each shape fills its viewBox exactly, so the imported
+#: width is the number the file says it is.
+SVG_MM_PX_VIEWBOX = """<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="100mm" height="50mm"
+     viewBox="0 0 283.465 141.7325">
+  <rect x="0" y="0" width="283.465" height="141.7325" fill="#000"/>
+</svg>
+"""
+
+SVG_MM_LARGE_VIEWBOX = """<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="100mm" height="50mm"
+     viewBox="0 0 1000 500">
+  <rect x="0" y="0" width="1000" height="500" fill="#000"/>
+</svg>
+"""
+
+SVG_INCH_VIEWBOX = """<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="2in" height="1in" viewBox="0 0 192 96">
+  <rect x="0" y="0" width="192" height="96" fill="#000"/>
+</svg>
+"""
+
+SVG_POINTS_VIEWBOX = """<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="144pt" height="72pt" viewBox="0 0 192 96">
+  <rect x="0" y="0" width="192" height="96" fill="#000"/>
+</svg>
+"""
+
+SVG_PX_VIEWBOX = """<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="200" height="100" viewBox="0 0 400 200">
+  <rect x="0" y="0" width="400" height="200" fill="#000"/>
+</svg>
+"""
+
+SVG_VIEWBOX_ONLY = """<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 400 200">
+  <rect x="0" y="0" width="400" height="200" fill="#000"/>
+</svg>
+"""
+
+#: Neither a width nor a viewBox: bare path coordinates, which are CSS pixels.
+SVG_BARE = """<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg">
+  <rect x="0" y="0" width="400" height="200" fill="#000"/>
+</svg>
+"""
+
+#: A physical width with no viewBox.  One user unit is one CSS pixel whatever the
+#: viewport says, which is how every browser and every editor draws it.
+SVG_MM_NO_VIEWBOX = """<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="100mm" height="50mm">
+  <rect x="0" y="0" width="100" height="50" fill="#000"/>
+</svg>
+"""
+
+#: A width with no height.  svgelements applies the viewport transform only when
+#: both are absolute, so these four import in the file's own user units and the
+#: size has to be put back afterwards.
+SVG_WIDTH_ONLY = """<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="200mm" viewBox="0 0 100 50">
+  <rect x="0" y="0" width="100" height="50" fill="#000"/>
+</svg>
+"""
+
+#: A height with no width, and a viewBox that is not square - so dividing by the
+#: viewBox width instead of its height gets it wrong by the aspect ratio.
+SVG_HEIGHT_ONLY = """<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" height="100mm" viewBox="0 0 100 50">
+  <rect x="0" y="0" width="100" height="50" fill="#000"/>
+</svg>
+"""
+
+SVG_PX_WIDTH_ONLY = """<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="200px" viewBox="0 0 100 50">
+  <rect x="0" y="0" width="100" height="50" fill="#000"/>
+</svg>
+"""
+
+#: A percentage height, which is no height at all.  Inkscape writes these.
+SVG_PERCENT_HEIGHT = """<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="200mm" height="100%" viewBox="0 0 100 50">
+  <rect x="0" y="0" width="100" height="50" fill="#000"/>
+</svg>
+"""
+
+#: Units in capitals.  CSS unit identifiers are case-insensitive.
+SVG_UPPERCASE_UNITS = """<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="2IN" height="1IN" viewBox="0 0 192 96">
+  <rect x="0" y="0" width="192" height="96" fill="#000"/>
+</svg>
+"""
+
+#: A group transform inside a scaled viewport - the shape ocpsvg has to place,
+#: and the case a viewBox ratio applied afterwards gets most badly wrong.
+SVG_NESTED_TRANSFORM = """<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="100mm" height="50mm"
+     viewBox="0 0 1000 500">
+  <g transform="translate(100,100) scale(2)">
+    <rect x="0" y="0" width="100" height="50" fill="#000"/>
+  </g>
+</svg>
+"""
+
+#: Two overlapping squares and a bow tie, all one colour.  Resolving the overlap
+#: used to take the bow tie with it - no face, no issue, nothing said.
+SVG_CROSSING_WITH_OVERLAP = """<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="60mm" height="40mm" viewBox="0 0 60 40">
+  <path d="M 0 0 L 20 0 L 20 20 L 0 20 Z" fill="#000000"/>
+  <path d="M 10 10 L 30 10 L 30 30 L 10 30 Z" fill="#000000"/>
+  <path d="M 40 0 L 55 15 L 55 0 L 40 15 Z" fill="#000000"/>
+</svg>
+"""
+
+#: The same, in two colours, so the per-component resolution path runs instead.
+SVG_CROSSING_TWO_COLOR = """<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="60mm" height="40mm" viewBox="0 0 60 40">
+  <path d="M 0 0 L 20 0 L 20 20 L 0 20 Z" fill="#000000"/>
+  <path d="M 10 10 L 30 10 L 30 30 L 10 30 Z" fill="#ff0000"/>
+  <path d="M 40 0 L 55 15 L 55 0 L 40 15 Z" fill="#000000"/>
+</svg>
+"""
+
+
 def make_assembly_3mf(path: Path) -> None:
     """Two separate boxes in one 3MF, which is what a slicer file looks like.
 
@@ -224,7 +351,33 @@ def make_assembly_3mf(path: Path) -> None:
     path.write_bytes(scene.export(file_type="3mf"))
 
 
+SIZING_SVGS = {
+    "size_mm_px_viewbox.svg": SVG_MM_PX_VIEWBOX,
+    "size_mm_large_viewbox.svg": SVG_MM_LARGE_VIEWBOX,
+    "size_inch_viewbox.svg": SVG_INCH_VIEWBOX,
+    "size_points_viewbox.svg": SVG_POINTS_VIEWBOX,
+    "size_px_viewbox.svg": SVG_PX_VIEWBOX,
+    "size_viewbox_only.svg": SVG_VIEWBOX_ONLY,
+    "size_bare.svg": SVG_BARE,
+    "size_mm_no_viewbox.svg": SVG_MM_NO_VIEWBOX,
+    "size_nested_transform.svg": SVG_NESTED_TRANSFORM,
+    "size_width_only.svg": SVG_WIDTH_ONLY,
+    "size_height_only.svg": SVG_HEIGHT_ONLY,
+    "size_px_width_only.svg": SVG_PX_WIDTH_ONLY,
+    "size_percent_height.svg": SVG_PERCENT_HEIGHT,
+    "size_uppercase_units.svg": SVG_UPPERCASE_UNITS,
+}
+
+
 def make_svgs() -> None:
+    for name, text in SIZING_SVGS.items():
+        (FIXTURES / name).write_text(text, encoding="utf-8")
+    (FIXTURES / "crossing_with_overlap.svg").write_text(
+        SVG_CROSSING_WITH_OVERLAP, encoding="utf-8"
+    )
+    (FIXTURES / "crossing_two_color.svg").write_text(
+        SVG_CROSSING_TWO_COLOR, encoding="utf-8"
+    )
     (FIXTURES / "logo.svg").write_text(SVG_LOGO, encoding="utf-8")
     (FIXTURES / "two_color.svg").write_text(SVG_TWO_COLOR, encoding="utf-8")
     (FIXTURES / "background.svg").write_text(SVG_BACKGROUND, encoding="utf-8")
@@ -405,6 +558,183 @@ def make_bracket_rev_b_stl(path: Path) -> None:
     trimesh.Trimesh(vertices=verts, faces=tris, process=False).export(path)
 
 
+def make_inverted_stl(path: Path) -> None:
+    """A closed box with every triangle wound the wrong way round.
+
+    It passes ``is_watertight`` exactly as a good mesh does, so the repair pass
+    never looked at it; its volume is negative, which makes it the whole of space
+    minus the box, and every boolean on it came out inside out.
+    """
+    import trimesh
+
+    box = trimesh.creation.box(extents=(40.0, 20.0, 6.0))
+    trimesh.Trimesh(
+        vertices=box.vertices, faces=box.faces[:, ::-1], process=False
+    ).export(path)
+
+
+def make_half_inverted_stl(path: Path) -> None:
+    """A closed box with half its triangles wound the wrong way round.
+
+    Watertight, so the seam repair never runs; the two halves cancel to a volume
+    of exactly zero rather than a negative one, so the inside-out test never runs
+    either.  It went through the whole importer without a word and enclosed
+    nothing at all.
+    """
+    import trimesh
+
+    box = trimesh.creation.box(extents=(40.0, 20.0, 6.0))
+    faces = box.faces.copy()
+    half = len(faces) // 2
+    faces[:half] = faces[:half][:, ::-1]
+    trimesh.Trimesh(vertices=box.vertices, faces=faces, process=False).export(path)
+
+
+def make_half_inverted_assembly_3mf(path: Path) -> None:
+    """Two bodies, one of them built inside out.
+
+    The negative body cancels part of the positive one, so the assembly is
+    watertight, consistently wound, and has a plausible positive volume - and
+    the part that is inside out is still rebuilt from its own geometry, so a
+    stamp cut into it came out as the space around it.
+    """
+    import trimesh
+
+    body = trimesh.creation.box(extents=(40, 20, 10))
+    body.apply_translation((0, 0, 5))
+    clip = trimesh.creation.box(extents=(10, 10, 10))
+    clip.apply_translation((40, 0, 5))
+    clip.invert()
+    scene = trimesh.Scene()
+    scene.add_geometry(body, geom_name="body")
+    scene.add_geometry(clip, geom_name="clip")
+    path.write_bytes(scene.export(file_type="3mf"))
+
+
+def make_blocks_dxf(path: Path) -> None:
+    """A drawing whose geometry is all inside block references.
+
+    Two inserts of a pad, one of which inserts a tag block of its own, plus a
+    plain circle.  Block references carry no geometry themselves, so a reader
+    that does not expand them imports the circle and nothing else - which is what
+    Stamp did, without saying so.
+    """
+    import ezdxf
+
+    doc = ezdxf.new("R2010")
+    doc.header["$INSUNITS"] = 4
+    doc.layers.add("PROFILE", color=7)
+
+    tag = doc.blocks.new(name="TAG")
+    tag.add_lwpolyline([(0, 0), (4, 0), (4, 4), (0, 4)], close=True, dxfattribs={"layer": "0"})
+
+    pad = doc.blocks.new(name="PAD")
+    pad.add_lwpolyline(
+        [(0, 0), (10, 0), (10, 6), (0, 6)], close=True, dxfattribs={"layer": "0"}
+    )
+    pad.add_blockref("TAG", (12, 0), dxfattribs={"layer": "0"})
+
+    msp = doc.modelspace()
+    msp.add_blockref("PAD", (0, 0), dxfattribs={"layer": "PROFILE"})
+    msp.add_blockref("PAD", (30, 0), dxfattribs={"layer": "PROFILE"})
+    msp.add_circle((60, 3), 3, dxfattribs={"layer": "PROFILE"})
+    doc.saveas(path)
+
+
+def make_minsert_dxf(path: Path) -> None:
+    """A MINSERT: one block reference that draws its block on a 2 x 3 grid.
+
+    ``virtual_entities`` hands back one cell's worth of geometry no matter how
+    big the array is, so an array of six pads imported as one and the drawing
+    came in a sixth of its real size, without a word about it.
+    """
+    import ezdxf
+
+    doc = ezdxf.new("R2010")
+    doc.header["$INSUNITS"] = 4
+    doc.layers.add("ARRAY", color=7)
+
+    cell = doc.blocks.new(name="CELL")
+    cell.add_lwpolyline([(0, 0), (6, 0), (6, 4), (0, 4)], close=True, dxfattribs={"layer": "0"})
+
+    msp = doc.modelspace()
+    insert = msp.add_blockref("CELL", (0, 0), dxfattribs={"layer": "ARRAY"})
+    insert.dxf.row_count = 2
+    insert.dxf.column_count = 3
+    insert.dxf.row_spacing = 10
+    insert.dxf.column_spacing = 10
+    doc.saveas(path)
+
+
+def make_ring_bowtie_dxf(path: Path) -> None:
+    """A square with a hole wound the same way as its outer, plus a bow tie.
+
+    DXF has no fill rule, so containment alone decides the hole and both loops
+    keep the winding they were drawn with.  Handed to the non-zero fill rule as
+    drawn, the hole fills in - so "union overlapping loops" used to hand back a
+    solid square 100 mm2 too big.
+    """
+    import ezdxf
+
+    doc = ezdxf.new("R2010")
+    doc.header["$INSUNITS"] = 4
+    msp = doc.modelspace()
+    msp.add_lwpolyline([(0, 0), (30, 0), (30, 30), (0, 30)], close=True)
+    msp.add_lwpolyline([(10, 10), (20, 10), (20, 20), (10, 20)], close=True)
+    msp.add_lwpolyline([(40, 0), (55, 15), (55, 0), (40, 15)], close=True)
+    doc.saveas(path)
+
+
+def make_inch_3mf(path: Path) -> None:
+    """A 2 x 1 x 0.25 inch box in a 3MF that says ``unit="inch"``.
+
+    trimesh reports the unit rather than applying it, so the box used to arrive
+    as 2 x 1 x 0.25 *millimetres*.  The XML is written by hand because trimesh's
+    3MF exporter has no way to set the attribute.
+    """
+    import zipfile
+
+    verts = [
+        (0, 0, 0), (2, 0, 0), (2, 1, 0), (0, 1, 0),
+        (0, 0, 0.25), (2, 0, 0.25), (2, 1, 0.25), (0, 1, 0.25),
+    ]
+    tris = [
+        (0, 2, 1), (0, 3, 2), (4, 5, 6), (4, 6, 7), (0, 1, 5), (0, 5, 4),
+        (1, 2, 6), (1, 6, 5), (2, 3, 7), (2, 7, 6), (3, 0, 4), (3, 4, 7),
+    ]
+    vertices = "".join(f'<vertex x="{x}" y="{y}" z="{z}"/>' for x, y, z in verts)
+    triangles = "".join(f'<triangle v1="{a}" v2="{b}" v3="{c}"/>' for a, b, c in tris)
+    model = (
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<model unit="inch" xml:lang="en-US"'
+        ' xmlns="http://schemas.microsoft.com/3dmanufacturing/core/2015/02">'
+        '<resources><object id="1" type="model"><mesh>'
+        f"<vertices>{vertices}</vertices><triangles>{triangles}</triangles>"
+        "</mesh></object></resources>"
+        '<build><item objectid="1"/></build></model>'
+    )
+    content_types = (
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+        '<Default Extension="rels"'
+        ' ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
+        '<Default Extension="model"'
+        ' ContentType="application/vnd.ms-package.3dmanufacturing-3dmodel+xml"/></Types>'
+    )
+    rels = (
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<Relationships'
+        ' xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+        '<Relationship Target="/3D/3dmodel.model" Id="rel-1"'
+        ' Type="http://schemas.microsoft.com/3dmanufacturing/2013/01/3dmodel"/>'
+        "</Relationships>"
+    )
+    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("[Content_Types].xml", content_types)
+        archive.writestr("_rels/.rels", rels)
+        archive.writestr("3D/3dmodel.model", model)
+
+
 def main() -> None:
     FIXTURES.mkdir(parents=True, exist_ok=True)
     make_plate_step(FIXTURES / "plate.step")
@@ -416,12 +746,19 @@ def main() -> None:
     make_bracket_moved(FIXTURES / "bracket_moved.step")
     make_bracket_rev_b_stl(FIXTURES / "bracket_rev_b.stl")
     make_leaky_stl(FIXTURES / "leaky.stl")
+    make_inverted_stl(FIXTURES / "inverted.stl")
+    make_half_inverted_stl(FIXTURES / "half_inverted.stl")
+    make_half_inverted_assembly_3mf(FIXTURES / "half_inverted_assembly.3mf")
     make_assembly_3mf(FIXTURES / "assembly.3mf")
+    make_inch_3mf(FIXTURES / "inch_box.3mf")
     make_svgs()
     make_dxf(FIXTURES / "profile.dxf")
     make_open_loop_dxf(FIXTURES / "open_loop.dxf")
     make_no_units_dxf(FIXTURES / "no_units.dxf")
     make_serial_dxf(FIXTURES / "serial.dxf")
+    make_blocks_dxf(FIXTURES / "blocks.dxf")
+    make_ring_bowtie_dxf(FIXTURES / "ring_bowtie.dxf")
+    make_minsert_dxf(FIXTURES / "minsert.dxf")
     for f in sorted(FIXTURES.iterdir()):
         print(f"{f.name:>26}  {f.stat().st_size:>8,} bytes")
 

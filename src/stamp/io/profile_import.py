@@ -8,6 +8,7 @@ unit scale, and surface the questions only the user can answer.  Everything afte
 from __future__ import annotations
 
 import hashlib
+import io
 import re
 import shutil
 import tempfile
@@ -15,6 +16,7 @@ import xml.etree.ElementTree as ET
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
+from xml.sax.saxutils import quoteattr
 
 from OCP.BRepBuilderAPI import BRepBuilderAPI_MakeEdge, BRepBuilderAPI_Transform
 from OCP.Geom import Geom_BezierCurve
@@ -35,14 +37,14 @@ from stamp.io.normalize import (
     outline_strokes,
     union_overlapping,
 )
-from stamp.units import DXF_INSUNITS_TO_MM, TO_MM
+from stamp.units import DXF_INSUNITS_TO_MM, MM_PER_INCH, TO_MM
 
 SVG_EXTS = {".svg"}
 DXF_EXTS = {".dxf"}
 DWG_EXTS = {".dwg"}
 PROFILE_EXTS = SVG_EXTS | DXF_EXTS | DWG_EXTS
 
-_LENGTH_RE = re.compile(r"^\s*([+-]?[0-9]*\.?[0-9]+(?:[eE][+-]?[0-9]+)?)\s*([a-z%]*)\s*$")
+_LENGTH_RE = re.compile(r"^\s*([+-]?[0-9]*\.?[0-9]+(?:[eE][+-]?[0-9]+)?)\s*([a-zA-Z%]*)\s*$")
 
 #: SVG features that carry no extrudable geometry.  Warn once, then ignore (§5.3).
 _IGNORED_SVG_TAGS = {
@@ -121,7 +123,12 @@ def import_profile(path: str | Path, options: ImportOptions | None = None) -> Im
 
 
 def parse_length(text: str | None) -> tuple[float, str] | None:
-    """Split an SVG length into (value, unit).  Unitless means px."""
+    """Split an SVG length into (value, unit).  Unitless means px.
+
+    CSS unit identifiers are case-insensitive, so ``2IN`` is two inches, and
+    the unit comes back lowercased.  Matched case-sensitively it was not a
+    length at all, and a drawing declared in capitals imported at 96 dpi.
+    """
     if not text:
         return None
     m = _LENGTH_RE.match(text)
@@ -134,36 +141,141 @@ def parse_length(text: str | None) -> tuple[float, str] | None:
     return value, unit
 
 
-def svg_user_unit_mm(path: Path) -> tuple[float, str, bool]:
-    """Work out how many millimetres one SVG user unit is.
+@dataclass(frozen=True)
+class SvgScale:
+    """The two different scales an SVG needs, which are not the same number.
 
-    Returns ``(mm_per_user_unit, declared_unit, ambiguous)``.  ``ambiguous`` is True
-    when the document gives no physical size, so the caller must show the 96 dpi
-    guess as an editable field rather than commit to it (§5.3).
+    *geometry* multiplies what ocpsvg hands back.  ocpsvg parses at 25.4 ppi and
+    applies the viewBox-to-viewport transform itself - but only where
+    svgelements does, which is only when both width and height are absolute
+    lengths.  So its shapes are already millimetres for a document with a
+    viewBox and a physical width *and* height, and are still in the file's own
+    user units for anything else.  Multiplying the first kind by the viewBox
+    ratio as well scaled the file a second time; not multiplying the second kind
+    left a width-only document at whatever its viewBox said.  *geometry* is what
+    is left over: the millimetres one user unit measures, divided by the scale
+    ocpsvg already applied.
+
+    *user_unit_mm* is what one viewBox unit measures, which is what a
+    ``stroke-width`` written in the file is expressed in.
     """
+
+    geometry: float
+    user_unit_mm: float
+    unit: str
+    ambiguous: bool
+
+
+#: The root attributes that decide how big an SVG is.  Nothing else in the
+#: document has any bearing on it.
+_SIZING_ATTRS = ("width", "height", "viewBox", "preserveAspectRatio")
+
+
+def _sizing_root(root):
+    """svgelements' own reading of the root's width, height and viewBox.
+
+    Sizing has to agree with ocpsvg, which hands the file to svgelements at
+    25.4 ppi, so the numbers come from svgelements rather than being worked out
+    a second time here where the two can drift apart.  Only the root's four
+    sizing attributes are handed over: re-parsing the whole document just to
+    read the top of it is what makes a large logo slow to open.
+    """
+    import svgelements
+
+    attrs = " ".join(
+        f"{name}={quoteattr(root.get(name))}" for name in _SIZING_ATTRS if root.get(name)
+    )
+    stub = f'<svg xmlns="http://www.w3.org/2000/svg" {attrs}/>'
+    try:
+        return svgelements.SVG.parse(io.StringIO(stub), ppi=MM_PER_INCH)
+    except Exception:  # noqa: BLE001 - a root nobody can read is sized as pixels
+        return None
+
+
+def _view_box_size(svg) -> tuple[float, float] | None:
+    """The viewBox's width and height, or None where there is no usable one.
+
+    A viewBox that is missing, has the wrong number of values in it, or measures
+    zero is no viewBox: svgelements leaves the geometry in user units and so
+    does the sizing here.
+    """
+    try:
+        box = svg.viewbox
+        width = float(box.width)
+        height = float(box.height)
+    except (AttributeError, TypeError, ValueError):
+        return None
+    return (width, height) if width > 0 and height > 0 else None
+
+
+def _viewport_scale(svg, *, vertical: bool) -> float:
+    """The scale svgelements has already applied to the geometry.
+
+    svgelements maps the viewBox onto the viewport only when *both* width and
+    height resolve to absolute lengths.  With either one missing or given as a
+    percentage it substitutes the viewBox's own dimension, and the viewport
+    transform comes out as a centring translation with no scale in it at all -
+    which is what made a ``width="200mm" viewBox="0 0 100 50"`` document, with
+    no height, import at 100 mm instead of 200.  Asking svgelements for the
+    transform it would apply is the only way the two can never disagree.
+
+    The two axes differ only under ``preserveAspectRatio="none"``, which
+    stretches the drawing; the axis the declared size came from is the one that
+    can still be made right.
+    """
+    from svgelements import Matrix
+
+    try:
+        matrix = Matrix(svg.viewbox.transform(svg))
+    except (AttributeError, TypeError, ValueError, ZeroDivisionError):
+        return 1.0
+    scale = matrix.d if vertical else matrix.a
+    return scale if scale > 0 else 1.0
+
+
+def svg_scale(path: Path) -> SvgScale:
+    """Work out how to size an SVG.  See :class:`SvgScale`."""
     root = ET.parse(path).getroot()
+    svg = _sizing_root(root)
+    view_box = _view_box_size(svg)
     width = parse_length(root.get("width"))
-    view_box = root.get("viewBox")
+    height = parse_length(root.get("height"))
 
-    vb_width = None
-    if view_box:
-        parts = re.split(r"[,\s]+", view_box.strip())
-        if len(parts) == 4:
-            try:
-                vb_width = float(parts[2])
-            except ValueError:
-                vb_width = None
+    if view_box is None:
+        # Without a viewBox one user unit *is* one CSS pixel, whatever the
+        # viewport is declared in, so the width says nothing about the artwork.
+        # That is what the spec says and what every browser draws, and it still
+        # surprises people who wrote width="100mm" and get 26.5, so the size is
+        # offered for correction rather than committed to (§5.3).
+        return SvgScale(TO_MM["px"], TO_MM["px"], "px", True)
 
-    if width is None:
-        # No width at all: user units are px by the CSS reference pixel.
-        return TO_MM["px"], "px", True
+    vb_width, vb_height = view_box
+    if width is not None:
+        value, unit = width
+        user_unit_mm = value * TO_MM.get(unit, TO_MM["px"]) / vb_width
+    elif height is not None:
+        # Against the viewBox *height*: dividing a height by the viewBox width
+        # sized a non-square document by the ratio between two unrelated numbers.
+        value, unit = height
+        user_unit_mm = value * TO_MM.get(unit, TO_MM["px"]) / vb_height
+    else:
+        # No usable size - a percentage counts as none.  User units are read as
+        # CSS pixels at 96 dpi, and that reading is a guess the UI must offer to
+        # correct (§5.3).
+        return SvgScale(TO_MM["px"], TO_MM["px"], "px", True)
 
-    value, unit = width
-    physical_mm = value * TO_MM.get(unit, TO_MM["px"])
-    ambiguous = unit == "px"
-    if vb_width and vb_width > 0:
-        return physical_mm / vb_width, unit, ambiguous
-    return physical_mm / value if value else 1.0, unit, ambiguous
+    applied = _viewport_scale(svg, vertical=width is None)
+    return SvgScale(user_unit_mm / applied, user_unit_mm, unit, unit == "px")
+
+
+def svg_user_unit_mm(path: Path) -> tuple[float, str, bool]:
+    """How many millimetres one SVG user unit is, plus the declared unit.
+
+    ``ambiguous`` is True when the document gives no physical size, so the caller
+    must show the 96 dpi guess as an editable field rather than commit to it.
+    """
+    scale = svg_scale(path)
+    return scale.user_unit_mm, scale.unit, scale.ambiguous
 
 
 def _scan_svg_extras(path: Path) -> list[Issue]:
@@ -206,11 +318,18 @@ def import_svg(path: Path, options: ImportOptions) -> ImportResult:
     from ocpsvg import import_svg_document
 
     issues = _scan_svg_extras(path)
-    scale, declared_unit, ambiguous = svg_user_unit_mm(path)
+    sizing = svg_scale(path)
+    declared_unit, ambiguous = sizing.unit, sizing.ambiguous
+    scale, user_unit_mm = sizing.geometry, sizing.user_unit_mm
     if options.unit_override:
-        scale = TO_MM[options.unit_override.lower()]
+        # The override says what one user unit is, so it replaces the reading of
+        # the document, not the viewport transform ocpsvg already applied.
+        override = TO_MM[options.unit_override.lower()]
+        scale *= override / user_unit_mm if user_unit_mm else override
+        user_unit_mm = override
         ambiguous = False
     scale *= options.extra_scale
+    user_unit_mm *= options.extra_scale
 
     from ocpsvg import ColorAndLabel
 
@@ -238,7 +357,7 @@ def import_svg(path: Path, options: ImportOptions) -> ImportResult:
                     f"area to extrude. Outline the strokes at {width:g} mm to give "
                     "them area.",
                     blocking=True,
-                    detail={"suggested_width_mm": width * scale},
+                    detail={"suggested_width_mm": width * user_unit_mm},
                 )
             )
             profile = Profile(issues=issues)
@@ -448,6 +567,44 @@ _DXF_GEOMETRY_TYPES = {
 _DXF_TEXT_TYPES = {"TEXT", "MTEXT", "ATTDEF", "ATTRIB"}
 _DXF_SKIP_LAYERS = {"defpoints"}
 
+#: How far to follow block references into other block references.  Deep enough
+#: for any real drawing; a guard against a block that somehow inserts itself.
+_MAX_INSERT_DEPTH = 16
+
+
+def _exploded(entity, layer: str | None = None, depth: int = 0):
+    """Yield ``(entity, layer)`` for everything *entity* actually draws.
+
+    A block reference draws nothing itself - its geometry lives in the block
+    definition - so an INSERT is replaced by its transformed contents, and a
+    nested INSERT by its own.  Entities drawn on layer 0 inside a block take the
+    layer the block was inserted on, which is how AutoCAD has always resolved
+    them; anything on a named layer keeps it.
+    """
+    kind = entity.dxftype()
+    own = getattr(entity.dxf, "layer", "0")
+    resolved = layer if (own == "0" and layer is not None) else own
+    if kind != "INSERT":
+        yield entity, resolved
+        return
+    if depth >= _MAX_INSERT_DEPTH:
+        return
+    try:
+        # A MINSERT is one INSERT that draws its block on a grid.
+        # ``virtual_entities`` gives the contents of a single cell, so a 2x3
+        # array of pads imported as one pad; ``multi_insert`` gives one INSERT
+        # per cell, already placed, and each of those explodes normally.
+        if getattr(entity, "mcount", 1) > 1:
+            virtual = list(entity.multi_insert())
+        else:
+            virtual = list(entity.virtual_entities())
+    except Exception:
+        return  # a block Stamp cannot expand is skipped, not fatal
+    for sub in virtual:
+        yield from _exploded(sub, resolved, depth + 1)
+    for attrib in getattr(entity, "attribs", ()):
+        yield attrib, resolved
+
 
 def dxf_layers(path: Path) -> list[str]:
     """The layers that actually carry geometry, for the layer filter UI."""
@@ -456,8 +613,9 @@ def dxf_layers(path: Path) -> list[str]:
     doc = ezdxf.readfile(path)
     layers: dict[str, int] = {}
     for e in doc.modelspace():
-        if e.dxftype() in _DXF_GEOMETRY_TYPES:
-            layers[e.dxf.layer] = layers.get(e.dxf.layer, 0) + 1
+        for entity, layer in _exploded(e):
+            if entity.dxftype() in _DXF_GEOMETRY_TYPES:
+                layers[layer] = layers.get(layer, 0) + 1
     return sorted(layers)
 
 
@@ -515,28 +673,28 @@ def import_dxf(path: Path, options: ImportOptions) -> ImportResult:
     text_elsewhere = 0
     edges: list[TopoDS_Edge] = []
     msp = doc.modelspace()
-    for entity in msp:
-        kind = entity.dxftype()
-        layer = getattr(entity.dxf, "layer", "0")
-        selected = layer.lower() in wanted_set
-        if kind in _DXF_TEXT_TYPES:
-            if selected:
-                text_on_selected += 1
-            else:
-                text_elsewhere += 1
-            continue
-        if not selected or kind not in _DXF_GEOMETRY_TYPES:
-            continue
+    for top in msp:
+        for entity, layer in _exploded(top):
+            kind = entity.dxftype()
+            selected = layer.lower() in wanted_set
+            if kind in _DXF_TEXT_TYPES:
+                if selected:
+                    text_on_selected += 1
+                else:
+                    text_elsewhere += 1
+                continue
+            if not selected or kind not in _DXF_GEOMETRY_TYPES:
+                continue
 
-        try:
-            if kind == "HATCH":
-                paths = list(ezpath.from_hatch(entity))
-            else:
-                paths = [ezpath.make_path(entity)]
-        except Exception:
-            continue
-        for p in paths:
-            edges.extend(_edges_from_ezdxf_path(p, scale))
+            try:
+                if kind == "HATCH":
+                    paths = list(ezpath.from_hatch(entity))
+                else:
+                    paths = [ezpath.make_path(entity)]
+            except Exception:
+                continue
+            for p in paths:
+                edges.extend(_edges_from_ezdxf_path(p, scale))
 
     if text_on_selected:
         issues.append(
@@ -726,5 +884,6 @@ __all__ = [
     "import_profile",
     "import_svg",
     "parse_length",
+    "svg_scale",
     "svg_user_unit_mm",
 ]

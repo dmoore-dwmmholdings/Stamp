@@ -44,12 +44,24 @@ def shape_to_manifold(shape: TopoDS_Shape, deflection: float = 0.02, angle: floa
     verts, tris = triangulate(shape, deflection, angle)
     if len(verts) == 0 or len(tris) == 0:
         raise ValueError("The tool solid produced no triangles.")
-    return Manifold(
+    manifold = Manifold(
         Mesh(
             vert_properties=verts.astype(np.float32),
             tri_verts=tris.astype(np.uint32),
         )
     )
+    # manifold3d does not raise on a mesh it cannot use.  It hands back an empty
+    # solid and records why on status(), and an empty tool then makes every
+    # boolean downstream report that the feature removed the whole part - which
+    # sends the user off checking a depth and a direction that were never wrong.
+    status = manifold.status()
+    if getattr(status, "name", str(status)) != "NoError":
+        raise ValueError(
+            f"The tool solid did not tessellate into a closed shape "
+            f"({getattr(status, 'name', status)}). Try a finer mesh quality, or "
+            f"simplify the artwork."
+        )
+    return manifold
 
 
 def triangulate(
@@ -186,7 +198,10 @@ def decimate_for_display(manifold, target: int):
     if len(mesh.faces) <= target:
         return mesh
     try:
-        return mesh.simplify_quadric_decimation(target)
+        # Keyword, not positional: trimesh 5's first parameter is *percent*, so
+        # ``simplify_quadric_decimation(5000)`` asks for 5000x the faces it was
+        # given rather than 5000 of them.
+        return mesh.simplify_quadric_decimation(face_count=target)
     except Exception:
         return mesh
 

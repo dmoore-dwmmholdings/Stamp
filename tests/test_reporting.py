@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import sys
+
 import pytest
 
 pytest.importorskip("PySide6")
@@ -65,11 +67,24 @@ class TestMailtoLink:
         url = reporting.mailto_url(reporting.Report(kind="bug"), None)
         assert url.startswith(f"mailto:{reporting.SUPPORT_EMAIL}?")
 
-    def test_a_long_report_still_fits_the_command_line(self, started):
+    def test_a_long_report_still_fits_the_command_line(self, started, tmp_path):
         """Windows drops a link past about 2 kB, so a long report is cut."""
         report = reporting.Report(kind="bug", summary="s" * 300, detail="x" * 8000)
         url = reporting.mailto_url(report, None)
         assert len(url) <= reporting.MAX_URL
+
+        # And with the path of the full copy in the footer.  A log of short
+        # lines packs the body to within a character or two of the budget,
+        # which is where the newline joining the footer to the body used to be
+        # spent without ever having been counted - three characters once
+        # encoded, so the link came out over the limit it was measured against.
+        for line in range(200):
+            diagnostics.breadcrumb("%d", line)
+        attachment = tmp_path / "stamp-crash-20260101-120000.txt"
+        for budget in range(1400, 1500):
+            body = reporting.build_body(report, attachment, budget=budget)
+            assert reporting._encoded_length(body) <= budget, budget
+        assert len(reporting.mailto_url(report, attachment)) <= reporting.MAX_URL
 
     def test_what_the_user_typed_survives_the_budget(self, started):
         """The words a person wrote matter more than the log, so they go in first."""
@@ -92,6 +107,28 @@ class TestMailtoLink:
         body = reporting.build_body(report, target, budget=reporting.MAX_URL)
         assert str(target) in body
 
+    def test_no_length_of_report_pushes_the_link_over_the_limit(self, started, tmp_path):
+        """The footer used to be added after the budget had already been spent.
+
+        Every section was measured against the whole budget, the path of the
+        full copy was subtracted only once the log was reached, and the footer
+        went on at the end whether or not there was room - so a bug report of
+        about 1600 characters came out ninety over a limit Windows enforces by
+        dropping the link on the floor.  Swept over every length rather than
+        the one that was found, because the one that was found was an accident.
+        """
+        for line in range(300):
+            diagnostics.breadcrumb("import: part=bracket-%d.step faces=482", line)
+        attachment = tmp_path / "stamp-bug-20260101-120000.txt"
+        for length in range(0, 3001, 50):
+            report = reporting.Report(kind="bug", summary="s" * 80, detail="w" * length)
+            url = reporting.mailto_url(report, attachment)
+            assert len(url) <= reporting.MAX_URL, length
+            body = reporting.build_body(
+                report, attachment, budget=reporting.MAX_URL
+            )
+            assert "Full log:" in body, length
+
     def test_the_environment_fits_on_one_line(self, started):
         line = reporting.environment_line()
         assert "\n" not in line
@@ -99,10 +136,38 @@ class TestMailtoLink:
 
 
 class TestSend:
-    def test_send_writes_the_full_copy(self, started, qapp):
+    def test_send_writes_the_full_copy(self, started, qapp, monkeypatch):
+        """The file half of send(), with the mail client held shut.
+
+        send() ends in QDesktopServices.openUrl, which hands a real ``mailto:``
+        to the desktop and takes over the screen with a compose window.  That is
+        the point of the function and it is worth testing, but not on every run
+        of the suite - see the opens_email test below.  What this one is about is
+        the file that stands alone when the mail never opens, so the mail is
+        stubbed out and the file is checked.
+        """
+        opened = []
+        from PySide6.QtGui import QDesktopServices
+
+        monkeypatch.setattr(
+            QDesktopServices, "openUrl", lambda url: opened.append(url) or True
+        )
         result = reporting.send(reporting.Report(kind="bug", detail="hello"))
         assert result.path is not None and result.path.exists()
         assert "hello" in result.path.read_text(encoding="utf-8")
+        assert result.opened is True
+        assert opened and opened[0].toString().startswith("mailto:")
+
+    @pytest.mark.opens_email
+    def test_send_really_opens_the_mail_client(self, started, qapp):
+        """The whole path, including the compose window the user would see.
+
+        Deselected by default: it opens a real email.  Run it deliberately, on a
+        machine you are not sitting at or in a container - see README.
+        """
+        result = reporting.send(reporting.Report(kind="bug", detail="hello"))
+        assert result.path is not None and result.path.exists()
+        assert result.opened is True
 
 
 class TestReportFile:
@@ -115,56 +180,102 @@ class TestReportFile:
 
 
 class TestCrashFlag:
-    def test_a_clean_exit_leaves_no_crash_behind(self, tmp_path, monkeypatch):
+    @staticmethod
+    def _fresh(tmp_path, monkeypatch, name):
         import logging
 
         monkeypatch.setattr(diagnostics, "log_dir", lambda: tmp_path)
         monkeypatch.setattr(diagnostics, "_started", False)
         monkeypatch.setattr(diagnostics, "_crashed_before", False)
-        monkeypatch.setattr(diagnostics, "_log", logging.getLogger("stamp.flag.test"))
+        monkeypatch.setattr(diagnostics, "_log", logging.getLogger(name))
         diagnostics.start()
-        assert (tmp_path / diagnostics.RUNNING_NAME).exists()
+
+    def test_a_clean_exit_leaves_no_crash_behind(self, tmp_path, monkeypatch):
+        self._fresh(tmp_path, monkeypatch, "stamp.flag.test")
+        assert diagnostics.running_flag(tmp_path).exists()
         diagnostics.mark_clean_exit()
-        assert not (tmp_path / diagnostics.RUNNING_NAME).exists()
+        assert not diagnostics.running_flag(tmp_path).exists()
 
     def test_a_flag_left_behind_reports_a_crash(self, tmp_path, monkeypatch):
         """The flag stays when the process dies, thus the next start sees it."""
-        import logging
-
-        (tmp_path / diagnostics.RUNNING_NAME).write_text("running", encoding="utf-8")
-        monkeypatch.setattr(diagnostics, "log_dir", lambda: tmp_path)
-        monkeypatch.setattr(diagnostics, "_started", False)
-        monkeypatch.setattr(diagnostics, "_crashed_before", False)
-        monkeypatch.setattr(diagnostics, "_log", logging.getLogger("stamp.flag2.test"))
-        diagnostics.start()
+        (tmp_path / f"{diagnostics.RUNNING_PREFIX}999999{diagnostics.RUNNING_SUFFIX}").write_text(
+            "999999", encoding="utf-8"
+        )
+        self._fresh(tmp_path, monkeypatch, "stamp.flag2.test")
         assert diagnostics.previous_run_crashed()
 
     def test_a_second_window_is_not_a_crash(self, tmp_path, monkeypatch):
         """Two windows at once must not make either report a crash."""
-        import logging
         import os
 
-        (tmp_path / diagnostics.RUNNING_NAME).write_text(
+        diagnostics.running_flag(tmp_path, os.getpid()).write_text(
             str(os.getpid()), encoding="utf-8"
         )
-        monkeypatch.setattr(diagnostics, "log_dir", lambda: tmp_path)
-        monkeypatch.setattr(diagnostics, "_started", False)
-        monkeypatch.setattr(diagnostics, "_crashed_before", False)
-        monkeypatch.setattr(diagnostics, "_log", logging.getLogger("stamp.flag3.test"))
-        diagnostics.start()
+        self._fresh(tmp_path, monkeypatch, "stamp.flag3.test")
         assert not diagnostics.previous_run_crashed()
 
     def test_a_flag_from_a_dead_process_is_a_crash(self, tmp_path, monkeypatch):
-        import logging
-
         # A process id that is certainly not running.
-        (tmp_path / diagnostics.RUNNING_NAME).write_text("999999", encoding="utf-8")
-        monkeypatch.setattr(diagnostics, "log_dir", lambda: tmp_path)
-        monkeypatch.setattr(diagnostics, "_started", False)
-        monkeypatch.setattr(diagnostics, "_crashed_before", False)
-        monkeypatch.setattr(diagnostics, "_log", logging.getLogger("stamp.flag4.test"))
-        diagnostics.start()
+        diagnostics.running_flag(tmp_path, 999999).write_text("999999", encoding="utf-8")
+        self._fresh(tmp_path, monkeypatch, "stamp.flag4.test")
         assert diagnostics.previous_run_crashed()
+
+    def test_a_second_window_does_not_take_the_first_ones_flag(
+        self, tmp_path, monkeypatch
+    ):
+        """One shared file let the second window overwrite the first one's.
+
+        The first window then crashed and nobody was ever told: its flag had
+        already been replaced by a live process id, so the next start read the
+        flag as somebody else's window rather than as a crash.
+        """
+        import os
+
+        first = diagnostics.running_flag(tmp_path, 999999)
+        first.write_text("999999", encoding="utf-8")
+        self._fresh(tmp_path, monkeypatch, "stamp.flag5.test")
+        assert diagnostics.running_flag(tmp_path, os.getpid()).exists()
+        # The dead run was reported, and cleared so it is not reported twice.
+        assert diagnostics.previous_run_crashed()
+        assert not first.exists()
+
+    def test_a_live_flag_survives_this_window(self, tmp_path, monkeypatch):
+        """A window that is still open keeps its own flag when another starts."""
+        import os
+
+        other = diagnostics.running_flag(tmp_path, os.getpid())
+        other.write_text(str(os.getpid()), encoding="utf-8")
+        self._fresh(tmp_path, monkeypatch, "stamp.flag6.test")
+        assert other.exists()
+
+    @pytest.mark.skipif(
+        sys.platform == "win32", reason="Windows asks the kernel, not os.kill"
+    )
+    def test_a_flag_from_another_user_is_not_a_crash(self, tmp_path, monkeypatch):
+        """os.kill on somebody else's process raises rather than answering.
+
+        Read as "not running", a process owned by another user on a shared
+        machine turns into a crash report about a run that never happened.
+        """
+        import os
+
+        def refuse(pid, signal):
+            raise PermissionError(1, "Operation not permitted")
+
+        monkeypatch.setattr(os, "kill", refuse)
+        diagnostics.running_flag(tmp_path, 4242).write_text("4242", encoding="utf-8")
+        self._fresh(tmp_path, monkeypatch, "stamp.flag7.test")
+        assert not diagnostics.previous_run_crashed()
+
+    def test_the_flag_an_older_stamp_left_still_reports_a_crash(
+        self, tmp_path, monkeypatch
+    ):
+        """Upgrading over a crashed run must not lose the crash."""
+        legacy = tmp_path / diagnostics.RUNNING_NAME
+        legacy.write_text("999999", encoding="utf-8")
+        self._fresh(tmp_path, monkeypatch, "stamp.flag8.test")
+        assert diagnostics.previous_run_crashed()
+        assert not legacy.exists()
 
 
 class TestLogFallback:

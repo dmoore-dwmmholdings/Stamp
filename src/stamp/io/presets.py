@@ -10,6 +10,7 @@ from pathlib import Path
 from PySide6.QtCore import QStandardPaths
 
 from stamp.core.document import Anchor, Feature
+from stamp.io import with_extension
 
 EXTENSION = ".stamp-preset"
 METADATA = "preset.json"
@@ -51,9 +52,7 @@ def library_dir() -> Path:
 def save_preset(
     feature: Feature, path: str | Path | None = None, *, tags: list[str] | tuple[str, ...] | None = None
 ) -> Path:
-    path = Path(path) if path else library_dir() / f"{feature.name}{EXTENSION}"
-    if path.suffix != EXTENSION:
-        path = path.with_suffix(EXTENSION)
+    path = with_extension(path or library_dir() / f"{feature.name}{EXTENSION}", EXTENSION)
     payload = feature.to_dict()
     with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as archive:
         archive.writestr("feature.json", json.dumps(payload, indent=2))

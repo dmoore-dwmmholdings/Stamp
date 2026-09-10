@@ -625,6 +625,11 @@ class ProfileRef:
     unit_scale: float = 1.0  # extra scale the user applied at import
     join_tolerance: float = 0.01
     union_overlapping: bool = False
+    #: Whether the import bridged gaps to close a loop that the file left open.
+    #: It is a repair the user accepted at import time and it changes the shape of
+    #: the result, so the project has to remember it: without it a feature that
+    #: rebuilt fine when it was saved comes back blocked on the next open.
+    close_open_loops: bool = False
     #: Keep a filled backdrop the importer would otherwise drop.  An import-time
     #: option, so it is part of the cache key like the others.
     keep_background: bool = False
@@ -654,6 +659,7 @@ class ProfileRef:
             "unit_scale": self.unit_scale,
             "join_tolerance": self.join_tolerance,
             "union_overlapping": self.union_overlapping,
+            "close_open_loops": self.close_open_loops,
             "keep_background": self.keep_background,
         }
 
@@ -669,6 +675,9 @@ class ProfileRef:
             unit_scale=float(d.get("unit_scale", 1.0)),
             join_tolerance=float(d.get("join_tolerance", 0.01)),
             union_overlapping=bool(d.get("union_overlapping", False)),
+            # Absent in projects written before the repair was recorded, and False
+            # is what those files were imported with, so old projects are unchanged.
+            close_open_loops=bool(d.get("close_open_loops", False)),
             keep_background=bool(d.get("keep_background", False)),
             text=TextSpec.from_dict(d["text"]) if d.get("text") else None,
             code=CodeSpec.from_dict(d["code"]) if d.get("code") else None,
@@ -685,6 +694,7 @@ class ProfileRef:
             self.unit_scale,
             self.join_tolerance,
             self.union_overlapping,
+            self.close_open_loops,
             self.keep_background,
         )
 
@@ -798,6 +808,11 @@ class Feature:
                     across = -dx * math.sin(radians) + dy * math.cos(radians)
                     copy.placement.offset_2d = (cx + along * math.cos(radians) + across * math.sin(radians),
                                                 cy + along * math.sin(radians) - across * math.cos(radians))
+                    # Reflecting the placement is not just flipping the artwork: a
+                    # seed turned by θ comes back turned by 2α - θ, where α is the
+                    # mirror line.  Toggling the flip and leaving the rotation alone
+                    # puts the copy somewhere the mirror never would.
+                    copy.placement.rotation = 2.0 * spec.axis_angle - copy.placement.rotation
                     copy.placement.mirror_v = not copy.placement.mirror_v
             copies.append(copy)
         return copies
@@ -955,6 +970,33 @@ class BasePart:
     def diagonal(self) -> float:
         dx, dy, dz = self.size
         return (dx * dx + dy * dy + dz * dz) ** 0.5
+
+    def adopt_runtime(self, other: BasePart | None, *, require_match: bool = True) -> bool:
+        """Take the live geometry from *other*, which is the same part reloaded.
+
+        Every JSON round trip - the undo stack, the copy the rebuild worker sends
+        across the thread boundary - drops the geometry, because the geometry is
+        deliberately not in the file.  Re-attaching only ``runtime`` is not enough
+        for a multi-part file: the pieces in :attr:`parts` each carry their own
+        geometry, and without it a rebuild finds nothing to work on and quietly
+        produces nothing at all.
+
+        The hash and the mode have to agree, otherwise this is a *different* part
+        wearing the same record - which is what an undo across "Replace part"
+        hands us - and attaching that geometry would leave the document describing
+        one part and holding another.  Refusing leaves ``runtime`` at None, and
+        the rebuild says the part needs reloading.
+        """
+        if other is None:
+            return False
+        if require_match and (other.source_hash != self.source_hash or other.mode != self.mode):
+            return False
+        self.runtime = other.runtime
+        by_index = {p.index: p for p in other.parts}
+        for part in self.parts:
+            twin = by_index.get(part.index)
+            part.runtime = twin.runtime if twin is not None else None
+        return True
 
 
 
@@ -1150,7 +1192,7 @@ class Document:
         return self.to_dict()
 
     def restore(self, snap: dict[str, Any]) -> None:
-        runtime = self.base.runtime if self.base else None
+        previous = self.base
         other = Document.from_dict(snap)
         self.name = other.name
         self.units = other.units
@@ -1160,7 +1202,9 @@ class Document:
         self.datums = other.datums
         self.transform = other.transform
         if other.base is not None:
-            other.base.runtime = runtime
+            # Only when it is the same part: undoing across "Replace part" restores
+            # the record of the *old* part, and the geometry in hand is the new one.
+            other.base.adopt_runtime(previous)
         self.base = other.base
 
 

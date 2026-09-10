@@ -709,6 +709,19 @@ def _faceify(profile: Profile, loop_component: Sequence[str] | None = None) -> N
     profile.face_component = face_component if len(face_component) == len(faces) else []
 
 
+def _kept_issues(issues: Sequence[Issue], drop_crossing_issues: bool) -> list[Issue]:
+    """The issues a rebuilt profile inherits.
+
+    A self-intersection is only answered by the 2D union, so only the union drops
+    those.  Merely *resolving* two other overlapping faces leaves the crossing
+    loop exactly as broken as it was, and dropping its issue there is what made a
+    bow tie disappear from a file with an overlap in it without a word.
+    """
+    if not drop_crossing_issues:
+        return list(issues)
+    return [i for i in issues if i.kind is not IssueKind.SELF_INTERSECTION]
+
+
 def _oriented(wire: TopoDS_Wire, *, ccw: bool) -> TopoDS_Wire:
     """Return the wire with the winding a face outer/inner boundary expects."""
 
@@ -746,6 +759,9 @@ def _center(profile: Profile) -> None:
     for loop in profile.loops:
         loop.wire = TopoDS.Wire_s(BRepBuilderAPI_Transform(loop.wire, trsf, True).Shape())
         loop.polyline = [(x + dx, y + dy) for x, y in loop.polyline]
+    # The repair dialog draws these on top of the profile, so they move with it.
+    for issue in profile.issues:
+        issue.points = [(x + dx, y + dy) for x, y in issue.points]
 
 
 def _bbox(profile: Profile) -> None:
@@ -794,15 +810,26 @@ def _faces_overlap(profile: Profile) -> bool:
     return False
 
 
-def _contours_of(profile: Profile, keys: Sequence[str] | None = None):
+def _contours_of(
+    profile: Profile, keys: Sequence[str] | None = None, *, include_crossing: bool = False
+):
     """Loop polylines wound the way the non-zero fill rule wants them.
 
     Outer loops counter-clockwise, holes clockwise, so a hole covered by another
     element correctly becomes material again.
+
+    A loop that crosses itself has no meaningful winding and never becomes a
+    face, so it is left out - except for :func:`union_overlapping`, whose whole
+    job is to merge those, which asks for them with *include_crossing*.
     """
     contours: list[list[tuple[float, float]]] = []
     for i, loop in enumerate(profile.loops):
-        if not loop.closed or not loop.valid or len(loop.polyline) < 3:
+        if not loop.closed or len(loop.polyline) < 3:
+            continue
+        if not loop.valid:
+            if not include_crossing:
+                continue
+            contours.append(list(loop.polyline))
             continue
         if keys is not None and (i >= len(keys) or keys[i] is None):
             continue
@@ -840,13 +867,19 @@ def _resolve_overlaps(profile: Profile, loop_component: Sequence[str] | None = N
         if not contours:
             return profile
         section = CrossSection(contours, FillRule.NonZero).simplify(1e-6)
-        merged = _profile_from_cross_section(section, profile.issues, profile.source_units)
+        # Not centred: the crossing loops carried back in are still in source
+        # coordinates, and re-centring the merged faces on their own bbox first
+        # would slide them out from under those.  normalize_wire_groups centres
+        # the whole thing once this returns.
+        merged = _profile_from_cross_section(
+            section, profile.issues, profile.source_units, center=False
+        )
         if not merged.faces:
             return profile
         merged.components = list(profile.components)
         merged.face_component = [_only_key(profile)] * len(merged.faces)
         merged.loop_component = [_only_key(profile)] * len(merged.loops)
-        return merged
+        return _carry_crossings(profile, merged)
 
     sections = {}
     for key in order:
@@ -874,7 +907,35 @@ def _resolve_overlaps(profile: Profile, loop_component: Sequence[str] | None = N
 
     if not parts:
         return profile
-    return _merge_components(parts, profile.issues, profile.source_units)
+    return _carry_crossings(
+        profile, _merge_components(parts, profile.issues, profile.source_units)
+    )
+
+
+def _carry_crossings(source: Profile, resolved: Profile) -> Profile:
+    """Put the loops that cross themselves back into a resolved profile.
+
+    Resolution rebuilds the profile from the contours that could be faced, so a
+    crossing loop is not in the result at all.  It never was a face and it must
+    not become one, but it has to still be there: the repair dialog points at it,
+    and "union overlapping loops" is what finally merges it.  Without this it
+    vanished from any file where two *other* elements happened to overlap.
+    """
+    keys = source.loop_keys()
+    for index, loop in enumerate(source.loops):
+        if loop.valid or not loop.closed:
+            continue
+        key = keys[index] if index < len(keys) else SINGLE_COMPONENT
+        resolved.parent.append(-1)
+        resolved.depth.append(0)
+        if len(resolved.loop_component) == len(resolved.loops):
+            resolved.loop_component.append(key)
+        resolved.loops.append(loop)
+        if resolved.components and resolved.component(key) is None:
+            component = source.component(key)
+            if component is not None:
+                resolved.components.append(component)
+    return resolved
 
 
 def _only_key(profile: Profile) -> str:
@@ -882,7 +943,11 @@ def _only_key(profile: Profile) -> str:
 
 
 def _merge_components(
-    parts: Sequence[tuple[Component, Profile]], issues: list[Issue], units: str
+    parts: Sequence[tuple[Component, Profile]],
+    issues: list[Issue],
+    units: str,
+    *,
+    drop_crossing_issues: bool = False,
 ) -> Profile:
     """Stitch the separately resolved components back into one profile.
 
@@ -890,7 +955,7 @@ def _merge_components(
     are appended; everything downstream reads those as one flat list.
     """
     merged = Profile(
-        issues=[i for i in issues if i.kind is not IssueKind.SELF_INTERSECTION],
+        issues=_kept_issues(issues, drop_crossing_issues),
         source_units=units,
     )
     for component, piece in parts:
@@ -1017,12 +1082,16 @@ def union_overlapping(profile: Profile) -> Profile:
     """
     from manifold3d import CrossSection, FillRule
 
-    polys = [loop.polyline for loop in profile.loops if loop.closed and len(loop.polyline) >= 3]
-    polys = [p for p in polys if abs(polygon_area(p)) > 0.0 or self_intersections(p)]
-    if not polys:
+    # Wound by depth, exactly as :func:`_resolve_overlaps` does it.  Fed the raw
+    # polylines instead, a hole that happened to be drawn the same way round as
+    # its outer loop counted as material under the non-zero rule and filled in.
+    contours = _contours_of(profile, include_crossing=True)
+    if not contours:
         return profile
-    section = CrossSection(polys, FillRule.NonZero).simplify(1e-6)
-    return _profile_from_cross_section(section, profile.issues, profile.source_units)
+    section = CrossSection(contours, FillRule.NonZero).simplify(1e-6)
+    return _profile_from_cross_section(
+        section, profile.issues, profile.source_units, drop_crossing_issues=True
+    )
 
 
 #: Number of segments used to draw a round join or cap when outlining a stroke.
@@ -1107,7 +1176,12 @@ def _disc(center, radius: float, segments: int = STROKE_CAP_SEGMENTS) -> list[tu
 
 
 def _profile_from_cross_section(
-    section, issues: list[Issue], units: str, *, center: bool = True
+    section,
+    issues: list[Issue],
+    units: str,
+    *,
+    center: bool = True,
+    drop_crossing_issues: bool = False,
 ) -> Profile:
     """Convert a manifold3d CrossSection back into OCC wires and faces.
 
@@ -1128,7 +1202,7 @@ def _profile_from_cross_section(
         if maker.IsDone():
             wires.append(maker.Wire())
 
-    kept = [i for i in issues if i.kind is not IssueKind.SELF_INTERSECTION]
+    kept = _kept_issues(issues, drop_crossing_issues)
     # The cross section is already a resolved region, so re-running the overlap pass
     # on it would only recurse back into this function.
     return normalize_wire_groups(

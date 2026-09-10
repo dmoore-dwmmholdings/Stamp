@@ -228,6 +228,7 @@ def _run_boolean(base, tool, kind: str, fuzzy: float, collect_history: bool):
 def classify_feature_edges(
     tool: TopoDS_Shape,
     direction: tuple[float, float, float],
+    axis: tuple[tuple[float, float, float], tuple[float, float, float]] | None = None,
 ) -> dict[EdgeRole, list[TopoDS_Edge]]:
     """Sort a tool solid's edges into top, bottom and side sets.
 
@@ -236,11 +237,17 @@ def classify_feature_edges(
     whatever start offset the symmetric mode or the contact overlap introduced, and
     it is derived only from the profile and the placement - so it comes out
     identical on every rebuild, which is the property §8.3 asks for.
+
+    *axis* is the axis of the face a wrapped tool was rolled onto, from
+    :attr:`ToolSolid.axis`.  A wrapped tool is sorted by radius instead; see
+    :func:`_classify_radial_edges`.
     """
     dx, dy, dz = direction
     edges = edges_of(tool)
     if not edges:
         return {EdgeRole.TOP: [], EdgeRole.BOTTOM: [], EdgeRole.SIDE: []}
+    if axis is not None:
+        return _classify_radial_edges(edges, direction, axis)
 
     positions = []
     for edge in edges:
@@ -268,6 +275,68 @@ def classify_feature_edges(
             groups[EdgeRole.SIDE].append(edge)
     return groups
 
+
+def _classify_radial_edges(
+    edges: list[TopoDS_Edge],
+    direction: tuple[float, float, float],
+    axis: tuple[tuple[float, float, float], tuple[float, float, float]],
+) -> dict[EdgeRole, list[TopoDS_Edge]]:
+    """Sort a wrapped tool's edges by their distance from the face's axis.
+
+    A wrapped feature has no one direction to measure along.  Its walls are radial,
+    so the top of the mark is a piece of one cylinder and the bottom a piece of a
+    smaller one, and both of them curve right across the sketch plane normal that
+    the planar sweep measures against.  Measured that way the far corners of the top
+    sit lower than the near corners of the bottom, and a four-sided wrapped mark
+    comes out with three top edges and five bottom ones - which then rounds the
+    wrong things.  Radius tells the two apart exactly.
+
+    Which radius is the *top* follows the sweep, exactly as it does on a flat face:
+    it is the end the feature grows towards, so the outer cylinder for a boss and
+    the floor of the pocket for a cut.
+    """
+    (ox, oy, oz), (ax, ay, az) = axis
+
+    def radial(point) -> tuple[float, float, float]:
+        dx, dy, dz = point[0] - ox, point[1] - oy, point[2] - oz
+        along = dx * ax + dy * ay + dz * az
+        return (dx - along * ax, dy - along * ay, dz - along * az)
+
+    radii: list[float] = []
+    units: list[tuple[float, float, float]] = []
+    outward = 0.0
+    for edge in edges:
+        p = edge_midpoint(edge)
+        rx, ry, rz = radial((p.X(), p.Y(), p.Z()))
+        r = math.sqrt(rx * rx + ry * ry + rz * rz)
+        radii.append(r)
+        unit = (rx / r, ry / r, rz / r) if r > 1e-9 else (0.0, 0.0, 0.0)
+        units.append(unit)
+        outward += direction[0] * unit[0] + direction[1] * unit[1] + direction[2] * unit[2]
+    low, high = min(radii), max(radii)
+    tol = max((high - low) * 0.05, 1e-6)
+    grows_outward = outward >= 0
+
+    groups: dict[EdgeRole, list[TopoDS_Edge]] = {
+        EdgeRole.TOP: [],
+        EdgeRole.BOTTOM: [],
+        EdgeRole.SIDE: [],
+    }
+    for edge, r, unit in zip(edges, radii, units, strict=True):
+        tangent = edge_tangent(edge)
+        if abs(tangent[0] * unit[0] + tangent[1] * unit[1] + tangent[2] * unit[2]) > 0.9:
+            groups[EdgeRole.SIDE].append(edge)  # a wall edge, running straight out
+            continue
+        outer, inner = r > high - tol, r < low + tol
+        far = outer if grows_outward else inner
+        near = inner if grows_outward else outer
+        if far:
+            groups[EdgeRole.TOP].append(edge)
+        elif near:
+            groups[EdgeRole.BOTTOM].append(edge)
+        else:
+            groups[EdgeRole.SIDE].append(edge)
+    return groups
 
 
 def edges_reach_shape(
@@ -306,10 +375,11 @@ def select_edges(
     tool: TopoDS_Shape,
     modifier: Modifier,
     direction: tuple[float, float, float],
+    axis: tuple[tuple[float, float, float], tuple[float, float, float]] | None = None,
 ) -> list[TopoDS_Edge]:
     """Resolve a modifier's :class:`EdgeSelector` against a tool solid."""
     role = modifier.target.role
-    groups = classify_feature_edges(tool, direction)
+    groups = classify_feature_edges(tool, direction, axis)
 
     if role is EdgeRole.ALL:
         return edges_of(tool)
@@ -354,6 +424,7 @@ def find_blend_edges(
     *,
     tolerance: float = 1e-4,
     min_length: float = 0.0,
+    axis: tuple[tuple[float, float, float], tuple[float, float, float]] | None = None,
 ) -> list[TopoDS_Edge]:
     """Find the edges where the feature meets the base surface - the §6.4B targets.
 
@@ -384,7 +455,7 @@ def find_blend_edges(
     if tool is None or direction is None:
         return []
 
-    bottom = classify_feature_edges(tool, direction)[EdgeRole.BOTTOM]
+    bottom = classify_feature_edges(tool, direction, axis)[EdgeRole.BOTTOM]
     if not bottom:
         return []
     wanted = []

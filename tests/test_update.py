@@ -13,6 +13,8 @@ import contextlib
 import hashlib
 import json
 import os
+import pathlib
+import sys
 from base64 import b64encode
 
 import pytest
@@ -72,9 +74,41 @@ class TestComparingVersions:
     def test_a_short_version_is_padded(self):
         assert update.parse_version("2") == update.parse_version("2.0.0")
 
+    def test_a_suffix_with_no_dash_is_still_a_pre_release(self):
+        """1.5.0rc1 read "rc1" as the patch number and sorted above 1.5.0."""
+        assert update.parse_version("1.5.0rc1") < update.parse_version("1.5.0")
+        assert update.parse_version("1.5.0rc1") > update.parse_version("1.4.9")
+
+    def test_the_pre_releases_of_one_version_are_ordered_among_themselves(self):
+        """Every pre-release of 1.6.0 used to compare equal to every other.
+
+        "1.6.0-rc1" and "1.6.0-rc2" came out as the same version, so rc2 was
+        not an update from rc1 and withdrawing rc1 withdrew rc2 with it.  The
+        tail is carried as its own part of the version now, tag and number.
+        """
+        ordered = ["1.6.0-alpha", "1.6.0-beta2", "1.6.0-rc1", "1.6.0-rc2",
+                   "1.6.0-rc10", "1.6.0", "1.9.0", "1.10.0"]
+        parsed = [update.parse_version(v) for v in ordered]
+        assert parsed == sorted(parsed)
+        assert len(set(parsed)) == len(parsed)
+
+    def test_the_same_version_written_three_ways_is_one_version(self):
+        assert update.parse_version("1.6.0rc1") == update.parse_version("1.6.0-rc1")
+        assert update.parse_version("1.6.0.rc1") == update.parse_version("1.6.0-rc1")
+
+    def test_build_metadata_is_not_a_different_release(self):
+        """"+build5" says how a release was built, not which release it is."""
+        assert update.parse_version("1.6.0+build5") == update.parse_version("1.6.0")
+        assert update.parse_version("1.6.0-rc1+build5") == update.parse_version("1.6.0-rc1")
+
+    def test_a_tail_behind_a_dot_is_still_a_pre_release(self):
+        """1.6.0.rc1 was read as a final release and offered over 1.6.0."""
+        assert update.parse_version("1.6.0.rc1") < update.parse_version("1.6.0")
+
     def test_nonsense_does_not_raise(self):
         """A feed is remote input; it must not be able to crash the check."""
-        assert update.parse_version("") == (0, 0, 0, 1)
+        assert update.parse_version("") == (0, 0, 0, 1, "", 0)
+        assert update.parse_version("not a version") < update.parse_version("0.0.1")
 
 
 class TestTrustingTheManifest:
@@ -161,6 +195,24 @@ class TestWhatItOffers:
             release = update.check("1.4.0", url)
         assert release is not None and release.urgent
 
+    def test_a_withdrawal_written_with_a_v_still_counts(self, keypair, tmp_path):
+        """The tag is v1.4.0 and the build calls itself 1.4.0.
+
+        Compared as strings, a manifest that withdraws the tag name withdrew
+        nothing at all and the person stayed on the bad build.
+        """
+        private, public = keypair
+        url = _publish(tmp_path, private, _manifest("1.6.0", revoked=["v1.4.0"]))
+        with _key(public):
+            release = update.check("1.4.0", url)
+        assert release is not None and release.urgent
+
+    def test_a_newest_release_withdrawn_by_tag_is_not_offered(self, keypair, tmp_path):
+        private, public = keypair
+        url = _publish(tmp_path, private, _manifest("1.5.0", revoked=["v1.5.0"]))
+        with _key(public):
+            assert update.check("1.4.0", url) is None
+
     def test_below_the_minimum_is_urgent_too(self, keypair, tmp_path):
         private, public = keypair
         url = _publish(
@@ -236,6 +288,37 @@ class TestDownloading:
         update.download(release.artifact, tmp_path / "into", progress=lambda *a: seen.append(a))
         assert seen and seen[-1][0] == installer.stat().st_size
 
+    def test_a_download_longer_than_the_manifest_is_stopped_in_the_loop(
+        self, keypair, tmp_path, installer
+    ):
+        """Reading to EOF is reading as much as the server wants to send."""
+        private, public = keypair
+        manifest = _manifest("9.9.9", installer)
+        entry = manifest["artifacts"][update.platform_key()]
+        entry["size"] = 64
+        url = _publish(tmp_path, private, manifest)
+        with _key(public):
+            release = update.check("1.4.0", url)
+
+        with pytest.raises(update.UpdateError, match="longer than"):
+            update.download(release.artifact, tmp_path / "into")
+
+    def test_an_artifact_of_no_stated_size_is_capped(
+        self, keypair, tmp_path, installer, monkeypatch
+    ):
+        """A size of zero left the loop with nothing to stop it at all."""
+        private, public = keypair
+        manifest = _manifest("9.9.9", installer)
+        entry = manifest["artifacts"][update.platform_key()]
+        entry["size"] = 0
+        url = _publish(tmp_path, private, manifest)
+        with _key(public):
+            release = update.check("1.4.0", url)
+        monkeypatch.setattr(update, "MAX_ARTIFACT_BYTES", 128)
+
+        with pytest.raises(update.UpdateError, match="longer than"):
+            update.download(release.artifact, tmp_path / "into")
+
     def test_cancelling_leaves_nothing_behind(self, keypair, tmp_path, installer):
         private, public = keypair
         url = _publish(tmp_path, private, _manifest("9.9.9", installer))
@@ -248,11 +331,178 @@ class TestDownloading:
         assert not (tmp_path / "into" / installer.name).exists()
 
 
+class TestTidyingUp:
+    """A download nobody installs is a hundred megabytes left in %TEMP%."""
+
+    @pytest.fixture
+    def installer(self, tmp_path):
+        path = tmp_path / "Stamp-9.9.9-Setup.exe"
+        path.write_bytes(b"pretend this is an installer" * 500)
+        return path
+
+    def _download(self, keypair, tmp_path, installer):
+        private, public = keypair
+        url = _publish(tmp_path, private, _manifest("9.9.9", installer))
+        with _key(public):
+            release = update.check("1.4.0", url)
+        return update.download(release.artifact, tmp_path / "into")
+
+    def test_a_second_download_clears_what_the_first_left(
+        self, keypair, tmp_path, installer
+    ):
+        """Skip, later, or quit without installing all used to leave one."""
+        first = self._download(keypair, tmp_path, installer)
+        second = self._download(keypair, tmp_path, installer)
+        assert second.exists()
+        assert not first.parent.exists()
+        assert [p.name for p in (tmp_path / "into").iterdir()] == [second.parent.name]
+
+    def test_what_was_swept_is_no_longer_a_file_stamp_would_run(
+        self, keypair, tmp_path, installer, monkeypatch
+    ):
+        """The hash goes with the file, or that path stays runnable forever."""
+        first = self._download(keypair, tmp_path, installer)
+        self._download(keypair, tmp_path, installer)
+        first.parent.mkdir(parents=True, exist_ok=True)
+        first.write_bytes(b"anything at all")
+        monkeypatch.setattr(sys, "platform", "win32")
+        with pytest.raises(update.UpdateError, match="does not know"):
+            update.install(first)
+
+    def test_discarding_takes_the_directory_with_it(
+        self, keypair, tmp_path, installer
+    ):
+        """What the UI calls when the user skips or closes without installing."""
+        got = self._download(keypair, tmp_path, installer)
+        update.discard(got)
+        assert not got.exists()
+        assert not got.parent.exists()
+        assert list((tmp_path / "into").iterdir()) == []
+
+    def test_discarding_forgets_the_hash_as_well(
+        self, keypair, tmp_path, installer, monkeypatch
+    ):
+        got = self._download(keypair, tmp_path, installer)
+        update.discard(got)
+        got.parent.mkdir(parents=True, exist_ok=True)
+        got.write_bytes(b"anything at all")
+        monkeypatch.setattr(sys, "platform", "win32")
+        with pytest.raises(update.UpdateError, match="does not know"):
+            update.install(got)
+
+    def test_discarding_a_file_stamp_did_not_place_leaves_the_folder(
+        self, tmp_path
+    ):
+        """Only the directories Stamp made are Stamp's to remove."""
+        elsewhere = tmp_path / "Downloads"
+        elsewhere.mkdir()
+        stray = elsewhere / "Stamp-Setup.exe"
+        stray.write_bytes(b"anything at all")
+        update.discard(stray)
+        assert not stray.exists()
+        assert elsewhere.exists()
+
+
+class TestInstalling:
+    """What is run has to be what was checked, at the moment it is run."""
+
+    @pytest.fixture
+    def installer(self, tmp_path):
+        path = tmp_path / "Stamp-9.9.9-Setup.exe"
+        path.write_bytes(b"pretend this is an installer" * 500)
+        return path
+
+    def _downloaded(self, keypair, tmp_path, installer):
+        private, public = keypair
+        url = _publish(tmp_path, private, _manifest("9.9.9", installer))
+        with _key(public):
+            release = update.check("1.4.0", url)
+        return update.download(release.artifact, tmp_path / "into")
+
+    def test_the_download_lands_somewhere_nobody_can_name_in_advance(
+        self, keypair, tmp_path, installer
+    ):
+        """A fixed path is a file anything on the machine can swap out.
+
+        "Install when I quit" leaves the verified installer on disk for as long
+        as the user keeps working, and %TEMP%\\stamp-update\\<name> is a path
+        anyone could write to before that.
+        """
+        got = self._downloaded(keypair, tmp_path, installer)
+        assert got != tmp_path / "into" / installer.name
+        assert got.parent.name.startswith("stamp-update-")
+
+    def test_an_installer_changed_after_the_check_is_not_run(
+        self, keypair, tmp_path, installer, monkeypatch
+    ):
+        got = self._downloaded(keypair, tmp_path, installer)
+        started: list[list[str]] = []
+        monkeypatch.setattr(sys, "platform", "win32")
+        monkeypatch.setattr(
+            update.subprocess, "Popen", lambda cmd, **kw: started.append(cmd)
+        )
+        got.write_bytes(b"\x00" * got.stat().st_size)
+
+        with pytest.raises(update.UpdateError, match="changed after"):
+            update.install(got)
+        assert started == []
+        assert not got.exists()
+
+    def test_the_installer_that_was_checked_is_run(
+        self, keypair, tmp_path, installer, monkeypatch
+    ):
+        got = self._downloaded(keypair, tmp_path, installer)
+        started: list[list[str]] = []
+        monkeypatch.setattr(sys, "platform", "win32")
+        monkeypatch.setattr(
+            update.subprocess, "Popen", lambda cmd, **kw: started.append(cmd)
+        )
+        update.install(got)
+        assert started and started[0][0] == str(got)
+
+    def test_a_file_stamp_never_checked_is_refused(self, tmp_path, monkeypatch):
+        stray = tmp_path / "Stamp-Setup.exe"
+        stray.write_bytes(b"anything at all")
+        monkeypatch.setattr(sys, "platform", "win32")
+        monkeypatch.setattr(update, "_verified", {})
+        with pytest.raises(update.UpdateError, match="does not know"):
+            update.install(stray)
+
+
 class TestWhereItWillAct:
     def test_it_only_fetches_over_https(self, tmp_path):
         """A manifest may name the URL to download; it may not name any scheme."""
         artifact = update.Artifact(
             name="x", url="http://example.invalid/x", size=1, sha256="00"
+        )
+        with pytest.raises(update.UpdateError, match="HTTPS"):
+            update.download(artifact, tmp_path)
+
+    def test_a_shipped_build_reads_no_feed_but_its_own(self, monkeypatch):
+        """An environment variable is not a trusted thing in a frozen build.
+
+        Anything that can set one could otherwise point Stamp at a feed of its
+        own signed with a key of its own, and both signature checks this module
+        exists for would pass.
+        """
+        monkeypatch.setenv("STAMP_UPDATE_FEED", "https://example.invalid/feed.json")
+        monkeypatch.setenv("STAMP_UPDATE_PUBLIC_KEY", "A" * 44)
+        monkeypatch.setattr(sys, "frozen", True, raising=False)
+        assert update.feed_url() == update.FEED_URL
+        assert update.public_key() == update.RELEASE_PUBLIC_KEY
+
+    def test_a_source_checkout_still_takes_the_override(self, monkeypatch):
+        """Which is what lets these tests serve a real signed feed."""
+        monkeypatch.delattr(sys, "frozen", raising=False)
+        monkeypatch.setenv("STAMP_UPDATE_FEED", "https://example.invalid/feed.json")
+        assert update.feed_url() == "https://example.invalid/feed.json"
+
+    def test_a_shipped_build_does_not_read_a_feed_off_the_disk(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.setattr(sys, "frozen", True, raising=False)
+        artifact = update.Artifact(
+            name="x", url=(tmp_path / "x").as_uri(), size=1, sha256="00"
         )
         with pytest.raises(update.UpdateError, match="HTTPS"):
             update.download(artifact, tmp_path)
@@ -285,3 +535,66 @@ def _key(value: str):
             os.environ.pop("STAMP_UPDATE_PUBLIC_KEY", None)
         else:
             os.environ["STAMP_UPDATE_PUBLIC_KEY"] = was
+
+
+def _make_manifest_module():
+    """packaging/ is a directory of scripts, not an installed package."""
+    import importlib.util
+
+    here = pathlib.Path(__file__).resolve().parent.parent
+    spec = importlib.util.spec_from_file_location(
+        "stamp_make_manifest", here / "packaging" / "make_manifest.py"
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+class TestTheManifestTheWorkflowWrites:
+    """What gets signed has to be the build the release is called after."""
+
+    @pytest.fixture
+    def make_manifest(self):
+        return _make_manifest_module()
+
+    def test_the_installer_carrying_the_version_is_the_one_signed(
+        self, make_manifest, tmp_path
+    ):
+        """Sorted-first signed whichever name came first alphabetically.
+
+        A tag rebuilt over a release that already had an installer leaves two
+        on the same release, and the manifest then said 1.7.0 over the bytes of
+        1.6.0.
+        """
+        (tmp_path / "Stamp-1.6.0-Setup.exe").write_bytes(b"old")
+        (tmp_path / "Stamp-1.7.0-Setup.exe").write_bytes(b"new")
+        (tmp_path / "Stamp-1.7.0-macos-arm64.dmg").write_bytes(b"arm")
+        (tmp_path / "Stamp-1.7.0-macos-x86_64.dmg").write_bytes(b"intel")
+
+        manifest, found = make_manifest.build(
+            "1.7.0", "v1.7.0", tmp_path, "owner/Stamp"
+        )
+        assert manifest["artifacts"]["windows-x86_64"]["name"] == "Stamp-1.7.0-Setup.exe"
+        assert len(found) == 3
+
+    def test_an_installer_of_another_version_is_not_signed_as_this_one(
+        self, make_manifest, tmp_path
+    ):
+        """A dispatch that built main and named an older tag ends here."""
+        (tmp_path / "Stamp-1.6.0-Setup.exe").write_bytes(b"old")
+
+        with pytest.raises(make_manifest.ManifestError, match="disagree"):
+            make_manifest.build("1.7.0", "v1.7.0", tmp_path, "owner/Stamp")
+
+    def test_a_missing_platform_stops_the_feed(self, make_manifest, tmp_path):
+        """A feed published over a failed job offers a download nobody built."""
+        (tmp_path / "Stamp-1.7.0-Setup.exe").write_bytes(b"win")
+
+        with pytest.raises(make_manifest.ManifestError, match="No installer for"):
+            make_manifest.build("1.7.0", "v1.7.0", tmp_path, "owner/Stamp")
+
+        manifest, found = make_manifest.build(
+            "1.7.0", "v1.7.0", tmp_path, "owner/Stamp", allow_missing=True
+        )
+        assert set(manifest["artifacts"]) == {"windows-x86_64"}
+        assert len(found) == 1

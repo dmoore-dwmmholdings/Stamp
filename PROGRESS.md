@@ -5,28 +5,28 @@ end of each work session.
 
 ## Environment
 
-uv was installed with pip and isn't on PATH, so run it as a module. The virtual
-environment is `.venv` with Python 3.12.10.
+The virtual environment is `.venv` with Python 3.12. Where `uv` was installed
+with pip and is not on PATH, `python -m uv` does for `uv` throughout.
 
 Run the app:
 
 ```
-python -m uv run stamp
-python -m uv run stamp tests/fixtures/bracket.step
+uv run stamp
+uv run stamp tests/fixtures/bracket.step
 ```
 
 Tests and lint:
 
 ```
-python -m uv run pytest
-python -m uv run ruff check src tests
+uv run pytest
+uv run ruff check src tests
 ```
 
 Regenerate fixtures / build the package:
 
 ```
-python -m uv run python tests/make_fixtures.py
-python -m uv run pyinstaller packaging/stamp.spec --noconfirm
+uv run python tests/make_fixtures.py
+uv run pyinstaller packaging/stamp.spec --noconfirm
 ```
 
 ## Milestones
@@ -38,12 +38,14 @@ python -m uv run pyinstaller packaging/stamp.spec --noconfirm
 | M2 | One complete feature, from face selection to export. | Done |
 | M3 | Mouse placement: drag handles, snapping, live preview. | Done |
 | M4 | Feature tree, modifiers, rebuild, project files. | Done |
-| M5 | Polish: error messages, packaging. | Done for Windows |
+| M5 | Polish: error messages, packaging. | Done |
 
 Version 1 is complete. The seven-step acceptance flow from section 14 exists as a
-single test, and it passes. The suite is 402 tests, all passing, with a clean ruff
-run. Headless (`QT_QPA_PLATFORM=offscreen`) 341 run and 61 skip — the skipped ones
-need a real window and an OpenGL context.
+single test, and it passes. The suite is about 800 tests (plus one marked
+`opens_email`, deselected by default), all passing, with a clean ruff run. Under
+`QT_QPA_PLATFORM=offscreen` the whole suite runs and 68 of them skip — 66 in
+`test_ui.py` and the two acceptance tests, the ones that need a real window with
+an OpenGL context. That is what CI does; `docker/` runs those 68 as well.
 
 ## Modules
 
@@ -56,7 +58,7 @@ need a real window and an OpenGL context.
 | `core/profiles.py` | The profile cache. Section 5.5, step 7. |
 | `core/snapping.py` | Snap targets. Section 6.2. |
 | `io/normalize.py` | The shared back half of every import. Section 5.5. |
-| `io/profile_import.py` | SVG, DXF, and DWG. Sections 5.3 and 5.4. |
+| `io/profile_import.py` | SVG, DXF, and DWG (DWG through the external ODA File Converter). Sections 5.3 and 5.4. |
 | `io/part_import.py` | STEP, IGES, BREP, STL, 3MF, and OBJ. Sections 5.1 and 5.2. |
 | `io/export.py` | STEP and STL export. Section 9. |
 | `io/project.py` | The `.stamp` archive. Section 4.4. |
@@ -731,12 +733,15 @@ smaller box is the more specific answer.
 
 ## Testing without a desktop
 
-Sixteen tests build a real window and two build the OCC viewport, so a local run
-takes over the screen. `QT_QPA_PLATFORM=offscreen` is not the way out: the
-viewport tests hang on it, because OpenCascade needs a real GL surface, and its
-empty font database fails three text tests that pass normally.
+Many tests build a real window, so a local run takes over the screen.
+`QT_QPA_PLATFORM=offscreen` is the way out for all but 68 of them: those need a
+real GL surface for the OCC viewport and skip themselves, and the rest — the text
+tests included — run offscreen. That is what CI does. Note that
+`tests/test_acceptance.py` builds a real window too, so `--ignore=tests/test_ui.py`
+alone is not enough to keep a run off the screen; set the platform as well.
 
-`docker/` runs them under Xvfb with Mesa's software renderer instead. Two things
+`docker/` runs the whole suite, those 68 included, under Xvfb with Mesa's
+software renderer instead. Two things
 cost an hour between them and are worth recording. `python:3.12-slim` has no
 glib, so PySide6 would not import - and the failure showed up as a container
 sitting at 0% CPU rather than as an error. And `uv run` without `--no-sync`
@@ -760,19 +765,108 @@ with no output, which looks exactly like a wedged test suite and is not one.
 The package root is `src/stamp/` (uv's default layout); section 13 says `app/`.
 Module names inside the root match section 13.
 
+## v1.6.1 - what an adversarial review found
+
+Before using 1.6.0 in anger, every area was reviewed by someone whose only job
+was to break it, each defect was reproduced with a script before it was
+believed, and each fix was reviewed the same way. Around seventy defects were
+verified; the ones worth recording are the ones that shipped wrong geometry or
+lost work without saying so.
+
+Wrap stamped both walls of a tube. The band was a full ring and the selector
+prism ran straight through the part, so a cut on the near wall was mirrored on
+the far one. Wrap was also a projection, not a wrap: the flat artwork was
+extruded along the tangent-plane normal and clipped at the silhouette, so an
+18 mm mark on a 20 mm tube spanned 64° instead of the 52° its arc length gives.
+Cylinders now get a true wrap - each loop is mapped by arc length onto the
+face's own parameterization and built as exact faces on the cylinder with
+radial walls - and cones keep the projection with a size limit and a message
+saying so. The wrapped solid is closed with `ShapeFix_Solid` rather than
+`BRepLib.OrientClosedSolid`, which produced a reversed solid that measured the
+right volume, passed `BRepCheck`, and failed every fillet.
+
+The draft neutral plane sat at the start of the sweep, not on the sketch plane,
+so a through-all cut with 1° of draft was already 30 % undersized where it met
+the face and pinched to nothing at 2°.
+
+A multi-part 3MF rebuilt to nothing in the app. `restore()` and the worker's
+copy carried the base's geometry across the JSON round trip but not the parts',
+so every part looked like it had nothing to do. `BasePart.adopt_runtime` copies
+both now, and a part with features and no geometry reports itself instead of
+staying silent.
+
+The rebuild cache replayed a bare passing row for anything it had cached, so a
+broken feature turned green on the next edit, preflight lost its warnings, and
+colour export lost its tools. It now caches the row with the geometry. The
+second review found it could still skip a feature whose row the FIFO had
+evicted after thirty edits; a resume now needs every row before it.
+
+SVGs were scaled twice. ocpsvg applies the viewBox transform itself, and Stamp
+multiplied by it again, so any file whose viewBox did not equal its physical
+width - every Illustrator export - came in at the wrong size with no prompt.
+The rule now comes from svgelements' own parse, and a file with no viewBox
+asks.
+
+Opening a part or project threw unsaved work away without asking. The preset
+picker crashed on every QR preset. Keys 1 to 7 were bound twice, so Qt fired
+neither. Selecting a feature that had a pattern replaced the pattern with a
+default one. Dragging a feature in the tree did nothing, because `QTreeWidget`
+moves rows without ever calling `moveRows`.
+
+Fit to face, rewritten during this work to measure the face in the sketch
+plane, measured only its vertices, so a round face fitted the artwork to zero.
+`face_extent_in_plane` transforms the face into the plane's frame and takes its
+bounding box there. That one is here as a reminder that a fix needs the same
+review as the bug.
+
+## What a release is allowed to publish
+
+A signed feed is only worth the care taken over what gets signed, and four ways
+of getting that wrong were found in one pass and are worth recording.
+
+A manual run of the release workflow builds `main` but names everything after
+the tag somebody typed, so the manifest said one version over the bytes of
+another. `make_manifest.py` also took `sorted(glob("*-Setup.exe"))[0]`, which on
+a tag that had been built twice signed whichever installer sorted first. The
+workflow now refuses a run whose tag, `src/stamp/__init__.py` and
+`packaging/stamp.iss` disagree, and the manifest is built from the installers
+whose names carry that version - never from whatever is in the folder.
+
+The manifest job ran `if: always()` over `gh release download ... || true`, so a
+failed installer job still published a signed feed, over whatever a previous run
+had left on that tag. It is gated on success now, and refuses to write a
+manifest with a platform missing unless `--allow-missing` says so.
+
+"Install when I quit" left a verified installer at a fixed path in `%TEMP%` for
+as long as the user kept working. Verified that morning is not verified now, so
+the download lands in a directory made fresh for it and the hash is checked
+again immediately before the installer is started.
+
+`STAMP_UPDATE_FEED` and `STAMP_UPDATE_PUBLIC_KEY` are what let the tests stand
+up a real signed feed, and they were honoured in shipped builds too - anything
+that could set an environment variable could point Stamp at its own feed signed
+with its own key, and both signature checks would pass. They are honoured only
+when not frozen now, `file://` included.
+
+Packaging builds on every platform Stamp claims: `.github/workflows/release.yml`
+compiles the Windows Setup with Inno, and builds a DMG and a PKG for each of the
+two macOS architectures; `packaging/build_installer.py` makes the Linux tarball.
+None of it is signed - see below.
+
 ## Not done
 
-1. macOS and Linux packages. The PyInstaller spec has the macOS bundle code, but
-   there's no machine here to test it.
-2. DWG is best-effort, as section 5.4 allows. The ODA File Converter isn't on this
+1. DWG is best-effort, as section 5.4 allows. The ODA File Converter isn't on this
    machine, so that path is untested. Stamp detects the converter at startup and
    shows a download link and a file picker when it's missing.
-3. Nothing from section 11's "later" list. Cylindrical wrap is first in line.
-4. Code signing. Nothing is signed with an Authenticode certificate or notarised
+2. Nothing from section 11's "later" list.
+3. Code signing. Nothing is signed with an Authenticode certificate or notarised
    for macOS, so SmartScreen warns on every install and Gatekeeper quarantines a
    downloaded bundle. The update manifest's Ed25519 signature covers *what Stamp
    installs*; it does nothing about what the operating system thinks of the
    installer. Until there is a Developer ID, the update bar on macOS links to the
    release page rather than installing anything.
-5. No release key has been generated yet, so update checking is switched off in
-   this build. See "Signing releases" in the README.
+4. No release key has been generated yet, so update checking is switched off in
+   every build shipped so far: `RELEASE_PUBLIC_KEY` is empty, Stamp refuses to
+   read a manifest it cannot verify, and Help → Check for updates says as much.
+   See "Signing releases, once" in the README. The release workflow warns on a
+   tag build when the key is still empty.

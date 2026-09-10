@@ -31,6 +31,8 @@ ROLE_FEATURE_ID = Qt.ItemDataRole.UserRole + 1
 ROLE_MODIFIER_ID = Qt.ItemDataRole.UserRole + 2
 ROLE_KIND = Qt.ItemDataRole.UserRole + 3
 ROLE_PART_INDEX = Qt.ItemDataRole.UserRole + 4
+#: The feature's real name, without the icons the row text carries.
+ROLE_NAME = Qt.ItemDataRole.UserRole + 5
 
 WARN_COLOR = QColor("#c58a2a")
 BROKEN_COLOR = QColor("#c0453a")
@@ -72,7 +74,6 @@ class FeatureTree(QTreeWidget):
         self.itemChanged.connect(self._on_item_changed)
         self.itemSelectionChanged.connect(self._on_selection_changed)
         self.customContextMenuRequested.connect(self._on_context_menu)
-        self.model().rowsMoved.connect(self._on_rows_moved)
 
     # ------------------------------------------------------------------ filling
 
@@ -154,6 +155,7 @@ class FeatureTree(QTreeWidget):
             OperationKind.COLOR: STAMP_ICON,
         }.get(feature.operation.kind, CUT_ICON)
         item.setText(0, f"{icon}  {feature.name}")
+        item.setData(0, ROLE_NAME, feature.name)
         item.setData(0, ROLE_KIND, "feature")
         item.setData(0, ROLE_FEATURE_ID, feature.id)
         item.setFlags(
@@ -248,26 +250,63 @@ class FeatureTree(QTreeWidget):
             self.enabled_toggled.emit(feature_id, enabled)
             return
 
-        # A rename arrives as a text change; strip the icon prefix the view adds.
+        # A rename arrives as a text change; strip the icons the view puts in
+        # front of the name, and compare against the name the row was built from
+        # rather than the feature's.  The colour-stamp glyph used to survive the
+        # strip, so every rename of a stamp prepended another one.
         text = item.text(0)
-        for prefix in (f"{BROKEN_ICON} ", ADD_ICON, CUT_ICON):
+        for prefix in (f"{BROKEN_ICON} ", WARN_ICON, ADD_ICON, CUT_ICON, STAMP_ICON):
             text = text.replace(prefix, "")
         text = text.strip()
-        if feature is not None and text and text != feature.name:
+        name = item.data(0, ROLE_NAME) or ""
+        if feature is not None and text and text != name:
+            item.setData(0, ROLE_NAME, text)
             self.renamed.emit(feature_id, text)
 
-    def _on_rows_moved(self, parent, start, end, destination, row) -> None:
-        if self._updating or self._document is None:
+    def _feature_order(self) -> list[str]:
+        """The feature ids in the order the rows are in now."""
+        order = []
+        for row in range(self.topLevelItemCount()):
+            item = self.topLevelItem(row)
+            if item.data(0, ROLE_KIND) == "feature":
+                feature_id = item.data(0, ROLE_FEATURE_ID)
+                if feature_id:
+                    order.append(feature_id)
+        return order
+
+    def dropEvent(self, event) -> None:  # noqa: N802
+        """Report the new order after an internal move.
+
+        QTreeWidget performs an InternalMove by taking the items out and putting
+        them back itself, without going through the model's ``moveRows``.  So
+        ``rowsMoved`` never fires, and before this the drag rearranged the rows
+        and left the document exactly as it was.
+        """
+        if self.dropIndicatorPosition() == self.DropIndicatorPosition.OnItem:
+            # Dropping onto a row would nest one feature inside another, which
+            # the document has no way to express.
+            event.ignore()
             return
-        item = self.topLevelItem(min(row, self.topLevelItemCount() - 1))
-        if item is None:
+        moved = [
+            item.data(0, ROLE_FEATURE_ID) for item in self.selectedItems()
+            if item.data(0, ROLE_KIND) == "feature"
+        ]
+        before = self._feature_order()
+        super().dropEvent(event)
+        after = self._feature_order()
+        # An InternalMove takes the row out and puts a new one back, which leaves
+        # nothing selected.  Without this the panel drops to the base part on the
+        # next rebuild, so a drag lost the feature the user was working on.
+        for feature_id in moved:
+            if feature_id:
+                self.select_feature(feature_id)
+                break
+        if self._document is None or after == before:
             return
-        feature_id = item.data(0, ROLE_FEATURE_ID)
-        if not feature_id:
-            return
-        # The base part is pinned at index 0, so feature indices are one less.
-        new_index = max(0, self.indexOfTopLevelItem(item) - 1)
-        self.reordered.emit(feature_id, new_index)
+        for feature_id in moved:
+            if feature_id in after:
+                self.reordered.emit(feature_id, after.index(feature_id))
+                return
 
     # ------------------------------------------------------------ context menu
 

@@ -683,6 +683,72 @@ class TestTheUpdateBar:
         window.close()
         assert started == [1]
 
+    def test_the_automatic_check_matches_the_readme_s_once_a_day(
+        self, window, monkeypatch
+    ):
+        """W2: the window was 20 hours, so an automatic check ran twice in a day
+        for anybody who opens Stamp at roughly the same time each morning."""
+        import time
+
+        monkeypatch.setattr("stamp.update.is_configured", lambda: True)
+        window.interactive = True
+        window.settings.setValue("update/check_automatically", True)
+        checked = []
+        window._check_for_updates = lambda announce: checked.append(announce)
+        try:
+            window.settings.setValue("update/last_check", int(time.time()) - 21 * 60 * 60)
+            window.begin_update_check()
+            assert checked == []
+
+            window.settings.setValue("update/last_check", int(time.time()) - 25 * 60 * 60)
+            window.begin_update_check()
+            assert checked == [False]
+        finally:
+            window.settings.remove("update/last_check")
+            window.settings.remove("update/check_automatically")
+            window.interactive = False
+
+    def test_the_installer_hash_is_carried_to_the_install(self, window, monkeypatch):
+        """W3: install re-checks the hash, and without one it refuses to run the
+        file - so "install when I quit" could never work."""
+        from stamp.update import Artifact
+
+        artifact = Artifact(
+            name="Stamp-Setup.exe",
+            url="https://example.invalid/Stamp-Setup.exe",
+            size=10,
+            sha256="ab" * 32,
+        )
+        window._update_release = self._release(artifact=artifact)
+
+        seen = {}
+        monkeypatch.setattr(
+            "stamp.update.install",
+            lambda path, **kwargs: seen.update(kwargs) or seen.update(path=path),
+        )
+        window._on_update_ready("C:\\Temp\\Stamp-Setup.exe")
+        assert window._update_sha256 == "ab" * 32
+
+        window._apply_update(now=False)
+        assert seen["sha256"] == "ab" * 32
+
+    def test_the_download_asks_for_no_directory_of_its_own(self, window, monkeypatch):
+        """update.download makes a fresh directory with permissions of its own;
+        a guessable %TEMP%\\stamp-update is where an installer gets swapped."""
+        from stamp.update import Artifact
+
+        artifact = Artifact(
+            name="Stamp-Setup.exe",
+            url="https://example.invalid/Stamp-Setup.exe",
+            size=10,
+            sha256="ab" * 32,
+        )
+        window._update_release = self._release(artifact=artifact)
+        asked = []
+        monkeypatch.setattr(window.updater, "fetch", lambda *a, **k: asked.append((a, k)))
+        window._on_update_install()
+        assert asked and len(asked[0][0]) == 1 and not asked[0][1]
+
     def test_the_menu_switch_is_remembered(self, window):
         before = window.settings.value("update/check_automatically", False, type=bool)
         try:
@@ -1270,6 +1336,21 @@ class TestPresetLibraryDialog:
 
         assert dialog.list.count() == 1
         assert dialog.selected_path() == serial.path
+
+    def test_a_code_preset_gets_a_preview_like_every_other_one(self, qtbot):
+        """io.presets tags every QR and Data Matrix preset "code", and the
+        preview for that branch unpacked one string into two names.  Saving a
+        code preset made the whole library unopenable."""
+        from stamp.io.presets import PresetInfo
+        from stamp.ui.dialogs import PresetLibraryDialog
+
+        code = PresetInfo(Path("serial-qr.stamp-preset"), "Serial QR", ("cut", "code", "qr"), "cut · qr")
+        dialog = PresetLibraryDialog([code])
+        qtbot.addWidget(dialog)
+
+        assert dialog.list.count() == 1
+        assert not dialog.list.item(0).icon().isNull()
+        assert dialog.selected_path() == code.path
 
 
 class TestFeatureTree:
@@ -2674,3 +2755,1204 @@ class TestPartScaleDialog:
         dialog.percent.setValue(0.0)
         assert dialog.percent.value() == pytest.approx(MIN_PART_SCALE * 100.0)
         assert not dialog.transform().validate()
+
+
+class TestTheViewportRefusesAPlatformWithNoNativeWindow:
+    """Item 0 of the adversarial review, and the reason the rest can be tested.
+
+    Under Qt's offscreen platform ``winId()`` is not a native handle, and OCC's
+    Cocoa_Window dereferenced it and took the process down - so the "fail once
+    and disable the viewport" design in _init_viewer never got a turn.
+    """
+
+    @pytest.mark.skipif(not HEADLESS, reason="only the non-native platforms refuse")
+    def test_starting_the_viewer_is_refused_rather_than_attempted(self, qtbot):
+        from stamp.ui.viewport import Viewport
+
+        widget = Viewport()
+        qtbot.addWidget(widget)
+        with pytest.raises(RuntimeError, match="no native window"):
+            widget._start_viewer()
+
+    @pytest.mark.skipif(not HEADLESS, reason="only the non-native platforms refuse")
+    def test_the_window_still_opens_a_part_with_the_viewport_disabled(
+        self, qtbot, fixtures
+    ):
+        from stamp.ui.main_window import MainWindow
+
+        win = MainWindow()
+        win.interactive = False
+        qtbot.addWidget(win)
+
+        win.viewport._init_viewer()
+        assert win.viewport._init_failed
+        assert win.viewport.context is None
+
+        win.open_part(fixtures / "bracket.step")
+        qtbot.waitUntil(lambda: win._last_result is not None, timeout=20000)
+        assert win.document.base is not None
+
+
+class TestUnsavedWorkIsNotThrownAway:
+    """Item 1.  Only closeEvent asked; every other path that replaced the
+    document cleared the undo stack with it and said nothing."""
+
+    @pytest.fixture
+    def window(self, qtbot, fixtures):
+        from stamp.ui.main_window import MainWindow
+
+        win = MainWindow()
+        win.interactive = False
+        qtbot.addWidget(win)
+        win.open_part(fixtures / "bracket.step")
+        win._dirty = True
+        yield win
+        win.rebuilder.shutdown()
+
+    def test_open_part_asks_and_keeps_the_document_on_no(
+        self, window, fixtures, monkeypatch
+    ):
+        monkeypatch.setattr(window, "_confirm", lambda *a: False)
+        before = window.document
+        window.open_part(fixtures / "bracket_rev_b.step")
+        assert window.document is before
+
+    def test_open_project_asks_too(self, window, tmp_path, monkeypatch):
+        monkeypatch.setattr(window, "_confirm", lambda *a: False)
+        opened = []
+        monkeypatch.setattr(
+            "stamp.io.project.open_project", lambda *a, **k: opened.append(1)
+        )
+        before = window.document
+        window.open_project(tmp_path / "nothing.stamp")
+        assert window.document is before
+        assert not opened, "the file must not even be read after a No"
+
+    def test_a_clean_document_is_never_asked_about(self, window, fixtures, monkeypatch):
+        window._dirty = False
+        asked = []
+        monkeypatch.setattr(window, "_confirm", lambda *a: asked.append(1) or True)
+        window.open_part(fixtures / "bracket_rev_b.step")
+        assert not asked
+
+
+class TestReopeningAProject:
+    """Items 3 and W1/W4: what a project needs back before it can be rebuilt."""
+
+    @pytest.fixture
+    def window(self, qtbot):
+        from stamp.ui.main_window import MainWindow
+
+        win = MainWindow()
+        win.interactive = False
+        qtbot.addWidget(win)
+        yield win
+        win.rebuilder.shutdown()
+
+    def test_the_base_part_is_reimported_at_the_unit_the_user_chose(
+        self, window, fixtures, tmp_path, monkeypatch
+    ):
+        """An STL answered "inches" on import came back 25.4x smaller on reopen,
+        which put every anchor off the part."""
+        from stamp.core.document import Document
+        from stamp.io import project as project_io
+        from stamp.io.part_import import import_part
+        from stamp.ui import main_window as mw
+
+        part = import_part(fixtures / "bracket.stl", unit_scale=25.4).part
+        assert part.unit_scale == 25.4
+        path = tmp_path / "inches.stamp"
+        project_io.save(Document(base=part, name="inches"), path)
+
+        seen = {}
+
+        def spy(parent, source, **options):
+            seen.update(options)
+            return import_part(source, unit_scale=options.get("unit_scale"))
+
+        monkeypatch.setattr(mw, "import_part_for_ui", spy)
+        window.open_project(path)
+
+        assert seen["unit_scale"] == 25.4
+        assert window.document.base.size == pytest.approx(part.size)
+
+    def test_undo_brings_the_geometry_back_with_the_snapshot(
+        self, window, fixtures, monkeypatch
+    ):
+        """A snapshot is JSON, so a restored base part carries no runtime shape.
+        Without a re-import every rebuild after the undo had nothing to cut."""
+        from stamp.io.part_import import import_part
+        from stamp.ui import main_window as mw
+
+        window.open_part(fixtures / "bracket.step")
+        window.undo_stack.push("something", window.document.snapshot())
+
+        calls = []
+
+        def spy(parent, source, **options):
+            calls.append(Path(source))
+            return import_part(source)
+
+        monkeypatch.setattr(mw, "import_part_for_ui", spy)
+        window.document.base.runtime = None
+        window.undo()
+
+        assert calls == [Path(fixtures / "bracket.step")]
+        assert window.document.base.runtime is not None
+        assert window._dirty and "•" in window.windowTitle()
+
+
+class TestSelectingAFeatureChangesNothing:
+    """Item 4.  The pattern widgets were filled after _updating was cleared, so
+    merely clicking a patterned feature replaced its pattern with a default one
+    and put an undo entry, a dirty mark and a rebuild behind the click."""
+
+    def test_a_circular_pattern_survives_being_shown(self, qtbot):
+        from stamp.core.document import PatternKind, PatternSpec
+        from stamp.ui.properties import PropertiesPanel
+
+        panel = PropertiesPanel()
+        qtbot.addWidget(panel)
+
+        feature = a_feature()
+        feature.pattern = PatternSpec(kind=PatternKind.CIRCULAR, count=6, angle=60.0)
+        document = Document()
+        document.add_feature(feature)
+
+        changed = []
+        panel.changed.connect(changed.append)
+        panel.show_feature(document, feature, (36.0, 16.0))
+
+        assert changed == []
+        assert feature.pattern is not None
+        assert feature.pattern.kind is PatternKind.CIRCULAR
+        assert feature.pattern.count == 6
+        assert panel.pattern_count.value() == 6
+
+
+class TestDraggingAFeatureInTheTree:
+    """Item 5.  QTreeWidget does an InternalMove itself instead of going through
+    the model's moveRows, so rowsMoved never fired and the drag reordered the
+    rows and nothing else."""
+
+    def test_a_drop_reports_the_new_order(self, qtbot, bracket_step, monkeypatch):
+        from PySide6.QtWidgets import QAbstractItemView, QTreeWidget
+
+        from stamp.ui.feature_tree import FeatureTree
+
+        tree = FeatureTree()
+        qtbot.addWidget(tree)
+        document = Document(base=bracket_step)
+        first, second = a_feature("First"), a_feature("Second")
+        document.add_feature(first)
+        document.add_feature(second)
+        tree.set_document(document)
+        tree.select_feature(second.id)
+
+        def rearrange(self, event):
+            """What QTreeWidget's own drop does: take the row out, put it back."""
+            self.insertTopLevelItem(1, self.takeTopLevelItem(2))
+
+        monkeypatch.setattr(QTreeWidget, "dropEvent", rearrange)
+        monkeypatch.setattr(
+            FeatureTree, "dropIndicatorPosition",
+            lambda self: QAbstractItemView.DropIndicatorPosition.AboveItem,
+        )
+
+        with qtbot.waitSignal(tree.reordered, timeout=1000) as blocker:
+            tree.dropEvent(object())
+        assert blocker.args == [second.id, 0]
+
+    def test_a_drop_onto_a_row_is_refused(self, qtbot, bracket_step, monkeypatch):
+        """Nesting one feature under another is not something a document can say."""
+        from PySide6.QtWidgets import QAbstractItemView, QTreeWidget
+
+        from stamp.ui.feature_tree import FeatureTree
+
+        tree = FeatureTree()
+        qtbot.addWidget(tree)
+        document = Document(base=bracket_step)
+        document.add_feature(a_feature("First"))
+        document.add_feature(a_feature("Second"))
+        tree.set_document(document)
+
+        moved = []
+        monkeypatch.setattr(QTreeWidget, "dropEvent", lambda self, e: moved.append(1))
+        monkeypatch.setattr(
+            FeatureTree, "dropIndicatorPosition",
+            lambda self: QAbstractItemView.DropIndicatorPosition.OnItem,
+        )
+
+        class Event:
+            def ignore(self):
+                self.ignored = True
+
+        event = Event()
+        tree.dropEvent(event)
+        assert not moved
+        assert event.ignored
+
+    def test_renaming_a_colour_stamp_does_not_collect_glyphs(
+        self, qtbot, bracket_step
+    ):
+        """Item 14: the strip list had the add and cut arrows but not the stamp
+        diamond, so every rename put another one in front of the name."""
+        from stamp.core.document import OperationKind
+        from stamp.ui.feature_tree import FeatureTree
+
+        tree = FeatureTree()
+        qtbot.addWidget(tree)
+        document = Document(base=bracket_step)
+        feature = a_feature("Badge")
+        feature.operation.kind = OperationKind.COLOR
+        document.add_feature(feature)
+        tree.set_document(document)
+
+        item = tree.topLevelItem(1)
+        assert "◈" in item.text(0)
+        with qtbot.waitSignal(tree.renamed, timeout=1000) as blocker:
+            item.setText(0, item.text(0).replace("Badge", "Crest"))
+        assert blocker.args == [feature.id, "Crest"]
+
+
+class TestWindowKeys:
+    @pytest.fixture
+    def window(self, qtbot, fixtures):
+        from stamp.ui.main_window import MainWindow
+
+        win = MainWindow()
+        win.interactive = False
+        qtbot.addWidget(win)
+        # A window shortcut needs a shown window; QTest posts the key to the
+        # widget, and Qt looks for the shortcut up the shown hierarchy.
+        win.show()
+        qtbot.waitExposed(win)
+        yield win
+        win.rebuilder.shutdown()
+
+    def test_the_preset_view_keys_fire(self, window, qtbot, monkeypatch):
+        """Item 6: 1-7 were on hidden actions and on the View menu entries at the
+        same time, so Qt called the overload ambiguous and fired neither."""
+        from PySide6.QtTest import QTest
+
+        seen = []
+        monkeypatch.setattr(window.viewport, "set_preset_view", seen.append)
+        for key, preset in (
+            (Qt.Key.Key_1, "front"), (Qt.Key.Key_5, "top"), (Qt.Key.Key_7, "iso"),
+        ):
+            QTest.keyClick(window, key)
+            assert seen and seen[-1] == preset, preset
+
+    def test_every_orientation_key_is_bound_exactly_once(self, window):
+        from PySide6.QtGui import QKeySequence
+
+        for digit in "1234567":
+            wanted = QKeySequence(digit)
+            bound = [a for a in window.actions() if a.shortcut() == wanted]
+            assert len(bound) == 1, f"{digit} is bound {len(bound)} times"
+
+    def test_space_ticks_a_focused_checkbox(self, window, qtbot):
+        """Item 15: Space was a window shortcut, so it toggled the preview
+        instead of ticking whatever checkbox had the keyboard.  The shortcut
+        still gets the key first, so the slot has to do the tick itself -
+        standing aside only made Space do nothing at all there."""
+        from PySide6.QtTest import QTest
+        from PySide6.QtWidgets import QCheckBox
+
+        box = QCheckBox(window)
+        box.show()
+        box.setFocus()
+        assert box.hasFocus()
+
+        before = window.action_preview.isChecked()
+        QTest.keyClick(window, Qt.Key.Key_Space)
+        assert box.isChecked(), "the focused checkbox must actually toggle"
+        assert window.action_preview.isChecked() == before
+
+    def test_space_still_toggles_the_preview_from_the_viewport(self, window, qtbot):
+        from PySide6.QtTest import QTest
+
+        window.viewport.setFocus()
+        before = window.action_preview.isChecked()
+        QTest.keyClick(window, Qt.Key.Key_Space)
+        assert window.action_preview.isChecked() != before
+
+
+class TestTheDocumentIsMarkedDirty:
+    """Item 8.  Undo, redo, a unit change and the size lock all edited the
+    document and left the title saying it was saved."""
+
+    @pytest.fixture
+    def window(self, qtbot, fixtures):
+        from stamp.ui.main_window import MainWindow
+
+        win = MainWindow()
+        win.interactive = False
+        qtbot.addWidget(win)
+        win.open_part(fixtures / "bracket.step")
+        win._dirty = False
+        yield win
+        win.rebuilder.shutdown()
+
+    def test_undo_and_redo_both_mark_it(self, window):
+        window.undo_stack.push("something", window.document.snapshot())
+        window.undo()
+        assert window._dirty
+        assert "•" in window.windowTitle()
+
+        window._dirty = False
+        window.redo()
+        assert window._dirty
+
+    def test_changing_the_units_marks_it(self, window):
+        window.units_box.setCurrentIndex(window.units_box.findData("in"))
+        assert window.document.units == "in"
+        assert window._dirty
+
+    def test_reloading_the_same_units_does_not(self, window):
+        window.units_box.setCurrentIndex(window.units_box.findData(window.document.units))
+        assert not window._dirty
+
+    def test_the_size_lock_marks_it(self, qtbot):
+        from stamp.ui.properties import PropertiesPanel
+
+        panel = PropertiesPanel()
+        qtbot.addWidget(panel)
+        feature = a_feature()
+        document = Document()
+        document.add_feature(feature)
+        panel.show_feature(document, feature, (36.0, 16.0))
+
+        with qtbot.waitSignal(panel.changed, timeout=1000):
+            panel.lock_button.setChecked(not panel.lock_button.isChecked())
+
+
+class TestExportsWaitForTheRebuild:
+    """Item 7.  An export inside the 250 ms debounce read _last_result and wrote
+    the shape from before the edit that was still waiting."""
+
+    @pytest.fixture
+    def window(self, qtbot, fixtures):
+        from stamp.ui.main_window import MainWindow
+
+        win = MainWindow()
+        win.interactive = False
+        qtbot.addWidget(win)
+        win.open_part(fixtures / "bracket.step")
+        qtbot.waitUntil(lambda: win._last_result is not None, timeout=20000)
+        yield win
+        win.rebuilder.shutdown()
+
+    def test_an_export_during_the_debounce_is_refused(self, window, monkeypatch):
+        written = []
+        monkeypatch.setattr(
+            "stamp.io.export.export_step", lambda *a, **k: written.append(1)
+        )
+        window.rebuilder._timer.start()
+        assert window.rebuilder.pending
+
+        window.export_step()
+
+        assert not written
+        assert "still rebuilding" in window.statusBar().currentMessage()
+
+    def test_an_export_while_the_worker_runs_is_refused(self, window, monkeypatch):
+        written = []
+        monkeypatch.setattr(
+            "stamp.io.export.export_stl", lambda *a, **k: written.append(1)
+        )
+        monkeypatch.setattr(type(window.rebuilder), "busy", property(lambda _s: True))
+        window.export_stl()
+        assert not written
+        assert "still rebuilding" in window.statusBar().currentMessage()
+
+
+class TestCancellingAPick:
+    """Item 9.  Esc cleared the profile, to-face and re-pick flags and left the
+    three origin picks, the preset template and the selection filter set."""
+
+    @pytest.fixture
+    def window(self, qtbot, fixtures):
+        from stamp.ui.main_window import MainWindow
+
+        win = MainWindow()
+        win.interactive = False
+        qtbot.addWidget(win)
+        win.open_part(fixtures / "bracket.step")
+        yield win
+        win.rebuilder.shutdown()
+
+    def test_it_clears_every_pick_and_the_filter(self, window):
+        from stamp.core.document import ProfileRef, TextSpec
+
+        window._pending_profile = ProfileRef(text=TextSpec(text="X"))
+        window._pending_profile_size = (12.0, 4.0)
+        window._pending_feature_template = a_feature()
+        window._picking_to_face = True
+        window._repicking = True
+        window._picking_alignment_edge = True
+        window._picking_origin_vertex = True
+        window._picking_hole_center = True
+        window.selection_box.setCurrentIndex(window.selection_box.findData("vertex"))
+
+        window._cancel_pending()
+
+        assert window._pending_profile is None
+        assert window._pending_feature_template is None
+        assert not window._picking_to_face
+        assert not window._repicking
+        assert not window._picking_alignment_edge
+        assert not window._picking_origin_vertex
+        assert not window._picking_hole_center
+        assert window.selection_box.currentData() == "face"
+        assert not window._pick_waiting()
+
+
+class TestPlacingAPresetOnAMesh:
+    """Item 10.  The mesh path ignored the preset template entirely, so a preset
+    inserted onto an STL arrived as a plain 0.5 mm cut called after its file."""
+
+    @pytest.fixture
+    def window(self, qtbot, fixtures):
+        from stamp.ui.main_window import MainWindow
+
+        win = MainWindow()
+        win.interactive = False
+        qtbot.addWidget(win)
+        win.open_part(fixtures / "bracket.stl")
+        yield win
+        win.rebuilder.shutdown()
+
+    def test_the_template_is_applied_and_then_cleared(self, window):
+        from stamp.core.document import (
+            FeatureMetadata,
+            Modifier,
+            ModifierKind,
+            OperationKind,
+            PatternSpec,
+            ProfileRef,
+            TextSpec,
+        )
+
+        template = a_feature("Serial plate")
+        template.operation.kind = OperationKind.ADD
+        template.operation.depth = 1.25
+        template.modifiers.append(Modifier(kind=ModifierKind.FILLET, value=0.3))
+        template.pattern = PatternSpec(count=3)
+        template.metadata = FeatureMetadata(identifier="1234")
+        template.placement.rotation = 30.0
+        window._pending_feature_template = template
+
+        class Region:
+            point = (30.0, 20.0, 8.0)
+            plane = template.placement.anchor.plane
+            warnings: list[str] = []
+
+        ref = ProfileRef(text=TextSpec(text="ABC"))
+        window._create_mesh_feature(ref, Region())
+
+        made = window.document.features[-1]
+        assert made.name.startswith("Serial plate")
+        assert made.operation.kind is OperationKind.ADD
+        assert made.operation.depth == 1.25
+        assert [m.kind for m in made.modifiers] == [ModifierKind.FILLET]
+        assert made.pattern is not None and made.pattern.count == 3
+        assert made.metadata.identifier == "1234"
+        assert made.placement.rotation == 30.0
+        assert window._pending_feature_template is None
+
+    def test_a_code_gets_its_own_name(self, window):
+        from stamp.core.document import CodeSpec, ProfileRef
+
+        class Region:
+            point = (30.0, 20.0, 8.0)
+            plane = a_feature().placement.anchor.plane
+            warnings: list[str] = []
+
+        window._create_mesh_feature(ProfileRef(code=CodeSpec(payload="X")), Region())
+        assert window.document.features[-1].name in ("QR code", "Data Matrix")
+
+    def test_to_face_depth_says_why_it_cannot_work(self, window):
+        """Item 18b: the pick was swallowed and the flag never cleared, so every
+        later click on the mesh went nowhere."""
+        window._picking_to_face = True
+        window._on_mesh_picked()
+        assert not window._picking_to_face
+        assert "solid part" in window.statusBar().currentMessage()
+
+
+class TestTheHandleOverlay:
+    """Item 11.  Any left press inside the frame started a translate drag, and
+    the release committed one whether or not anything had moved."""
+
+    @pytest.fixture
+    def overlay(self, qtbot):
+        from stamp.ui.handles import HandleOverlay
+        from stamp.ui.viewport import Viewport
+
+        viewport = Viewport()
+        qtbot.addWidget(viewport)
+        widget = HandleOverlay(viewport)
+        widget.set_feature(a_feature(), (36.0, 16.0))
+        return widget
+
+    def _press(self, overlay, uv=(0.0, 0.0)):
+        from stamp.ui.handles import Mode, _Drag
+
+        overlay._drag = _Drag(
+            mode=Mode.TRANSLATE,
+            handle=0,
+            start_screen=QPoint(0, 0),
+            start_offset=overlay.feature.placement.offset_2d,
+            start_scale=overlay.feature.placement.scale,
+            start_rotation=overlay.feature.placement.rotation,
+            start_uv=uv,
+        )
+
+    def test_a_click_that_moves_nothing_commits_nothing(self, overlay):
+        committed = []
+        overlay.placement_committed.connect(committed.append)
+        self._press(overlay)
+        overlay._end_drag()
+        assert committed == [], "a click was worth an undo entry and a rebuild"
+
+    def test_a_drag_that_moves_still_commits(self, overlay):
+        committed = []
+        overlay.placement_committed.connect(committed.append)
+        self._press(overlay)
+        overlay.feature.placement.offset_2d = (4.0, 0.0)
+        overlay._end_drag()
+        assert committed == ["move"]
+
+    def test_it_stands_down_while_the_window_waits_for_a_click(self, overlay, qtbot):
+        from PySide6.QtCore import QEvent, QPointF
+        from PySide6.QtGui import QMouseEvent
+
+        overlay.pick_pending = lambda: True
+        event = QMouseEvent(
+            QEvent.Type.MouseButtonPress, QPointF(10.0, 10.0), QPointF(10.0, 10.0),
+            Qt.MouseButton.LeftButton, Qt.MouseButton.LeftButton,
+            Qt.KeyboardModifier.NoModifier,
+        )
+        assert overlay._begin_drag(event) is False
+        assert overlay._drag is None
+
+
+class TestPartVisibilityBeforeTheFirstRebuild:
+    """Item 13.  Both calls handed None to _display_geometry, which raises in
+    solid mode - so ticking a part off before the first rebuild crashed."""
+
+    @pytest.fixture
+    def window(self, qtbot):
+        from stamp.ui.main_window import MainWindow
+
+        win = MainWindow()
+        win.interactive = False
+        qtbot.addWidget(win)
+        yield win
+        win.rebuilder.shutdown()
+
+    def _two_part_base(self, window, bracket_step):
+        from dataclasses import replace as _replace
+
+        from stamp.core.document import PartBody
+
+        base = _replace(bracket_step)
+        base.parts = [
+            PartBody(index=0, name="one", bbox=base.bbox),
+            PartBody(index=1, name="two", bbox=base.bbox),
+        ]
+        window.document = Document(base=base)
+        window._last_result = None
+
+    def test_hiding_a_part_is_recorded_and_does_not_raise(self, window, bracket_step):
+        self._two_part_base(window, bracket_step)
+        window.set_part_visible(1, False)
+        assert window.document.base.parts[1].visible is False
+
+    def test_isolating_a_part_does_not_raise_either(self, window, bracket_step):
+        self._two_part_base(window, bracket_step)
+        window.isolate_part(0)
+        assert [p.visible for p in window.document.base.parts] == [True, False]
+
+
+class TestARebuildThatWasCancelled:
+    """Item 17.  _dispatch cancelled through the running generation but left it
+    as the one the controller accepts, so a worker that had already passed its
+    last cancel check delivered its result over the document that replaced it."""
+
+    def test_a_late_result_from_a_cancelled_rebuild_is_dropped(self, qtbot):
+        import time
+
+        class UncancellableEngine:
+            """Checks for a cancel once, at the start, and then commits."""
+
+            def __init__(self) -> None:
+                self.runs = 0
+
+            def rebuild(self, document, should_cancel=None, progress=None):
+                self.runs += 1
+                mine = self.runs
+                if should_cancel and should_cancel():
+                    from stamp.core.rebuild import Cancelled
+
+                    raise Cancelled()
+                time.sleep(0.25)
+                return mine
+
+        from stamp.ui.rebuild_worker import RebuildController
+
+        engine = UncancellableEngine()
+        controller = RebuildController(engine)
+        delivered = []
+        controller.finished.connect(delivered.append)
+        try:
+            controller.request(Document(), immediate=True)
+            qtbot.wait(100)  # past the first and only cancel check
+            controller.request(Document(), immediate=True)
+            qtbot.waitUntil(lambda: engine.runs == 2 and not controller.busy, timeout=8000)
+            qtbot.wait(100)
+            assert delivered == [2], "the stale answer must not be applied"
+        finally:
+            controller.shutdown()
+
+
+class TestTheRecentProjectsMenu:
+    """Item 18a.  Projects were recorded and nothing ever showed them."""
+
+    @pytest.fixture
+    def window(self, qtbot):
+        from stamp.ui.main_window import MainWindow
+
+        win = MainWindow()
+        win.interactive = False
+        qtbot.addWidget(win)
+        yield win
+        win.rebuilder.shutdown()
+
+    def test_it_lists_what_is_there_and_drops_what_is_not(self, window, tmp_path):
+        here = tmp_path / "here.stamp"
+        here.write_bytes(b"")
+        gone = tmp_path / "gone.stamp"
+
+        window.settings.setValue("recent/projects", [str(gone), str(here)])
+        window._fill_recent_menu()
+
+        names = [a.text() for a in window.recent_menu.actions()]
+        assert names == ["here.stamp"]
+
+    def test_an_empty_list_says_so_rather_than_offering_nothing(self, window):
+        window.settings.setValue("recent/projects", [])
+        window._fill_recent_menu()
+        actions = window.recent_menu.actions()
+        assert len(actions) == 1 and not actions[0].isEnabled()
+
+    def test_opening_one_goes_through_the_unsaved_work_question(
+        self, window, tmp_path, monkeypatch
+    ):
+        path = tmp_path / "here.stamp"
+        path.write_bytes(b"")
+        window.settings.setValue("recent/projects", [str(path)])
+        window._fill_recent_menu()
+
+        window.document = Document(base=None)
+        opened = []
+        monkeypatch.setattr(window, "open_project", lambda p: opened.append(p))
+        window.recent_menu.actions()[0].trigger()
+        assert opened == [path]
+
+
+class TestTheHeaderFollowsTheDesktopTheme:
+    """Item 16.  The ribbon re-themed itself on a palette change; the menu bar,
+    the ribbon's holder and the update bar were painted once in _build_menus."""
+
+    def test_a_palette_change_repaints_the_header(self, qtbot):
+        from PySide6.QtCore import QEvent
+
+        from stamp.ui.main_window import MainWindow
+
+        win = MainWindow()
+        win.interactive = False
+        qtbot.addWidget(win)
+        try:
+            applied = []
+            win._apply_header_theme = lambda: applied.append(1)
+            win.changeEvent(QEvent(QEvent.Type.PaletteChange))
+            assert applied == [1]
+        finally:
+            win.rebuilder.shutdown()
+
+
+class TestFitToFaceOnATiltedFace:
+    """Item 18c.  The face was measured with a world-axis bounding box, so on a
+    face that is not square to the axes the fit used the box the face sits in -
+    bigger than the face, and in neither of the two directions the profile is
+    actually scaled along."""
+
+    @pytest.fixture
+    def window(self, qtbot):
+        from stamp.ui.main_window import MainWindow
+
+        win = MainWindow()
+        win.interactive = False
+        qtbot.addWidget(win)
+        yield win
+        win.rebuilder.shutdown()
+
+    def test_the_face_is_measured_in_its_own_axes(self, window):
+        import math
+
+        from OCP.BRepBuilderAPI import BRepBuilderAPI_Transform
+        from OCP.BRepPrimAPI import BRepPrimAPI_MakeBox
+        from OCP.gp import gp_Ax1, gp_Dir, gp_Pnt, gp_Trsf
+
+        from stamp.core.document import Anchor, AnchorKind, BasePart
+        from stamp.core.refs import faces_of, make_face_ref, plane_from_face
+
+        # A 60 x 20 slab turned 45 degrees about z.  Its top face is still 60 x 20,
+        # but its world-axis box is about 56.6 x 56.6.
+        box = BRepPrimAPI_MakeBox(gp_Pnt(0, 0, 0), gp_Pnt(60, 20, 10)).Shape()
+        turn = gp_Trsf()
+        turn.SetRotation(gp_Ax1(gp_Pnt(0, 0, 0), gp_Dir(0, 0, 1)), math.radians(45))
+        shape = BRepBuilderAPI_Transform(box, turn, True).Shape()
+
+        from stamp.io.part_import import bounding_box
+
+        def centre(face):
+            x0, y0, z0, x1, y1, z1 = bounding_box(face)
+            return ((x0 + x1) / 2.0, (y0 + y1) / 2.0, (z0 + z1) / 2.0)
+
+        top = next(
+            f for f in faces_of(shape)
+            if make_face_ref(f, centre(f)).normal[2] > 0.99
+        )
+        point = centre(top)
+        plane, _ = plane_from_face(top, point)
+
+        window.document = Document(base=BasePart(mode="solid", runtime=shape))
+        feature = a_feature()
+        feature.placement.anchor = Anchor(
+            kind=AnchorKind.FACE, face_ref=make_face_ref(top, point), plane=plane
+        )
+        window.document.add_feature(feature)
+
+        size = window._anchor_face_size(feature)
+        assert size is not None
+        assert sorted(size) == pytest.approx([20.0, 60.0], abs=1e-6)
+
+
+class TestTheBatchRunsOffTheGuiThread:
+    """Item 12.  simulate_batch and run_batch both ran on the GUI thread, so a
+    batch of any size froze the window until the desktop offered to kill it."""
+
+    @pytest.fixture
+    def window(self, qtbot):
+        from stamp.ui.main_window import MainWindow
+
+        win = MainWindow()
+        win.interactive = False
+        qtbot.addWidget(win)
+        yield win
+        win.rebuilder.shutdown()
+
+    def test_the_run_happens_on_a_worker_and_the_report_comes_back(
+        self, window, qtbot, fixtures, tmp_path
+    ):
+        import csv as csv_module
+
+        from stamp.core.document import Document as Doc
+        from stamp.io import project as project_io
+        from stamp.io.part_import import import_part
+
+        template = tmp_path / "template.stamp"
+        project_io.save(
+            Doc(base=import_part(fixtures / "bracket.step").part, name="template"),
+            template,
+        )
+        csv_path = tmp_path / "rows.csv"
+        with csv_path.open("w", newline="", encoding="utf-8") as handle:
+            writer = csv_module.DictWriter(handle, ["input", "output"])
+            writer.writeheader()
+            writer.writerow({"input": str(fixtures / "bracket.step"), "output": "one"})
+        out = tmp_path / "out"
+        out.mkdir()
+
+        gui_thread = window.thread()
+        ran_on = []
+        import stamp.ui.main_window as mw
+
+        real = mw.run_batch
+
+        def spy(*args, **kwargs):
+            from PySide6.QtCore import QThread
+
+            ran_on.append(QThread.currentThread())
+            return real(*args, **kwargs)
+
+        monkeyed = mw.run_batch
+        mw.run_batch = spy
+        try:
+            problems = []
+            window._on_batch_failed = problems.append
+            thread = window.start_batch(str(template), str(csv_path), str(out), "step")
+            qtbot.waitUntil(
+                lambda: bool(window._batch_report is not None or problems), timeout=60000
+            )
+            assert not problems, problems
+            thread.wait(5000)
+            assert window._batch_report is not None
+        finally:
+            mw.run_batch = monkeyed
+
+        assert ran_on and ran_on[0] is not gui_thread, "the batch blocked the window"
+        assert (out / "stamp-batch-report.json").exists()
+        assert (out / "one.step").exists()
+        assert not window._batch_report.stopped
+
+    def test_the_output_folder_is_chosen_before_the_dry_run(
+        self, window, monkeypatch, tmp_path
+    ):
+        """From the batch fixer: simulate_batch checks output containment against
+        the folder, so asking afterwards let the dry run pass rows the real run
+        refused."""
+        from PySide6.QtWidgets import QFileDialog, QInputDialog
+
+        order = []
+        monkeypatch.setattr(
+            QFileDialog, "getOpenFileName",
+            staticmethod(lambda *a, **k: (str(tmp_path / "t.stamp"), "")),
+        )
+        monkeypatch.setattr(
+            QFileDialog, "getExistingDirectory",
+            staticmethod(lambda *a, **k: order.append("folder") or str(tmp_path)),
+        )
+        monkeypatch.setattr(
+            QInputDialog, "getItem", staticmethod(lambda *a, **k: ("step", True))
+        )
+
+        def fake_simulate(template, csv_path, fmt, output_dir=None):
+            order.append(("simulate", output_dir))
+            raise BatchErrorForTest()
+
+        class BatchErrorForTest(Exception):
+            pass
+
+        import stamp.ui.main_window as mw
+
+        monkeypatch.setattr(mw, "BatchError", BatchErrorForTest)
+        monkeypatch.setattr(mw, "simulate_batch", fake_simulate)
+        window.batch_stamp()
+
+        assert order[0] == "folder"
+        assert order[1] == ("simulate", str(tmp_path))
+
+
+class TestTheUnitAnswerForAmbiguousArtwork:
+    """The unit prompt for an SVG or DXF with no physical size took an answer and
+    threw it away: whatever unit was picked, the artwork stayed at the 96 dpi
+    reading the dialog had just complained about."""
+
+    @pytest.fixture
+    def window(self, qtbot, fixtures):
+        from stamp.ui.main_window import MainWindow
+
+        win = MainWindow()
+        # Not interactive: _ask then takes the stub dialog's default without
+        # showing anything, which is the seam these tests need.
+        win.interactive = False
+        qtbot.addWidget(win)
+        win.open_part(fixtures / "bracket.step")
+        yield win
+        win.rebuilder.shutdown()
+
+    def test_the_artwork_is_rescaled_to_the_answer(
+        self, window, fixtures, monkeypatch
+    ):
+        from stamp.ui import dialogs
+
+        class InchesDialog:
+            def __init__(self, *args, **kwargs) -> None:
+                pass
+
+            def scale(self):
+                return 25.4
+
+            def unit(self):
+                return "in"
+
+        monkeypatch.setattr(dialogs, "UnitPromptDialog", InchesDialog)
+        window.add_profile(fixtures / "no_units.dxf")
+
+        ref = window._pending_profile
+        assert ref is not None
+        assert ref.unit_scale == 25.4
+        native = ref.native_size_mm
+        assert native[0] > 0 and native[1] > 0
+
+        plain = window.profiles.get(ref)
+        assert plain.width == pytest.approx(native[0])
+
+    def test_the_import_options_reach_the_reference(self, window, fixtures):
+        """close_open_loops was carried; join tolerance, unit scale and the
+        background flag were dropped, so the cache key did not describe the
+        import that filled it."""
+        window.add_profile(fixtures / "logo.svg")
+        ref = window._pending_profile
+        assert ref is not None
+        assert ref.join_tolerance > 0
+        assert ref.unit_scale == 1.0
+        assert ref.keep_background is False
+
+
+class TestTheDraftFieldOnAWrap:
+    """W6.  The geometry refuses a draft on a cylindrical wrap - the walls of a
+    wrap are radial - so a field that can only produce an error row is switched
+    off with the reason on it."""
+
+    @pytest.fixture
+    def panel(self, qtbot):
+        from stamp.ui.properties import PropertiesPanel
+
+        widget = PropertiesPanel()
+        qtbot.addWidget(widget)
+        return widget
+
+    def _shown(self, panel, surface: str, mode):
+        from stamp.core.document import Anchor, AnchorKind, FaceRef
+
+        feature = a_feature()
+        feature.placement.mode = mode
+        feature.placement.anchor = Anchor(
+            kind=AnchorKind.FACE,
+            face_ref=FaceRef(
+                point=(0.0, 0.0, 0.0), normal=(0.0, 0.0, 1.0), surface_type=surface
+            ),
+            plane=feature.placement.anchor.plane,
+        )
+        document = Document()
+        document.add_feature(feature)
+        panel.show_feature(document, feature, (36.0, 16.0))
+        return feature
+
+    def test_a_wrap_on_a_cylinder_disables_it(self, panel):
+        from stamp.core.document import PlacementMode
+
+        self._shown(panel, "cylinder", PlacementMode.WRAP)
+        assert not panel.draft_field.isEnabled()
+        assert "radial" in panel.draft_field.toolTip()
+
+    def test_a_wrap_on_a_cone_keeps_it(self, panel):
+        from stamp.core.document import PlacementMode
+
+        self._shown(panel, "cone", PlacementMode.WRAP)
+        assert panel.draft_field.isEnabled()
+
+    def test_flat_placement_on_a_cylinder_keeps_it(self, panel):
+        from stamp.core.document import PlacementMode
+
+        self._shown(panel, "cylinder", PlacementMode.PLANAR)
+        assert panel.draft_field.isEnabled()
+
+    def test_switching_to_a_wrap_switches_it_off(self, panel):
+        from stamp.core.document import PlacementMode
+
+        self._shown(panel, "cylinder", PlacementMode.PLANAR)
+        panel.placement_mode.setCurrentIndex(
+            panel.placement_mode.findData(PlacementMode.WRAP)
+        )
+        assert not panel.draft_field.isEnabled()
+
+
+class TestTheReReviewFixes:
+    """A second pass over the same window, on defects the first one left."""
+
+    @pytest.fixture
+    def window(self, qtbot):
+        from stamp.ui.main_window import MainWindow
+
+        win = MainWindow()
+        win.interactive = False
+        qtbot.addWidget(win)
+        yield win
+        win.rebuilder.shutdown()
+
+    # ------------------------------------------------------ a running batch
+
+    def test_closing_is_refused_while_a_batch_runs(self, window, qtbot):
+        """Item 2: run_batch blocks its thread end to end, so quit() was ignored
+        and Qt aborted the process over a QThread destroyed while running."""
+        from PySide6.QtGui import QCloseEvent
+
+        class Running:
+            def isRunning(self):  # noqa: N802
+                return True
+
+        window._batch_thread = Running()
+        event = QCloseEvent()
+        window.closeEvent(event)
+        try:
+            assert not event.isAccepted()
+            assert "batch is still running" in window.statusBar().currentMessage()
+        finally:
+            window._batch_thread = None
+
+    def test_the_batch_progress_dialog_ignores_escape(self, window, qtbot):
+        from stamp.ui.main_window import _BatchProgressDialog
+
+        dialog = _BatchProgressDialog(window)
+        qtbot.addWidget(dialog)
+        dialog.show()
+        dialog.reject()
+        assert dialog.isVisible(), "Esc must not dismiss a running batch"
+        dialog.force_close()
+        assert not dialog.isVisible()
+
+    # ------------------------------------------------- the relinked base path
+
+    def test_replacing_the_part_forgets_the_relinked_base_path(
+        self, window, qtbot, fixtures
+    ):
+        """Item 3: the path a relink found for the OLD part was still the one a
+        save archived and a redo reloaded from."""
+        window.open_part(fixtures / "bracket.step")
+        qtbot.waitUntil(lambda: window._last_result is not None, timeout=20000)
+        window._base_path = str(fixtures / "bracket.step")
+
+        window.replace_part(fixtures / "bracket_rev_b.step")
+        assert window._base_path is None
+
+    def test_replacing_the_part_does_not_ask_about_closing(
+        self, window, qtbot, fixtures, monkeypatch
+    ):
+        """Item 8: nothing closes and the swap is on the undo stack, so the
+        "Close without saving?" question was both wrong and unnecessary."""
+        window.open_part(fixtures / "bracket.step")
+        qtbot.waitUntil(lambda: window._last_result is not None, timeout=20000)
+        window._dirty = True
+
+        asked = []
+        monkeypatch.setattr(window, "_confirm", lambda *a: asked.append(a) or True)
+        window.replace_part(fixtures / "bracket_rev_b.step")
+        assert not asked
+
+    # ------------------------------------------------------------- a relink
+
+    def test_relinking_only_the_base_still_rebuilds(
+        self, window, qtbot, fixtures, monkeypatch
+    ):
+        """Item 9: with no missing profiles the relink returned early, leaving
+        the old part's geometry cached and the title saying it was saved."""
+        window.open_part(fixtures / "bracket.step")
+        qtbot.waitUntil(lambda: window._last_result is not None, timeout=20000)
+        window._dirty = False
+        window.document.base.source_path = str(fixtures / "gone.step")
+
+        monkeypatch.setattr(
+            window, "_find_missing_base", lambda original: fixtures / "bracket_rev_b.step"
+        )
+        invalidated = []
+        monkeypatch.setattr(
+            window.engine, "invalidate", lambda: invalidated.append(1)
+        )
+        rebuilt = []
+        monkeypatch.setattr(
+            window, "request_rebuild", lambda **k: rebuilt.append(k)
+        )
+
+        window.relink_sources()
+
+        assert invalidated, "the cached geometry is the old file's"
+        assert rebuilt
+        assert window._dirty
+
+    # -------------------------------------------- a rebuild that never landed
+
+    def test_an_unfinished_rebuild_is_not_current(self, window, qtbot, fixtures):
+        """Item 6: busy and pending are both clear after a cancel or a failure
+        too, so the check passed on the shape from before the edit."""
+        window.open_part(fixtures / "bracket.step")
+        qtbot.waitUntil(lambda: window._last_result is not None, timeout=20000)
+        qtbot.waitUntil(
+            lambda: not window.rebuilder.busy and not window.rebuilder.pending,
+            timeout=20000,
+        )
+        assert window._result_is_current()
+
+        # What a cancelled rebuild leaves: nothing running, an old result.
+        window._result_stale = True
+        assert not window._result_is_current()
+        assert "did not finish" in window.statusBar().currentMessage()
+
+    def test_a_finished_rebuild_clears_the_stale_flag(self, window, qtbot, fixtures):
+        window.open_part(fixtures / "bracket.step")
+        qtbot.waitUntil(lambda: window._last_result is not None, timeout=20000)
+        assert not window._result_stale
+        window.request_rebuild(immediate=True)
+        qtbot.waitUntil(lambda: not window._result_stale, timeout=20000)
+
+    # -------------------------------------------------- fit to a curved face
+
+    def test_fitting_to_a_round_face_does_not_collapse_the_artwork(
+        self, window, qtbot
+    ):
+        """Item 1: a face bounded by a full circle has one seam vertex, so the
+        old vertex-only measurement returned (0, 0) and scaled the profile to
+        nothing - with an undo entry and a degenerate rebuild behind it."""
+        from OCP.BRepPrimAPI import BRepPrimAPI_MakeCylinder
+
+        from stamp.core.document import BasePart, Document
+        from stamp.core.refs import faces_of, make_face_ref, plane_from_face, surface_kind
+
+        shape = BRepPrimAPI_MakeCylinder(10.0, 30.0).Shape()
+        flat = [f for f in faces_of(shape) if surface_kind(f) == "plane"]
+        assert flat
+        from stamp.core.refs import face_center
+
+        face = flat[0]
+        point = face_center(face)
+        plane, _ = plane_from_face(face, point)
+
+        window.document = Document(base=BasePart(mode="solid", runtime=shape))
+        feature = a_feature()
+        feature.placement.anchor = Anchor(
+            kind=AnchorKind.FACE, face_ref=make_face_ref(face, point), plane=plane
+        )
+        window.document.add_feature(feature)
+
+        size = window._anchor_face_size(feature)
+        assert size is not None
+        assert size == pytest.approx((20.0, 20.0), abs=1e-6)
+
+
+class TestDraggingKeepsTheSelection:
+    """Item 7: an InternalMove takes the row out and puts a new one back, which
+    deselects it, so the panel dropped to the base part on the next rebuild."""
+
+    def test_the_moved_feature_is_selected_again(
+        self, qtbot, bracket_step, monkeypatch
+    ):
+        from PySide6.QtWidgets import QAbstractItemView, QTreeWidget
+
+        from stamp.ui.feature_tree import FeatureTree
+
+        tree = FeatureTree()
+        qtbot.addWidget(tree)
+        document = Document(base=bracket_step)
+        first, second = a_feature("First"), a_feature("Second")
+        document.add_feature(first)
+        document.add_feature(second)
+        tree.set_document(document)
+        tree.select_feature(second.id)
+
+        def rearrange(self, event):
+            """What QTreeWidget's own drop does: take the row out, put it back."""
+            self.insertTopLevelItem(1, self.takeTopLevelItem(2))
+
+        monkeypatch.setattr(QTreeWidget, "dropEvent", rearrange)
+        monkeypatch.setattr(
+            FeatureTree, "dropIndicatorPosition",
+            lambda self: QAbstractItemView.DropIndicatorPosition.AboveItem,
+        )
+        tree.dropEvent(object())
+
+        assert tree.selected_feature_id() == second.id

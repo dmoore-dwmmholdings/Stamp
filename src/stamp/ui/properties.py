@@ -959,10 +959,10 @@ class PropertiesPanel(QScrollArea):
         self.depth_field.set_silently(operation.depth)
         self.direction.setCurrentIndex(self.direction.findData(operation.direction))
         self.draft_field.set_silently(operation.draft_angle)
-        self._updating = False
 
-        self._sync_depth_widgets()
-        self.lift_field.setEnabled(placement.mode is PlacementMode.PLANAR)
+        # Inside the _updating window: setChecked and setValue both emit, and
+        # _set_pattern_enabled answers by replacing the feature's pattern with a
+        # default one - an edit, an undo entry and a rebuild, from selecting a row.
         pattern = feature.pattern
         self.pattern_enabled.setChecked(pattern is not None)
         if pattern:
@@ -972,6 +972,11 @@ class PropertiesPanel(QScrollArea):
             self.pattern_center_u.set_silently(pattern.center[0])
             self.pattern_center_v.set_silently(pattern.center[1])
             self.pattern_axis.set_silently(pattern.axis_angle)
+        self._updating = False
+
+        self._sync_depth_widgets()
+        self._sync_draft_field()
+        self.lift_field.setEnabled(placement.mode is PlacementMode.PLANAR)
         for widget in (
             self.pattern_kind, self.pattern_count, self.pattern_spacing,
             self.pattern_center_u, self.pattern_center_v, self.pattern_axis,
@@ -979,6 +984,27 @@ class PropertiesPanel(QScrollArea):
             widget.setEnabled(pattern is not None)
         self._mesh_mode = mesh_mode
         self._fill_modifiers(feature, mesh_mode=mesh_mode)
+
+    def _sync_draft_field(self) -> None:
+        """A wrap on a cylinder has radial walls, so a draft angle has nowhere to go.
+
+        The geometry refuses it outright (see build_tool_solid), and a field that
+        can only produce an error row is better switched off with the reason on it.
+        """
+        feature = self._feature
+        face_ref = feature.placement.anchor.face_ref if feature is not None else None
+        wrapped = (
+            feature is not None
+            and PlacementMode(self.placement_mode.currentData()) is PlacementMode.WRAP
+            and face_ref is not None
+            and face_ref.surface_type == "cylinder"
+        )
+        self.draft_field.setEnabled(not wrapped)
+        self.draft_field.setToolTip(
+            "The walls of a wrap on a cylinder are radial, so there is no "
+            "direction left for a draft. Flat placement, or a cone, takes one."
+            if wrapped else ""
+        )
 
     def _sync_depth_widgets(self) -> None:
         stamp = self.stamp_radio.isChecked()
@@ -1227,6 +1253,7 @@ class PropertiesPanel(QScrollArea):
             self._feature.placement.lift = 0.0
             self.lift_field.set_silently(0.0)
         self.lift_field.setEnabled(mode is PlacementMode.PLANAR)
+        self._sync_draft_field()
         self._emit("surface mode")
 
     def _set_pattern_enabled(self, enabled: bool) -> None:
@@ -1342,6 +1369,7 @@ class PropertiesPanel(QScrollArea):
             return
         self._feature.placement.uniform_scale = on
         self.lock_button.setText("🔒" if on else "🔓")
+        self._emit("lock")
 
     def _set_kind(self, _checked: bool) -> None:
         """One handler for all three radios: a toggle fires twice, off then on."""

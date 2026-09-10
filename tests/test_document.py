@@ -132,6 +132,60 @@ class TestUndo:
         assert len(stack._undo) == 5
 
 
+class TestAdoptingTheGeometry:
+    """§4.4: the geometry is never in the file, so it is re-attached by hand.
+
+    Every round trip through JSON - the undo stack, the copy the rebuild worker
+    sends across the thread boundary, opening a project - drops it, and getting
+    it back onto the right record is not as simple as assigning ``runtime``.
+    """
+
+    def test_it_takes_the_geometry_of_the_same_part(self, bracket_step):
+        from stamp.core.document import BasePart
+
+        copy = BasePart.from_dict(bracket_step.to_dict())
+        assert copy.runtime is None
+        assert copy.adopt_runtime(bracket_step) is True
+        assert copy.runtime is bracket_step.runtime
+
+    def test_it_refuses_the_geometry_of_a_different_part(self, bracket_step, bracket_stl):
+        """A mesh is not the solid it was printed from, whatever the record says."""
+        from stamp.core.document import BasePart
+
+        copy = BasePart.from_dict(bracket_step.to_dict())
+        assert copy.adopt_runtime(bracket_stl) is False
+        assert copy.runtime is None
+
+    def test_undo_across_a_replaced_part_does_not_take_the_new_geometry(
+        self, bracket_step, fixtures
+    ):
+        """The record restored is the old part's; the geometry in hand is the new.
+
+        Attaching it anyway left the document describing one part and holding
+        another - old source path, old bounding box, new shape.
+        """
+        from stamp.core.replace_part import replace_part
+        from stamp.io.part_import import import_part
+
+        doc = Document(base=bracket_step)
+        before = doc.snapshot()
+        rev_b = import_part(fixtures / "bracket_rev_b.step").part
+        replace_part(doc, rev_b)
+
+        doc.restore(before)
+
+        assert doc.base.source_hash == bracket_step.source_hash
+        assert doc.base.runtime is not rev_b.runtime
+        assert doc.base.runtime is None, "it needs reloading, not the wrong geometry"
+
+    def test_undoing_an_ordinary_edit_still_keeps_the_geometry(self, bracket_step):
+        doc = Document(base=bracket_step)
+        before = doc.snapshot()
+        doc.add_feature(a_feature())
+        doc.restore(before)
+        assert doc.base.runtime is bracket_step.runtime
+
+
 class TestReferences:
     def test_a_face_ref_resolves_to_the_same_face(self, bracket_step):
         from stamp.core.refs import face_center, faces_of, make_face_ref, resolve_face_ref
@@ -261,6 +315,142 @@ class TestProjectFile:
         bogus.write_bytes(b"not a zip at all")
         with pytest.raises(project.ProjectError):
             project.open_project(bogus)
+
+
+class TestTheImportRepairIsRemembered:
+    """§5.5: a repair the user accepted changes the artwork, so the file keeps it.
+
+    "Close open loops" bridged the gaps in a DXF that would not otherwise build.
+    The project recorded the file and the other import options but not that one,
+    so re-importing on the next open - or on a duplicate, or in a batch - came
+    back blocked, and a feature that was fine when it was saved was broken when
+    it was reopened.
+    """
+
+    def test_it_survives_the_project_file(self, fixtures):
+        ref = ProfileRef(source_path=str(fixtures / "open_loop.dxf"),
+                         source_hash="abc123", close_open_loops=True)
+        assert ProfileRef.from_dict(ref.to_dict()).close_open_loops is True
+
+    def test_an_older_project_reads_as_no_repair(self):
+        """Which is what those files were imported with, so nothing changes."""
+        old = ProfileRef.from_dict({"source_path": "logo.svg", "source_hash": "abc123"})
+        assert old.close_open_loops is False
+
+    def test_it_is_part_of_the_cache_key(self):
+        """Otherwise the repaired profile and the broken one share a slot."""
+        plain = ProfileRef(source_path="a.dxf", source_hash="abc123")
+        repaired = ProfileRef(source_path="a.dxf", source_hash="abc123",
+                              close_open_loops=True)
+        assert plain.cache_key != repaired.cache_key
+
+    def test_the_reimported_profile_is_usable_again(self, fixtures):
+        from stamp.core.profiles import ProfileCache
+        from stamp.io.profile_import import ImportOptions, import_profile
+
+        path = fixtures / "open_loop.dxf"
+        repaired = import_profile(path, ImportOptions(close_open_loops=True))
+        assert not repaired.profile.blocked, "the repair itself has to work"
+
+        ref = ProfileRef(source_path=str(path), source_hash=repaired.source_hash,
+                         close_open_loops=True)
+        reopened = ProfileRef.from_dict(ref.to_dict())
+        assert not ProfileCache().get(reopened).blocked
+
+    def test_without_it_the_same_file_comes_back_blocked(self, fixtures):
+        """The state the bug left every reopened project in."""
+        from stamp.core.profiles import ProfileCache
+        from stamp.io.normalize import IssueKind
+
+        path = fixtures / "open_loop.dxf"
+        ref = ProfileRef(source_path=str(path), source_hash="abc123")
+        profile = ProfileCache().get(ref)
+        assert profile.blocked
+        assert any(i.kind is IssueKind.OPEN_LOOP for i in profile.issues)
+
+
+class TestTheProfileCacheIsBounded:
+    """Every keystroke in the text box is a new key (§5.5)."""
+
+    def test_it_does_not_grow_without_end(self):
+        from stamp.core.document import TextSpec
+        from stamp.core.profiles import ProfileCache
+
+        cache = ProfileCache(limit=8)
+        for n in range(50):
+            cache.put(ProfileRef(text=TextSpec(text="a" * n)), object())
+        assert len(cache._cache) == 8
+
+    def test_the_one_being_worked_on_is_the_one_kept(self):
+        """LRU, not "throw the lot away": the live edit must stay a cache hit."""
+        from stamp.core.document import TextSpec
+        from stamp.core.profiles import ProfileCache
+
+        cache = ProfileCache(limit=4)
+        wanted = ProfileRef(text=TextSpec(text="keep me"))
+        cache.put(wanted, "profile")
+        for n in range(3):
+            cache.put(ProfileRef(text=TextSpec(text=f"other {n}")), object())
+            assert cache.get(wanted) == "profile"
+        cache.put(ProfileRef(text=TextSpec(text="one more")), object())
+        assert cache.get(wanted) == "profile"
+
+
+class TestManufacturingWarnings:
+    """The guidance has to be worth reading, so it must not cry wolf."""
+
+    def test_a_through_cut_is_not_judged_on_a_depth_it_ignores(self):
+        from stamp.core.document import DepthMode
+        from stamp.core.inspection import inspect_feature
+
+        feature = a_feature()
+        feature.modifiers = []
+        feature.operation = Operation(kind=OperationKind.CUT,
+                                      depth_mode=DepthMode.THROUGH_ALL, depth=0.01)
+        assert inspect_feature(Document(), feature) == []
+
+    def test_nor_is_a_cut_to_a_face(self):
+        from stamp.core.document import DepthMode
+        from stamp.core.inspection import inspect_feature
+
+        feature = a_feature()
+        feature.modifiers = []
+        feature.operation = Operation(kind=OperationKind.CUT,
+                                      depth_mode=DepthMode.TO_FACE, depth=0.01)
+        assert inspect_feature(Document(), feature) == []
+
+    def test_a_blind_cut_still_is(self):
+        from stamp.core.document import DepthMode
+        from stamp.core.inspection import inspect_feature
+
+        feature = a_feature()
+        feature.modifiers = []
+        feature.operation = Operation(kind=OperationKind.CUT,
+                                      depth_mode=DepthMode.BLIND, depth=0.01)
+        warnings = inspect_feature(Document(), feature)
+        assert len(warnings) == 1
+        assert "manufacturing limit" in warnings[0]
+
+    def test_a_small_fillet_is_reported_once(self):
+        """Below the limit is also below one and a half times it, which said so twice."""
+        from stamp.core.inspection import inspect_feature
+
+        feature = a_feature()
+        feature.operation = Operation(kind=OperationKind.CUT, depth=1.0)
+        feature.modifiers = [Modifier(kind=ModifierKind.FILLET, value=0.05)]
+        warnings = inspect_feature(Document(), feature)
+        assert len(warnings) == 1
+        assert "detail limit" in warnings[0]
+
+    def test_a_marginal_fillet_still_gets_the_softer_note(self):
+        from stamp.core.inspection import inspect_feature
+
+        feature = a_feature()
+        feature.operation = Operation(kind=OperationKind.CUT, depth=1.0)
+        feature.modifiers = [Modifier(kind=ModifierKind.FILLET, value=0.25)]
+        warnings = inspect_feature(Document(), feature)
+        assert len(warnings) == 1
+        assert "cutter radius" in warnings[0]
 
 
 class TestDiagnostics:

@@ -17,7 +17,9 @@ Stamp is a desktop app that puts 2D artwork onto 3D parts as real geometry — n
 decal, not a texture.
 
 You bring a 3D part (STEP or STL) and a 2D profile (SVG, DXF, or DWG): a logo, a
-serial number, a slot pattern, a keep-out shape. Stamp turns that profile into
+serial number, a slot pattern, a keep-out shape. DWG needs the free ODA File
+Converter installed alongside Stamp — Stamp converts the file to DXF through it
+and offers the download and a file picker when it cannot find it. Stamp turns that profile into
 geometry on the part — raised, engraved, or cut clean through, with fillets or
 chamfers on the edges if you want them. Drag it into place with the mouse, type
 exact numbers where it matters, then export STEP for the machine shop and STL for
@@ -117,9 +119,13 @@ wherever the focus is.
 ## Wrap and patterns
 
 On a solid STEP/BREP part, select a feature and choose **Wrap cylinder/cone** in
-the placement panel to make its profile follow a cylindrical or conical face.
-Stamp refuses mesh parts, other curved surfaces, and artwork that crosses the
-face seam rather than making approximate geometry.
+the placement panel to make its profile follow a cylindrical or conical face. On
+a cylinder it is a true wrap: the artwork keeps its drawn arc length as it rolls
+onto the surface and its walls run out along the radii, which is also why a draft
+angle is not available there. On a cone it is a projection instead, and Stamp
+refuses artwork wider than about 1.4 times the face's smallest radius rather
+than smearing it around the taper. Mesh parts, other curved surfaces, and
+artwork that crosses the face seam are refused too.
 
 The same panel also turns a seed feature into an editable linear, circular, or
 mirror pattern. The pattern remains one feature-tree item: edit its text,
@@ -127,8 +133,10 @@ profile, or operation once and every generated instance rebuilds.
 
 ## Mirroring and scaling the part
 
-**Part → Mirror left to right** makes the exported file the other hand of the
-part. Nothing in the project moves: the mirror is applied on the way out, so the
+**Part → Mirror left to right (YZ)**, **Mirror front to back (XZ)** and **Mirror
+top to bottom (XY)** each make the exported file the other hand of the part.
+One at a time: picking a second replaces the first, and picking the one already
+on turns it off. Nothing in the project moves: the mirror is applied on the way out, so the
 artwork stays where you put it, face picking still works, and turning the mirror
 off gives the original back exactly. Export once with it off and once with it on
 and you have the pair — the suggested filename carries `-mirrored`, so the second
@@ -160,7 +168,7 @@ What to know before you send the file:
 No artwork file? Type it instead.
 
 1. Open a part.
-2. Press Ctrl+T, or click "+ Add text".
+2. Press Ctrl+T, or click "Add text".
 3. Click the face the text belongs on.
 4. Type your text in the properties panel.
 5. Pick the font, size, and formatting.
@@ -176,7 +184,7 @@ file to lose.
 
 ## QR and Data Matrix
 
-Choose **+ Add code** to create an editable QR or Data Matrix mark directly in
+Choose **Add code** to create an editable QR or Data Matrix mark directly in
 Stamp.  The code is vector geometry: module size, operation, depth, placement,
 patterns, and modifiers work exactly as they do for imported artwork.  In a batch
 template, code payloads accept `{{column}}` substitutions just like text, making
@@ -341,8 +349,11 @@ never pretends one is the other.
 
 | Input | Boolean engine | Blend into the part | Export |
 |---|---|---|---|
-| STEP, IGES, BREP | OpenCascade | Yes | STEP and STL |
-| STL, 3MF, OBJ | manifold3d | No | STL only |
+| STEP, IGES, BREP | OpenCascade | Yes | STEP, STL, 3MF, quote, proof, job package |
+| STL, 3MF, OBJ, PLY, OFF | manifold3d | No | STL, 3MF, quote, proof, job package |
+
+STEP is the only export a mesh part cannot produce: there are no exact surfaces
+to write into it. Everything else works from either kind.
 
 The tool solid is always a B-rep in both modes, which is why a fillet on the top
 edge of a raised logo works even on an STL part. Blending into the surrounding
@@ -397,6 +408,12 @@ panel if you want something else. The preview shows the same colours, so you can
 see where the artwork lands while you move it.
 
 ## Updates
+
+Update checking is switched off in every build shipped so far: no release key
+has been generated yet, and Stamp will not read a manifest it cannot prove came
+from us. **Help → Check for updates** says so rather than looking. Generating the
+key is one command — see "Signing releases, once" below — and everything in this
+section starts working the moment a release carries it.
 
 Stamp can tell you when there is a newer version. It asks the first time it
 starts whether that is alright, and reads one small file from github.com at most
@@ -478,11 +495,20 @@ has to exist before the update feed does. Generate one:
 uv run python packaging/make_release_key.py
 ```
 
-It prints two halves and saves neither. Paste the public half into
+It prints the public half and saves neither. Paste that half into
 `RELEASE_PUBLIC_KEY` in `src/stamp/update.py` and commit it; put the private
 half in the `STAMP_RELEASE_KEY` repository secret (Settings → Secrets and
-variables → Actions). The release workflow then writes and signs `latest.json`
-after the installers are built, and attaches it to the release.
+variables → Actions). The private half is shown only at a terminal you are
+sitting at — piped or redirected it goes nowhere, since a key in a log is a key
+that has been published. To hand it over any other way, write it to a file and
+delete the file afterwards:
+
+```
+uv run python packaging/make_release_key.py --private-key-out stamp-release.key
+```
+
+The release workflow then writes and signs `latest.json` after the installers
+are built, and attaches it to the release.
 
 Without the secret the workflow skips the feed with a warning and everything
 else still builds — nobody is offered the release automatically, which is the
@@ -495,14 +521,20 @@ anyone holding it can publish something Stamp will install.
 uv run pytest
 ```
 
-Sixteen of the tests build a real window and two of those build the OpenCascade
-viewport, so a local run puts windows on your screen and takes focus while it
-goes. Qt's `offscreen` platform is not a way round it: the viewport tests hang on
-it, because OpenCascade needs a genuine GL surface, and its empty font database
-breaks the text tests as well.
+Many of the tests build a real window, so a local run puts windows on your screen
+and takes focus while it goes.
 
-To run them without a desktop, run them in the container, which gives them an
-Xvfb display and Mesa's software renderer of their own:
+```
+QT_QPA_PLATFORM=offscreen uv run pytest
+```
+
+runs the whole suite without touching the screen, which is what CI does. The 68
+tests that need a genuine GL surface skip themselves there — 66 in
+`tests/test_ui.py` and the two acceptance tests — because OpenCascade's viewport
+needs a real one. Everything else, the text tests included, runs offscreen.
+
+To run those 68 as well without a desktop, run the suite in the container, which
+gives it an Xvfb display and Mesa's software renderer of its own:
 
 ```
 docker/test.sh                    # the whole suite
@@ -532,9 +564,36 @@ uv run ruff check src tests
 uv run python tests/make_fixtures.py
 ```
 
-Every push runs lint and the test suite on Windows and Linux via GitHub Actions
-(`.github/workflows/ci.yml`). Tests that need a real window and OpenGL are skipped
-there — the runners are headless.
+The fixtures under `tests/fixtures/` are generated and not in git, but a fresh
+clone does not need `make_fixtures.py`: `conftest.py` generates them the first
+time it finds `bracket.step` missing. Rerun it by hand after pulling changes to
+`make_fixtures.py` itself, since an out-of-date fixture shows up as an error in
+an unrelated-looking test.
+
+Pushes to `main` and pull requests against `main` run lint and the test suite on
+Windows, Linux and macOS via GitHub Actions (`.github/workflows/ci.yml`), under
+`QT_QPA_PLATFORM=offscreen`. The tests that need a real window and OpenGL skip
+themselves there — the runners are headless. The release workflow runs the suite
+too, before it builds any installer.
+
+### Tests that take over the screen
+
+`uv run pytest` does not run the tests marked `opens_email`. There is one, and it
+hands a real `mailto:` to the desktop, which opens a compose window in front of
+whatever you were doing. Nothing is sent, but on a machine you are sitting at it
+is a window to close on every run, so it is deselected in `addopts` rather than
+left to be remembered.
+
+Run it deliberately, on a machine you are away from or in a container:
+
+```
+uv run pytest -m opens_email
+```
+
+What that test covers beyond the default suite is only the last step — that the
+desktop really accepts the link. Everything up to it, including the `mailto:`
+that gets built and the report file that stands alone when no mail client
+answers, is covered on every ordinary run with the mail client stubbed out.
 
 `PROGRESS.md` tracks milestone status and records the hard-won findings worth
 keeping.
