@@ -390,7 +390,9 @@ sources. Any unzip tool can open one.
 
 A 3MF from a slicer is usually an assembly. Stamp keeps the parts apart: they are
 listed under the part in the tree, each with a tick box. Untick one to hide it,
-or right-click for **Show this part on its own**.
+or right-click for **Show this part on its own**. Each part keeps the name it has
+in Bambu Studio, Orca or PrusaSlicer, and their modifier and negative volumes are
+left out, since they are not geometry.
 
 Click a face and the stamp goes on whichever part you clicked — the tree says how
 many are on each. Only that part is rebuilt, so stamping one bracket of a
