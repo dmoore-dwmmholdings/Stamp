@@ -16,6 +16,9 @@ production extension:
   numbers its objects from its own 1;
 - a component resolves to exactly the object it names, in the file it names,
   or the file it is written in when it names none;
+- a build item or component that names no file names its own, and a child
+  file's unit is ignored - its numbers are in the root's unit, as lib3mf reads
+  them;
 - transforms compose down the tree, build item outermost;
 - every build item is one body, however many components it is made of.
 
@@ -43,6 +46,13 @@ _NOT_A_BODY = {"support", "other"}
 #: Components nest.  Deeper than this is a loop the id check did not catch.
 _MAX_DEPTH = 64
 
+#: Decompressed size allowed for one part, and for the whole package.  A ZIP
+#: entry can expand a thousandfold, and its header's size can lie, so the read
+#: stops at the limit rather than trusting it.  A gigabyte of model XML is about
+#: ten million triangles.
+MAX_PART_BYTES = 1 << 30
+MAX_PACKAGE_BYTES = 2 << 30
+
 
 class ThreeMFError(ValueError):
     """The package does not describe geometry Stamp can place."""
@@ -62,8 +72,8 @@ class _Object:
 class _Model:
     unit: str
     objects: dict[str, _Object]
-    #: (object id, 4x4 transform) per build item.
-    build: list[tuple[str, np.ndarray]]
+    #: (model part, object id, 4x4 transform) per build item.
+    build: list[tuple[str, str, np.ndarray]]
 
 
 def load_3mf(path: str | Path):
@@ -88,13 +98,14 @@ def load_3mf(path: str | Path):
         scene = trimesh.Scene()
         scene.metadata["units"] = root.unit
         used: dict[str, int] = {}
-        for object_id, transform in root.build:
-            vertices, triangles = reader.flatten(
-                reader.root_path(), object_id, transform, settings
-            )
+        root_path = reader.root_path()
+        for part, object_id, transform in root.build:
+            vertices, triangles = reader.flatten(part, object_id, transform, settings)
             if not len(triangles):
                 continue
-            base = settings.names.get(object_id) or root.objects[object_id].name
+            # The slicer config numbers the root model's objects, not a child's.
+            named = settings.names.get(object_id) if part == root_path else None
+            base = named or reader.model(part).objects[object_id].name
             used[base] = used.get(base, 0) + 1
             name = base if used[base] == 1 else f"{base} ({used[base]})"
             mesh = trimesh.Trimesh(vertices=vertices, faces=triangles, process=True)
@@ -112,10 +123,22 @@ class _Package:
         # Part names are case-insensitive in OPC, and exporters disagree on case.
         self.names = {info.filename.lower(): info.filename for info in archive.infolist()}
         self.models: dict[str, _Model] = {}
+        self.budget = MAX_PACKAGE_BYTES
 
     def read(self, part: str) -> bytes | None:
         real = self.names.get(part.lstrip("/").lower())
-        return None if real is None else self.archive.read(real)
+        if real is None:
+            return None
+        limit = min(MAX_PART_BYTES, self.budget)
+        with self.archive.open(real) as stream:
+            data = stream.read(limit + 1)
+        if len(data) > limit:
+            raise ThreeMFError(
+                f"{real} expands to more than {limit // (1 << 20)} MB, which is more "
+                "than Stamp will read from one 3MF."
+            )
+        self.budget -= len(data)
+        return data
 
     def root_path(self) -> str:
         rels = self.read("_rels/.rels")
@@ -204,9 +227,11 @@ def _read_model(root, part: str) -> _Model:
     build = []
     for element in root.iterfind("{*}build/{*}item"):
         object_id = element.get("objectid")
-        if object_id not in objects:
+        target = _attribute(element, "path")
+        target = _normal(target) if target else part
+        if target == part and object_id not in objects:
             raise ThreeMFError(f"The build places object {object_id}, which {part} does not define.")
-        build.append((object_id, _transform(element.get("transform"))))
+        build.append((target, object_id, _transform(element.get("transform"))))
     return _Model(unit=root.get("unit") or "millimeter", objects=objects, build=build)
 
 

@@ -52,6 +52,16 @@ def translate(x=0.0, y=0.0, z=0.0, scale=1.0, mirror_x=False) -> str:
     return f"{sx} 0 0 0 {scale} 0 0 0 {scale} {x} {y} {z}"
 
 
+CONTENT_TYPES = (
+    '<?xml version="1.0" encoding="UTF-8"?>\n'
+    '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+    '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
+    '<Default Extension="model" ContentType="application/vnd.ms-package.3dmanufacturing-3dmodel+xml"/>'
+    '<Default Extension="config" ContentType="text/xml"/>'
+    "</Types>"
+)
+
+
 def write_package(path, parts: dict[str, str], root="3D/3dmodel.model"):
     rels = (
         '<?xml version="1.0" encoding="UTF-8"?>\n'
@@ -61,9 +71,26 @@ def write_package(path, parts: dict[str, str], root="3D/3dmodel.model"):
         "</Relationships>"
     )
     with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("[Content_Types].xml", CONTENT_TYPES)
         archive.writestr("_rels/.rels", rels)
         for name, text in parts.items():
             archive.writestr(name, text)
+        # The root model's own relationships name the other model parts, as a
+        # slicer writes them - lib3mf will not follow a path without one.
+        others = [n for n in parts if n.endswith(".model") and n != root]
+        if others:
+            targets = "".join(
+                f'<Relationship Target="/{n}" Id="rel{i + 1}"'
+                ' Type="http://schemas.microsoft.com/3dmanufacturing/2013/01/3dmodel"/>'
+                for i, n in enumerate(others)
+            )
+            folder, _, leaf = root.rpartition("/")
+            archive.writestr(
+                f"{folder}/_rels/{leaf}.rels",
+                '<?xml version="1.0" encoding="UTF-8"?>\n<Relationships'
+                ' xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+                f"{targets}</Relationships>",
+            )
     return path
 
 
@@ -279,3 +306,67 @@ class TestSlicerParts:
             ),
         })
         assert [m.metadata["name"] for m in bodies(path)] == ["Clip", "Clip (2)"]
+
+
+class TestProductionPaths:
+    def test_a_build_item_can_place_an_object_from_another_file(self, tmp_path):
+        path = write_package(tmp_path / "itempath.3mf", {
+            "3D/3dmodel.model": model_xml(
+                "", f'<item objectid="1" p:path="/3D/Objects/c.model" transform="{translate(x=5)}"/>'
+            ),
+            "3D/Objects/c.model": model_xml(f'<object id="1" name="Knob">{mesh_xml()}</object>'),
+        })
+        (mesh,) = bodies(path)
+        assert mesh.volume == pytest.approx(1000.0)
+        assert mesh.bounds[0][0] == pytest.approx(5.0)
+        assert mesh.metadata["name"] == "Knob"
+
+    def test_a_child_files_unit_is_ignored(self, tmp_path):
+        """lib3mf reads a child's numbers in the root's unit, so Stamp does too.
+
+        Checked against lib3mf 2.5: a 10-unit cube in a child marked inch, under a
+        millimetre root, measures 10 mm.
+        """
+        path = write_package(tmp_path / "units.3mf", {
+            "3D/3dmodel.model": model_xml(
+                '<object id="2"><components>'
+                '<component p:path="/3D/Objects/c.model" objectid="1"/>'
+                "</components></object>",
+                '<item objectid="2"/>',
+            ),
+            "3D/Objects/c.model": model_xml(f'<object id="1">{mesh_xml()}</object>', unit="inch"),
+        })
+        scene = load_3mf(path)
+        (mesh,) = scene.dump()
+        assert scene.metadata["units"] == "millimeter"
+        np.testing.assert_allclose(mesh.bounds, [[0, 0, 0], [10, 10, 10]])
+
+
+class TestDecompressionLimit:
+    def test_a_part_that_expands_past_the_limit_is_refused(self, tmp_path, monkeypatch):
+        from stamp.io import threemf_import
+
+        monkeypatch.setattr(threemf_import, "MAX_PART_BYTES", 1024)
+        big = mesh_xml(verts=CUBE_VERTS * 40, tris=CUBE_TRIS)
+        path = write_package(tmp_path / "bomb.3mf", {
+            "3D/3dmodel.model": model_xml(f'<object id="1">{big}</object>', '<item objectid="1"/>'),
+        })
+        with pytest.raises(ThreeMFError, match="more than"):
+            load_3mf(path)
+
+    def test_the_whole_package_shares_one_budget(self, tmp_path, monkeypatch):
+        from stamp.io import threemf_import
+
+        root = model_xml(
+            '<object id="2"><components>'
+            '<component p:path="/3D/Objects/c.model" objectid="1"/>'
+            "</components></object>",
+            '<item objectid="2"/>',
+        )
+        child = model_xml(f'<object id="1">{mesh_xml()}</object>')
+        monkeypatch.setattr(threemf_import, "MAX_PACKAGE_BYTES", len(root) + len(child) // 2)
+        path = write_package(tmp_path / "budget.3mf", {
+            "3D/3dmodel.model": root, "3D/Objects/c.model": child,
+        })
+        with pytest.raises(ThreeMFError, match="more than"):
+            load_3mf(path)
