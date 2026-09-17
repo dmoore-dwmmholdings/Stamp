@@ -819,6 +819,31 @@ plane, measured only its vertices, so a round face fitted the artwork to zero.
 bounding box there. That one is here as a reminder that a fix needs the same
 review as the bug.
 
+## v1.6.2 - 3MF files from slicers
+
+A Bambu Studio project that Bambu Studio opened as closed solids came into
+Stamp as open meshes. Bambu and Orca put each object in its own file under
+`3D/Objects` and point at it from a component. trimesh's 3MF reader re-reads
+that file every time a component names it, so a cylinder placed six times was
+six stacked copies in each of the six places. Merging their vertices left every
+edge on twelve faces, and nothing was watertight. The same reader also merges
+every object in a file into one, ignores which object a component names, and
+cannot tell a part from the modifier volume inside it.
+
+Stamp now reads 3MF itself, in `stamp.io.threemf_import`. Objects are keyed by
+file and id, since every model file numbers from 1. A component resolves to
+the one object it names, transforms compose with the build item outermost, a
+mirroring transform turns the winding with it, and each build item is one body.
+The slicer's config supplies the names people gave their objects and marks the
+parts that are not geometry: Bambu/Orca `subtype` other than `normal_part`, and
+PrusaSlicer volume ranges other than `ModelPart`. A component that names a
+missing object, or a loop, is refused by name.
+
+On the file that showed it, the result matches lib3mf body for body - triangle
+counts and bounding boxes - and the import takes 0.9 s instead of 9.4 s. The
+tests build each shape of object tree by hand, since the file itself is not
+ours to commit.
+
 ## What a release is allowed to publish
 
 A signed feed is only worth the care taken over what gets signed, and four ways

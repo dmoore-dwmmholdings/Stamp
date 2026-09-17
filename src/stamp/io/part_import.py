@@ -29,6 +29,7 @@ from OCP.TopTools import TopTools_IndexedMapOfShape
 
 from stamp.core.document import BasePart, PartBody
 from stamp.io.profile_import import file_hash
+from stamp.io.threemf_import import load_3mf
 from stamp.units import MM_PER_INCH
 
 SOLID_EXTS = {".step", ".stp", ".iges", ".igs", ".brep", ".brp"}
@@ -368,7 +369,12 @@ def import_mesh(
         # before Stamp ever sees it, and a 3MF from a slicer is nearly always an
         # assembly - a base, a lid, four copies of a clip.  The scene is kept and
         # its parts named; the working mesh is still the whole thing.
-        loaded = trimesh.load(str(path), process=True)
+        if path.suffix.lower() == ".3mf":
+            # Not trimesh's reader: it stacks a copy of a shared object for every
+            # component that points at it.  See stamp.io.threemf_import.
+            loaded = load_3mf(path)
+        else:
+            loaded = trimesh.load(str(path), process=True)
     except ModuleNotFoundError as exc:
         # trimesh defers its per-format dependencies, thus a format it lists can
         # still fail here.  Say which package is absent, not "no module named".
