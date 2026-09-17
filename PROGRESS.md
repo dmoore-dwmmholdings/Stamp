@@ -835,7 +835,7 @@ file and id, since every model file numbers from 1. A component resolves to
 the one object it names, transforms compose with the build item outermost, a
 mirroring transform turns the winding with it, and each build item is one body.
 The slicer's config supplies the names people gave their objects and marks the
-parts that are not geometry: Bambu/Orca `subtype` other than `normal_part`, and
+parts that are not printable on their own: Bambu/Orca `subtype` other than `normal_part`, and
 PrusaSlicer volume ranges other than `ModelPart`. A component that names a
 missing object, or a loop, is refused by name.
 
@@ -843,6 +843,14 @@ On the file that showed it, the result matches lib3mf body for body - triangle
 counts and bounding boxes - and the import takes 0.9 s instead of 9.4 s. The
 tests build each shape of object tree by hand, since the file itself is not
 ours to commit.
+
+1.6.3 follows a review of that reader. A build item may place an object from
+another model part through `p:path`, and 1.6.2 refused those packages. Every
+part read from the ZIP now stops at 1 GB, and the package at 2 GB, reading
+rather than trusting the header, so a crafted file cannot exhaust memory. The
+review also asked for a child model's `unit` to be applied. lib3mf ignores it,
+reading a child's numbers in the root's unit, so Stamp does the same and a test
+pins it.
 
 ## What a release is allowed to publish
 
