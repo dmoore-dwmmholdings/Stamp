@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from PySide6.QtCore import QSize, Qt
+from PySide6.QtCore import QSize, Qt, Signal
 from PySide6.QtGui import QColor, QIcon, QPainter, QPixmap
 from PySide6.QtWidgets import (
     QCheckBox,
@@ -41,14 +41,17 @@ UNIT_CHOICES = [("Millimetres", "mm"), ("Centimetres", "cm"), ("Inches", "in"),
 
 
 class PresetLibraryDialog(QDialog):
-    """Search the local single-feature library before placing a preset."""
+    """Search the presets Stamp has kept, and place or delete one."""
+
+    #: The preset to forget, as a path.  The window does the deleting, since it
+    #: is the one that can say why a delete failed.
+    preset_deleted = Signal(str)
 
     def __init__(self, presets: list[PresetInfo], parent=None) -> None:
         super().__init__(parent)
-        self.setWindowTitle("Stamp preset library")
+        self.setWindowTitle("Stamp presets")
         self.setMinimumWidth(500)
-        self._presets = presets
-        self.browse_external = False
+        self._presets = list(presets)
 
         layout = QVBoxLayout(self)
         note = QLabel("Search by name or tag, then choose a preset to place on a face.")
@@ -72,16 +75,32 @@ class PresetLibraryDialog(QDialog):
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Open | QDialogButtonBox.StandardButton.Cancel
         )
-        browse = buttons.addButton("Browse file…", QDialogButtonBox.ButtonRole.ActionRole)
-        browse.clicked.connect(self._browse)
+        self.delete_button = buttons.addButton(
+            "Delete", QDialogButtonBox.ButtonRole.DestructiveRole
+        )
+        self.delete_button.clicked.connect(self._delete_selected)
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
         self._filter()
 
-    def _browse(self) -> None:
-        self.browse_external = True
-        self.reject()
+    def _delete_selected(self) -> None:
+        info = self._selected_info()
+        if info is None:
+            return
+        if not confirm(
+            self, "Delete this preset?",
+            f"“{info.name}” will be gone for good. The stamps already placed with "
+            f"it are not touched.",
+        ):
+            return
+        self.preset_deleted.emit(str(info.path))
+        self._presets = [p for p in self._presets if p.path != info.path]
+        self._filter()
+
+    def _selected_info(self) -> PresetInfo | None:
+        path = self.selected_path()
+        return next((p for p in self._presets if p.path == path), None)
 
     @staticmethod
     def _preview(info: PresetInfo) -> QIcon:
@@ -126,6 +145,7 @@ class PresetLibraryDialog(QDialog):
         self.empty.setVisible(self.list.count() == 0)
         if self.list.count():
             self.list.setCurrentRow(0)
+        self.delete_button.setEnabled(self.list.count() > 0)
 
     def selected_path(self) -> Path | None:
         item = self.list.currentItem()
