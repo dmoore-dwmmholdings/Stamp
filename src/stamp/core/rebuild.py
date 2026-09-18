@@ -568,6 +568,9 @@ class RebuildEngine:
                 plane,
                 part_diagonal=document.base.diagonal,
                 to_face_distance=to_face_distance,
+                # A mesh region's plane is fitted, not exact, so the sweep has to
+                # start far enough back to be sure of breaking the surface.
+                fitted_plane=mode == "mesh",
                 target_face=target_face,
             )
         except Exception as exc:

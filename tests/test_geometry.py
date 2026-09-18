@@ -512,6 +512,38 @@ class TestMeshMode:
         assert len(reduced.faces) <= 1000
         assert len(reduced.faces) > 0
 
+    def test_cutting_with_a_part_that_has_a_cavity_in_it(self):
+        """A stamped part carries voids, and a void decomposes to an inverted shell.
+
+        The tool used to be applied one component at a time whatever the
+        components were, so subtracting such a shell - everything *except* the
+        hollow - took the whole thing with it.  Exporting a colour stamp said the
+        boolean had removed everything, and skipped the artwork.
+        """
+        from manifold3d import Manifold
+
+        block = Manifold.cube((20.0, 20.0, 20.0))
+        void = Manifold.cube((4.0, 4.0, 1.0)).translate((8.0, 8.0, 5.0))
+        stamped = block - void
+        assert any(piece.volume() < 0 for piece in stamped.decompose()), (
+            "the fixture has to hold a cavity for this to test anything"
+        )
+
+        body = mesh_ops.boolean(void, stamped, "cut").manifold
+        assert body.volume() == pytest.approx(void.volume(), rel=1e-6)
+
+    def test_a_tool_of_separate_solids_is_still_applied_piece_by_piece(self):
+        """The reason the pieces are walked at all: a union against all of them
+        at once leaves some unmerged."""
+        from manifold3d import Manifold
+
+        block = Manifold.cube((10.0, 10.0, 10.0))
+        pins = Manifold.cube((2.0, 2.0, 2.0)).translate((10.0, 0.0, 0.0)) + (
+            Manifold.cube((2.0, 2.0, 2.0)).translate((10.0, 8.0, 0.0))
+        )
+        result = mesh_ops.boolean(block, pins, "add").manifold
+        assert result.volume() == pytest.approx(1000.0 + 16.0, rel=1e-6)
+
     def test_weld_closes_a_tessellated_box(self):
         from OCP.BRepPrimAPI import BRepPrimAPI_MakeBox
 

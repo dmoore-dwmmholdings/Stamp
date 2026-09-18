@@ -52,6 +52,16 @@ def _stamp_on(document, artwork, part_index, point, plane):
     return feature
 
 
+def _pick_bottom(part, base):
+    """The region a click on the underside of *part* would produce."""
+    mesh = manifold_to_trimesh(base.runtime)
+    return mesh_regions.region_at(
+        np.asarray(mesh.vertices), np.asarray(mesh.faces),
+        (part.center[0], part.center[1], part.bbox[2] - 50.0), (0.0, 0.0, 1.0),
+        tolerance_deg=25.0,
+    )
+
+
 def _pick_top(part, base):
     """The region a click on the top of *part* would produce."""
     mesh = manifold_to_trimesh(base.runtime)
@@ -206,6 +216,52 @@ class TestExportingOnePart:
         # Only the lid: the body sat below z=20 and must not be in here.
         lo, _hi = scene.bounds
         assert lo[2] > 15.0
+
+
+class TestStampingAnUnderside:
+    """A stamp that does not break the surface leaves a void, not a pocket.
+
+    The export then divides the part against a shape that has a cavity in it, and
+    a cavity decomposes to an inverted shell.  Subtracting one of those took the
+    whole part with it, so the colour bodies were dropped and the export said the
+    boolean had removed everything.
+    """
+
+    @pytest.fixture
+    def stamped(self, assembly, fixtures):
+        document = Document(base=assembly)
+        # The body, whose underside is the one facing outward in this assembly:
+        # the lid's own underside sits against the body and cannot be clicked.
+        body = assembly.part_named("body")
+        region = _pick_bottom(body, assembly)
+        _stamp_on(document, fixtures / "two_color.svg", body.index, region.point, region.plane)
+        cache = ProfileCache()
+        return document, RebuildEngine(cache.get).rebuild(document), cache, body
+
+    def test_the_colour_bodies_survive(self, stamped):
+        document, result, cache, _lid = stamped
+        split = color_split.split_for_color(document, result, profiles=cache)
+        assert split.warnings == []
+        assert [b.role for b in split.bodies] == ["base", "feature", "feature"]
+        assert all(b.triangle_count > 0 for b in split.bodies)
+
+    def test_the_bodies_fill_what_the_stamp_took_out(self, stamped):
+        document, result, cache, _lid = stamped
+        split = color_split.split_for_color(document, result, profiles=cache)
+        removed = document.base.runtime.volume() - result.geometry.volume()
+        assert removed > 0.0
+        # The colour bodies are exactly the material the stamp took out, so the
+        # two printed together come back to the part that was opened.
+        bodies = [b for b in split.bodies if b.role == "feature"]
+        assert sum(_volume(b) for b in bodies) == pytest.approx(removed, rel=0.02)
+
+
+def _volume(body) -> float:
+    import trimesh
+
+    return float(
+        trimesh.Trimesh(vertices=body.vertices, faces=body.triangles, process=False).volume
+    )
 
 
 class TestTheGeometrySurvivesACopy:

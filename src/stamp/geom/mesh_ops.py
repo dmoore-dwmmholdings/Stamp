@@ -140,6 +140,14 @@ def boolean(base_manifold, tool_manifold, kind: str) -> MeshBooleanResult:
     five disconnected solids, and a single union against all five at once leaves
     some of them unmerged - the same trap as handing OpenCascade a compound (see
     ``solid_ops._split_compound``).
+
+    Only where every component is a solid, though.  A part that has been stamped
+    already has cavities in it, and ``decompose`` hands a cavity back as its own
+    inverted shell - a piece of negative volume, meaning everything *except* that
+    hollow.  Subtracting one of those on its own takes the whole part with it,
+    which is how exporting a colour stamp placed on an outside face came to
+    report that the boolean had removed everything.  A tool like that is applied
+    whole, which is what it means anyway.
     """
     if kind not in ("add", "cut", "intersect"):
         raise ValueError(f"Unknown boolean kind {kind!r}")
@@ -154,10 +162,12 @@ def boolean(base_manifold, tool_manifold, kind: str) -> MeshBooleanResult:
         return MeshBooleanResult(manifold=result, warnings=warnings)
 
     pieces = tool_manifold.decompose() or [tool_manifold]
+    if any(piece.volume() <= 0.0 for piece in pieces):
+        pieces = [tool_manifold]
     result = base_manifold
     for piece in pieces:
         result = result + piece if kind == "add" else result - piece
-        if result.is_empty():
+        if result.is_empty() and not base_manifold.is_empty():
             raise ValueError(
                 "The boolean removed everything. Check the depth and the direction."
             )
