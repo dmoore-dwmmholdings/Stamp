@@ -6,9 +6,10 @@ full of dimension layers, artwork whose loops will not close.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from pathlib import Path
 
-from PySide6.QtCore import QSize, Qt, Signal
+from PySide6.QtCore import QSize, Qt
 from PySide6.QtGui import QColor, QIcon, QPainter, QPixmap
 from PySide6.QtWidgets import (
     QCheckBox,
@@ -43,15 +44,20 @@ UNIT_CHOICES = [("Millimetres", "mm"), ("Centimetres", "cm"), ("Inches", "in"),
 class PresetLibraryDialog(QDialog):
     """Search the presets Stamp has kept, and place or delete one."""
 
-    #: The preset to forget, as a path.  The window does the deleting, since it
-    #: is the one that can say why a delete failed.
-    preset_deleted = Signal(str)
-
-    def __init__(self, presets: list[PresetInfo], parent=None) -> None:
+    def __init__(
+        self,
+        presets: list[PresetInfo],
+        parent=None,
+        delete: Callable[[str], bool] | None = None,
+    ) -> None:
         super().__init__(parent)
         self.setWindowTitle("Stamp presets")
         self.setMinimumWidth(500)
         self._presets = list(presets)
+        # The window does the deleting, since it is the one that can say why a
+        # delete failed.  It answers whether the preset actually went, so a row
+        # is never taken off a list it would be back on at the next look.
+        self._delete = delete
 
         layout = QVBoxLayout(self)
         note = QLabel("Search by name or tag, then choose a preset to place on a face.")
@@ -88,13 +94,14 @@ class PresetLibraryDialog(QDialog):
         info = self._selected_info()
         if info is None:
             return
-        if not confirm(
+        if self._delete is None or not confirm(
             self, "Delete this preset?",
             f"“{info.name}” will be gone for good. The stamps already placed with "
             f"it are not touched.",
         ):
             return
-        self.preset_deleted.emit(str(info.path))
+        if not self._delete(str(info.path)):
+            return
         self._presets = [p for p in self._presets if p.path != info.path]
         self._filter()
 

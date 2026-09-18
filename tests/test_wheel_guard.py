@@ -141,3 +141,32 @@ class TestThePanelStillScrolls:
 
         assert bar.value() > before
         assert fields[2].value() == pytest.approx(0.0)
+
+    def test_an_inner_area_with_nothing_to_scroll_is_not_the_end_of_it(self, qtbot):
+        """A list that fits its box sits inside panels that do scroll."""
+        from PySide6.QtWidgets import QListWidget
+
+        area = QScrollArea()
+        inner = QWidget()
+        layout = QVBoxLayout(inner)
+        settled = QListWidget()  # scrollable in kind, with nothing to scroll
+        settled.addItem("one")
+        settled.setFixedHeight(200)
+        field = NumberField()
+        QVBoxLayout(settled).addWidget(field)
+        layout.addWidget(settled)
+        for _ in range(40):
+            layout.addWidget(NumberField())
+        area.setWidget(inner)
+        area.setWidgetResizable(True)
+        area.resize(220, 180)
+        qtbot.addWidget(area)
+        area.show()
+        qtbot.waitExposed(area)
+        bar = area.verticalScrollBar()
+        qtbot.waitUntil(lambda: bar.maximum() > 0, timeout=2000)
+        before = bar.value()
+
+        QApplication.sendEvent(field, a_wheel(field))
+
+        assert bar.value() > before

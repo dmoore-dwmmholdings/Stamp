@@ -1956,8 +1956,7 @@ class MainWindow(QMainWindow):
             return
         path = catalog[0].path
         if self.interactive:
-            dialog = dialogs.PresetLibraryDialog(catalog, self)
-            dialog.preset_deleted.connect(self._delete_preset)
+            dialog = dialogs.PresetLibraryDialog(catalog, self, delete=self._delete_preset)
             if dialog.exec() != dialog.DialogCode.Accepted:
                 return
             path = dialog.selected_path()
@@ -1977,13 +1976,16 @@ class MainWindow(QMainWindow):
         self.selection_box.setCurrentIndex(0)
         self.statusBar().showMessage("Click the face for the preset. Press Esc to cancel.")
 
-    def _delete_preset(self, path: str) -> None:
+    def _delete_preset(self, path: str) -> bool:
+        """Forget a preset, and say whether it is really gone."""
         from stamp.io.presets import delete_preset
 
         try:
             delete_preset(path)
         except OSError as exc:
             self._notify("Stamp could not delete the preset", str(exc))
+            return False
+        return True
 
     def pick_alignment_edge(self) -> None:
         if self.document.base is None or self.document.base.mode != "solid" or self.selected_feature is None:

@@ -1604,9 +1604,10 @@ class TestPresetsStampKeeps:
 
         self._placed(window, fixtures)
         window.save_preset()
-        dialog = dialogs.PresetLibraryDialog(presets.list_preset_info())
+        dialog = dialogs.PresetLibraryDialog(
+            presets.list_preset_info(), delete=window._delete_preset
+        )
         qtbot.addWidget(dialog)
-        dialog.preset_deleted.connect(window._delete_preset)
         monkeypatched = dialogs.confirm
         dialogs.confirm = lambda *a, **k: True
         try:
@@ -1616,6 +1617,27 @@ class TestPresetsStampKeeps:
 
         assert presets.list_presets() == []
         assert dialog.list.count() == 0
+
+    def test_a_delete_that_failed_leaves_the_preset_listed(self, window, fixtures, qtbot):
+        """Hiding a row for a file still on disk means it is back at the next look."""
+        from stamp.io import presets
+        from stamp.ui import dialogs
+
+        self._placed(window, fixtures)
+        window.save_preset()
+        dialog = dialogs.PresetLibraryDialog(
+            presets.list_preset_info(), delete=lambda _path: False
+        )
+        qtbot.addWidget(dialog)
+        monkeypatched = dialogs.confirm
+        dialogs.confirm = lambda *a, **k: True
+        try:
+            dialog._delete_selected()
+        finally:
+            dialogs.confirm = monkeypatched
+
+        assert len(presets.list_presets()) == 1
+        assert dialog.list.count() == 1
 
 
 @needs_gl

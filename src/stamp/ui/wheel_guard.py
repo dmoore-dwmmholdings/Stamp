@@ -62,7 +62,8 @@ def _scrollbar_over(widget):
             bar = parent.verticalScrollBar()
             if bar is not None and bar.minimum() != bar.maximum():
                 return bar
-            return None
+            # An inner area with nothing to scroll is not the end of the search:
+            # a panel inside a scrollable panel is still meant to scroll.
         parent = parent.parentWidget()
     return None
 
