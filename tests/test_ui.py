@@ -2235,6 +2235,86 @@ class TestMeshPicking:
         assert not window._last_result.errors
         assert window._last_result.volume < base_volume  # a cut, by default
 
+    def test_the_artwork_stays_on_the_part_when_nothing_is_selected(
+        self, window, qtbot, fixtures
+    ):
+        """Clicking away used to take the artwork off the part.
+
+        The footprint was drawn for the selected feature alone, so any click
+        that dropped the selection also dropped the only sign of where the
+        artwork was.
+        """
+        window.add_profile(fixtures / "logo.svg")
+        self._aim(window, (30.0, 20.0, 8.0))
+        window._on_mesh_picked()
+        self._settle(qtbot, window)
+        feature = window.document.features[0]
+        assert window.viewport.has(f"footprint:{feature.id}")
+
+        window.tree.clearSelection()
+        window._on_feature_selected("")
+        self._settle(qtbot, window)
+        assert window.selected_feature is None
+        assert window.viewport.has(f"footprint:{feature.id}")
+
+    def test_every_placed_feature_is_drawn_not_only_the_selected_one(
+        self, window, qtbot, fixtures
+    ):
+        for point in ((25.0, 20.0, 8.0), (45.0, 20.0, 8.0)):
+            window.add_profile(fixtures / "logo.svg")
+            self._aim(window, point)
+            window._on_mesh_picked()
+            self._settle(qtbot, window)
+
+        assert len(window.document.features) == 2
+        for feature in window.document.features:
+            assert window.viewport.has(f"footprint:{feature.id}")
+
+    def test_the_artwork_is_drawn_in_front_of_the_face_it_sits_on(
+        self, window, qtbot, fixtures
+    ):
+        """A mesh part gets no depth offset of its own, so the artwork needs one.
+
+        Without it the two share a depth exactly and the artwork came and went
+        as the view turned.
+        """
+        window.add_profile(fixtures / "logo.svg")
+        self._aim(window, (30.0, 20.0, 8.0))
+        window._on_mesh_picked()
+        self._settle(qtbot, window)
+
+        feature = window.document.features[0]
+        assert window.viewport.is_overlay(f"footprint:{feature.id}")
+        assert window.viewport.is_overlay("preview")
+
+    def test_the_export_view_takes_the_overlays_off(self, window, qtbot, fixtures):
+        """"Show the export" draws a mirrored, scaled part the overlays do not follow."""
+        window.add_profile(fixtures / "logo.svg")
+        self._aim(window, (30.0, 20.0, 8.0))
+        window._on_mesh_picked()
+        self._settle(qtbot, window)
+        feature = window.document.features[0]
+
+        window.set_show_transformed(True)
+        assert not window.viewport.has(f"footprint:{feature.id}")
+        assert not window.viewport.has("preview")
+        window.set_show_transformed(False)
+        assert window.viewport.has(f"footprint:{feature.id}")
+
+    def test_turning_the_preview_off_takes_the_artwork_off(
+        self, window, qtbot, fixtures
+    ):
+        window.add_profile(fixtures / "logo.svg")
+        self._aim(window, (30.0, 20.0, 8.0))
+        window._on_mesh_picked()
+        self._settle(qtbot, window)
+        feature = window.document.features[0]
+
+        window.set_preview_visible(False)
+        assert not window.viewport.has(f"footprint:{feature.id}")
+        window.set_preview_visible(True)
+        assert window.viewport.has(f"footprint:{feature.id}")
+
     def test_the_anchor_survives_a_save_and_reopen(
         self, window, qtbot, fixtures, tmp_path
     ):

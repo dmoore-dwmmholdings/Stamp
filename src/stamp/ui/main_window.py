@@ -3108,36 +3108,48 @@ class MainWindow(QMainWindow):
         )
 
     def _show_preview(self) -> None:
-        """The translucent tool solid, green for add and red for cut (§6.3)."""
+        """Every placed feature's artwork, and the selected one's tool solid.
+
+        The artwork used to be drawn for the selected feature alone, so clicking
+        anywhere else took it off the part: the thing a user is placing kept
+        vanishing for no reason they could see.  Every enabled feature draws its
+        own footprint now; only the selected one also gets the translucent solid
+        that says how deep it goes (§6.3).
+        """
         self.viewport.erase(PREVIEW_KEY, update=False)
-        self.viewport.erase(FOOTPRINT_KEY, update=False)
         for key in self._component_footprint_keys:
             self.viewport.erase(key, update=False)
         self._component_footprint_keys.clear()
         self._show_inspection_overlay(update=False)
 
         feature = self.selected_feature
-        if not self._preview_on or feature is None or self._last_result is None:
+        # "Show the export" draws the part mirrored and scaled, and the overlays
+        # are in the document's own space.  Drawn there they would sit beside the
+        # part rather than on it, so while that view is up there are none.
+        if self._show_transformed or not self._preview_on or self._last_result is None:
             self.viewport.context and self.viewport.context.UpdateCurrentViewer()
             return
-        result = self._last_result.result_for(feature.id)
+
+        for placed in self.document.features:
+            if not placed.enabled:
+                continue
+            result = self._last_result.result_for(placed.id)
+            if result is None or result.tool is None:
+                continue
+            self._show_footprint(placed, result)
+
+        result = (
+            self._last_result.result_for(feature.id) if feature is not None else None
+        )
         if result is None or result.tool is None:
             self.viewport.context and self.viewport.context.UpdateCurrentViewer()
             return
 
-        color = {
-            OperationKind.ADD: ADD_COLOR,
-            OperationKind.COLOR: STAMP_COLOR,
-        }.get(feature.operation.kind, CUT_COLOR)
         self.viewport.display_shape(
-            PREVIEW_KEY, result.tool.shape, color=color, transparency=0.65,
-            material=False, selectable=False, update=False,
+            PREVIEW_KEY, result.tool.shape, color=self._feature_color(feature),
+            transparency=0.65, material=False, selectable=False, overlay=True,
+            update=False,
         )
-        if not self._show_component_footprints(feature, result):
-            self.viewport.display_shape(
-                FOOTPRINT_KEY, result.tool.footprint, color=color, transparency=0.25,
-                material=False, selectable=False, update=False,
-            )
         if self.viewport.context:
             self.viewport.context.UpdateCurrentViewer()
         if feature.placement.mode.value == "wrap":
@@ -3145,6 +3157,25 @@ class MainWindow(QMainWindow):
                 "Curved-face proof: the translucent stamp follows the selected cylindrical or conical face.",
                 5000,
             )
+
+    @staticmethod
+    def _feature_color(feature: Feature) -> tuple[float, float, float]:
+        return {
+            OperationKind.ADD: ADD_COLOR,
+            OperationKind.COLOR: STAMP_COLOR,
+        }.get(feature.operation.kind, CUT_COLOR)
+
+    def _show_footprint(self, feature: Feature, result) -> None:
+        """One feature's artwork on the face, in its own colours where it has them."""
+        if self._show_component_footprints(feature, result):
+            return
+        key = f"{FOOTPRINT_KEY}:{feature.id}"
+        self.viewport.display_shape(
+            key, result.tool.footprint, color=self._feature_color(feature),
+            transparency=0.25, material=False, selectable=False, overlay=True,
+            update=False,
+        )
+        self._component_footprint_keys.append(key)
 
     def _show_component_footprints(self, feature: Feature, result) -> bool:
         """Draw the decal in the colours it will print in, one shape per part.
@@ -3175,10 +3206,11 @@ class MainWindow(QMainWindow):
             if rgb is None:
                 continue
             self.viewport.display_shape(
-                f"{FOOTPRINT_KEY}:{key}", shape, color=rgb, transparency=0.15,
-                material=False, selectable=False, update=False,
+                f"{FOOTPRINT_KEY}:{feature.id}:{key}", shape, color=rgb,
+                transparency=0.15, material=False, selectable=False, overlay=True,
+                update=False,
             )
-            self._component_footprint_keys.append(f"{FOOTPRINT_KEY}:{key}")
+            self._component_footprint_keys.append(f"{FOOTPRINT_KEY}:{feature.id}:{key}")
             drawn += 1
         return drawn >= 2
 
@@ -3198,7 +3230,13 @@ class MainWindow(QMainWindow):
         self.viewport.erase(CLEARANCE_KEY, update=False)
         feature = self.selected_feature
         result = self._last_result.result_for(feature.id) if feature and self._last_result else None
-        if not self.action_inspection.isChecked() or feature is None or result is None or result.tool is None:
+        if (
+            self._show_transformed  # the part on screen is not in this space
+            or not self.action_inspection.isChecked()
+            or feature is None
+            or result is None
+            or result.tool is None
+        ):
             if update and self.viewport.context:
                 self.viewport.context.UpdateCurrentViewer()
             return
@@ -3450,6 +3488,7 @@ class MainWindow(QMainWindow):
         self._show_transformed = bool(on)
         if self._last_result is not None and self._last_result.geometry is not None:
             self._display_geometry(self._last_result.geometry, self._last_result.mode)
+        self._show_preview()
         self._refresh_status()
 
     def _after_transform_changed(self) -> None:
@@ -3457,6 +3496,7 @@ class MainWindow(QMainWindow):
         self._refresh_properties()
         if self._last_result is not None and self._last_result.geometry is not None:
             self._display_geometry(self._last_result.geometry, self._last_result.mode)
+        self._show_preview()
         self._refresh_status()
 
     def _refresh_transform_actions(self) -> None:

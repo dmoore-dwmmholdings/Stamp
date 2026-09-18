@@ -439,9 +439,16 @@ class Viewport(QWidget):
         material: bool = True,
         matte: bool = False,
         selectable: bool = True,
+        overlay: bool = False,
         update: bool = True,
     ) -> AIS_Shape | None:
         """Display *shape* under *key*, replacing anything already shown there.
+
+        *overlay* is for something drawn lying on the part - the artwork on the
+        face it is placed on.  It shares that surface's depth exactly, so
+        without help the two fight for the same pixels: the artwork came and
+        went as the view turned, and on a mesh part it mostly lost.  A negative
+        polygon offset pulls it in front and keeps it there.
 
         Returns ``None`` when the viewer could not start, so a dead viewport makes
         the 3D view empty rather than making every later call raise.
@@ -455,7 +462,7 @@ class Viewport(QWidget):
         # a good deal of what the window does - switching selection mode,
         # reselecting a feature, toggling the preview - hands back the very
         # shape already on screen.  Redisplaying that is pure waste.
-        options = (color, transparency, material, matte, selectable)
+        options = (color, transparency, material, matte, selectable, overlay)
         previous = self._shown.get(key)
         if previous is not None and previous[1] == options and shape.IsEqual(previous[0]):
             if update:
@@ -497,6 +504,10 @@ class Viewport(QWidget):
             ais.SetMaterial(
                 Graphic3d_MaterialAspect(Graphic3d_NameOfMaterial_Plastered)
             )
+        if overlay:
+            ais.SetPolygonOffsets(
+                int(Aspect_PolygonOffsetMode.Aspect_POM_Fill), -2.0, -4.0
+            )
         if transparency:
             ais.SetTransparency(transparency)
         self.context.Display(ais, AIS_Shaded, 0, False)
@@ -534,6 +545,15 @@ class Viewport(QWidget):
 
     def has(self, key: str) -> bool:
         return key in self._displayed
+
+    def is_overlay(self, key: str) -> bool:
+        """Whether what is shown under *key* is drawn in front of the part.
+
+        OCC will not read its own polygon offsets back off an ``AIS_Shape``,
+        so what was asked for is recorded here.
+        """
+        shown = self._shown.get(key)
+        return bool(shown and shown[1][-1])
 
     def set_transparency(self, key: str, value: float) -> None:
         ais = self._displayed.get(key)

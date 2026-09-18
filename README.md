@@ -409,6 +409,10 @@ on its own filament slot. Pick different colours per piece in the properties
 panel if you want something else. The preview shows the same colours, so you can
 see where the artwork lands while you move it.
 
+Every mark you have placed is drawn on the part, not only the one you have
+selected, and it is drawn in front of the face it sits on. Turn the preview off
+below the viewport to see the bare result instead.
+
 ## Updates
 
 Update checking is switched off in every build shipped so far: no release key
@@ -557,6 +561,18 @@ docker/shot.sh icons.png --icon-sheet      # every icon, at three sizes
 
 The 3D view comes out black: Xvfb has no compositor, and the picture is taken
 from the widget rather than from the screen.
+
+For a picture of the 3D view itself, `tools/shot.py` opens the window off every
+screen and has OpenCascade dump its own frame buffer. Nothing takes the pointer
+or the keyboard, so it is safe to run while the machine is in use:
+
+```
+uv run python tools/shot.py out.png --part part.step     --profile logo.svg --place 30,20,8 --view top --rotate 25,-35
+```
+
+`--place` is a point on the part; the face under it is the face the artwork goes
+on. Repeat `--rotate` for more angles - `out.png`, `out-2.png`, and so on - which
+is how to tell whether something is visible from every side or only from one.
 
 ## Development
 
