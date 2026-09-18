@@ -164,8 +164,25 @@ def extrusion_length(
     raise ToolSolidError(f"Unknown depth mode {mode!r}.")
 
 
+#: How far a sweep must clear a *fitted* sketch plane, in mm.
+#:
+#: A mesh region's plane is a least-squares fit through triangles, so it can sit
+#: a fraction of a millimetre inside the material - and a cut that starts inside
+#: the material leaves a skin over the artwork instead of breaking the surface.
+#: The part then carries a sealed void: nothing shows in the slicer, nothing
+#: prints, and the colour split has no open pocket to fill.  This is the number
+#: a region is already called "not truly flat" beyond, so a fit worth trusting
+#: at all is covered by it.  The extension is above the surface, in material the
+#: cut discards, so paying it costs nothing.
+FITTED_PLANE_CLEARANCE_MM = 0.05
+
+
 def contact_overlap_for(
-    placement: Placement, operation: Operation, part_diagonal: float
+    placement: Placement,
+    operation: Operation,
+    part_diagonal: float,
+    *,
+    fitted_plane: bool = False,
 ) -> float:
     """How far to start the sweep *behind* the sketch plane, in mm.
 
@@ -187,7 +204,8 @@ def contact_overlap_for(
         return 0.0
     if operation.removes_material and growing_outward:
         return 0.0
-    return max(1e-3, part_diagonal * 1e-5)
+    floor = FITTED_PLANE_CLEARANCE_MM if fitted_plane else 0.0
+    return max(1e-3, part_diagonal * 1e-5, floor)
 
 
 def build_tool_solid(
@@ -199,6 +217,7 @@ def build_tool_solid(
     part_diagonal: float,
     to_face_distance: float | None = None,
     contact_overlap: float | None = None,
+    fitted_plane: bool = False,
     target_face: TopoDS_Face | None = None,
 ) -> ToolSolid:
     """Place the profile on the sketch plane and sweep it into a solid."""
@@ -228,7 +247,9 @@ def build_tool_solid(
 
     start, length = extrusion_length(operation, plane, part_diagonal, to_face_distance)
     overlap = (
-        contact_overlap_for(placement, operation, part_diagonal)
+        contact_overlap_for(
+            placement, operation, part_diagonal, fitted_plane=fitted_plane
+        )
         if contact_overlap is None
         else contact_overlap
     )

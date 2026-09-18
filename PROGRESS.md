@@ -883,6 +883,35 @@ the part mirrored and scaled, while the overlays are in the document's own
 space, so they would have sat beside the part rather than on it. There are none
 while that view is up, and they come back when it is switched off.
 
+## v1.6.5 - a stamp on a mesh that reaches the surface
+
+Reported as a colour 3MF that opened in Bambu Studio with no stamp on it and
+one filament instead of three, after an export warning saying the colour split
+had failed because "the boolean removed everything". One cause, two symptoms,
+and the geometry was wrong before the export ever ran.
+
+A mesh region's sketch plane is a least-squares fit through triangles, so it can
+sit a fraction of a millimetre inside the material. The sweep started a hair
+behind that plane - a hundredth of a millimetre on a part this size - which was
+not far enough to reach back out through the surface. The cut then took its
+material from *under* a skin a few microns thick: a sealed void. Nothing shows
+in a slicer, nothing prints, and there is no open pocket for a colour body to
+fill. A sweep onto a fitted plane now clears it by 0.05 mm, the same distance
+beyond which a region is already called "not truly flat". The extension is above
+the surface, in material the cut discards, so it costs nothing.
+
+That void is also what broke the export. `manifold3d.decompose` hands a cavity
+back as its own inverted shell - a piece of negative volume, meaning everything
+*except* that hollow - and the mesh boolean applies a tool one component at a
+time, so it subtracted one of those on its own and lost the whole part. Hence
+"the boolean removed everything", the artwork skipped, and a file with only the
+base body in it. A tool with a cavity in it is now applied whole, which is what
+it means anyway; separate solids are still applied one at a time, which is why
+that loop exists.
+
+Checked by reading the exported file back with lib3mf: base plus both colour
+bodies, and a colour group holding all three.
+
 ## What a release is allowed to publish
 
 A signed feed is only worth the care taken over what gets signed, and four ways
