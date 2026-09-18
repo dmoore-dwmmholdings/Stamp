@@ -1531,6 +1531,115 @@ class TestRebuildController:
             controller.shutdown()
 
 
+class TestPresetsStampKeeps:
+    """Presets live in Stamp, so neither saving nor placing one asks for a file."""
+
+    @pytest.fixture
+    def window(self, qtbot, tmp_path, monkeypatch):
+        from stamp.io import presets
+        from stamp.ui.main_window import MainWindow
+
+        folder = tmp_path / "library"
+        folder.mkdir()
+        monkeypatch.setattr(presets, "library_dir", lambda: folder)
+        win = MainWindow()
+        win.interactive = False
+        qtbot.addWidget(win)
+        return win
+
+    @pytest.fixture
+    def no_file_dialogs(self, monkeypatch):
+        """Any file dialog at all is the bug these tests are about."""
+        from PySide6.QtWidgets import QFileDialog
+
+        def refuse(*args, **kwargs):
+            raise AssertionError("a preset must not send anyone to a file dialog")
+
+        monkeypatch.setattr(QFileDialog, "getSaveFileName", refuse)
+        monkeypatch.setattr(QFileDialog, "getOpenFileName", refuse)
+
+    def _placed(self, window, fixtures):
+        from stamp.io.part_import import import_part
+        from stamp.io.profile_import import file_hash
+
+        window.document.base = import_part(fixtures / "bracket.step").part
+        feature = a_feature("Lid logo")
+        # A real drawing: a preset carries its artwork, and placing one reads it.
+        feature.profile.source_path = str(fixtures / "logo.svg")
+        feature.profile.source_hash = file_hash(fixtures / "logo.svg")
+        window.document.add_feature(feature)
+        window._refresh_tree()
+        window.tree.select_feature(feature.id)
+        return feature
+
+    def test_saving_keeps_it_by_name(self, window, fixtures, no_file_dialogs):
+        from stamp.io import presets
+
+        self._placed(window, fixtures)
+
+        window.save_preset()
+
+        assert [info.name for info in presets.list_preset_info()] == ["Lid logo"]
+
+    def test_placing_one_takes_it_from_the_library(self, window, fixtures, no_file_dialogs):
+        self._placed(window, fixtures)
+        window.save_preset()
+
+        window.insert_preset()
+
+        assert window._pending_feature_template is not None
+        assert window._pending_feature_template.name == "Lid logo"
+
+    def test_with_nothing_saved_it_says_so(self, window, fixtures, no_file_dialogs):
+        self._placed(window, fixtures)
+
+        window.insert_preset()
+
+        assert "no saved presets" in window.statusBar().currentMessage().lower()
+        assert window._pending_feature_template is None
+
+    def test_deleting_one_from_the_picker_removes_it(self, window, fixtures, qtbot):
+        from stamp.io import presets
+        from stamp.ui import dialogs
+
+        self._placed(window, fixtures)
+        window.save_preset()
+        dialog = dialogs.PresetLibraryDialog(
+            presets.list_preset_info(), delete=window._delete_preset
+        )
+        qtbot.addWidget(dialog)
+        monkeypatched = dialogs.confirm
+        dialogs.confirm = lambda *a, **k: True
+        try:
+            dialog._delete_selected()
+        finally:
+            dialogs.confirm = monkeypatched
+
+        assert presets.list_presets() == []
+        assert dialog.list.count() == 0
+
+    def test_a_delete_that_failed_leaves_the_preset_listed(self, window, fixtures, qtbot):
+        """Hiding a row for a file still on disk means it is back at the next look."""
+        from stamp.io import presets
+        from stamp.ui import dialogs
+
+        self._placed(window, fixtures)
+        window.save_preset()
+        dialog = dialogs.PresetLibraryDialog(
+            presets.list_preset_info(), delete=lambda _path: False
+        )
+        qtbot.addWidget(dialog)
+        monkeypatched = dialogs.confirm
+        dialogs.confirm = lambda *a, **k: True
+        try:
+            dialog._delete_selected()
+        finally:
+            dialogs.confirm = monkeypatched
+
+        assert len(presets.list_presets()) == 1
+        assert dialog.list.count() == 1
+
+
 @needs_gl
 class TestMainWindow:
     @pytest.fixture

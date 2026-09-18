@@ -222,9 +222,20 @@ to create a portable ZIP with the model, self-contained Stamp project, PDF
 production summary, preflight JSON, and thumbnail. Feature metadata — identifier,
 process, material, color, and notes — appears in the summary.
 
-For repeat work, save a selected feature as a **stamp preset** and insert it into
-another project. Presets carry their profile, operation, modifiers, and metadata,
-then prompt you to pick the new host face.
+For repeat work, save a selected feature as a **stamp preset**. Saving asks for a
+name and nothing else: Stamp keeps the preset itself, and **Insert preset** lists
+what you have saved, with a search box and a Delete button. Presets carry their
+profile, operation, modifiers, and metadata, then prompt you to pick the new host
+face.
+
+The presets themselves are ordinary files in Stamp's application data folder, so
+they can be copied to another machine by hand.
+
+## The mouse wheel
+
+The wheel scrolls; it does not edit. A spin box, drop-down or slider answers the
+wheel only once you have clicked into it or tabbed to it, so scrolling down the
+properties panel no longer changes the depth or rotation it passes over.
 
 ## Reference placement
 

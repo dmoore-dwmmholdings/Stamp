@@ -116,7 +116,7 @@ from stamp.io.profile_import import (
     import_profile,
     set_oda_converter,
 )
-from stamp.ui import dialogs
+from stamp.ui import dialogs, wheel_guard
 from stamp.ui.feature_tree import FeatureTree
 from stamp.ui.handles import HandleOverlay
 from stamp.ui.import_worker import ImportCancelled, import_part_for_ui
@@ -230,6 +230,8 @@ class MainWindow(QMainWindow):
         self.setWindowTitle(f"Stamp {__version__}")
         self.resize(1400, 880)
         self.setAcceptDrops(True)
+        # Before anything is built, so every field it makes is covered.
+        wheel_guard.install()
 
         self.document = Document()
         self.profiles = ProfileCache()
@@ -1909,23 +1911,35 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage("Click the face for the code. Press Esc to cancel.")
 
     def save_preset(self) -> None:
+        """Name it and keep it.  Stamp files presets itself (§9.4)."""
         if self.selected_feature is None:
             self._notify("Choose a stamp", "Select a feature in the tree before saving a preset.")
             return
-        from stamp.io.presets import library_dir, save_preset
+        from stamp.io.presets import library_path, save_preset
 
-        suggested = library_dir() / f"{self.selected_feature.name}.stamp-preset"
-        path, _ = QFileDialog.getSaveFileName(
-            self, "Save stamp preset", str(suggested), "Stamp presets (*.stamp-preset)"
-        )
-        if not path:
+        name = self.selected_feature.name
+        if self.interactive:
+            from PySide6.QtWidgets import QInputDialog
+
+            name, chosen = QInputDialog.getText(
+                self, "Save stamp preset", "Name this preset:", text=name
+            )
+            if not chosen or not name.strip():
+                return
+            name = name.strip()
+        target = library_path(name)
+        if target.exists() and not self._confirm(
+            "There is already a preset called that",
+            f"Replace the saved preset “{name}”?",
+        ):
             return
+        feature = self.selected_feature.copy_with_new_id(name)
         try:
-            written = save_preset(self.selected_feature, path)
+            save_preset(feature, target)
         except Exception as exc:
             self._notify("Stamp could not save the preset", str(exc))
             return
-        self._notify("Preset saved", f"Saved {written.name} to the preset library.")
+        self.statusBar().showMessage(f"Saved the preset “{name}”.", 5000)
 
     def insert_preset(self) -> None:
         if self.document.base is None:
@@ -1933,21 +1947,20 @@ class MainWindow(QMainWindow):
         from stamp.io.presets import list_preset_info, load_preset
 
         catalog = list_preset_info()
-        if catalog:
-            dialog = dialogs.PresetLibraryDialog(catalog, self)
-            if dialog.exec() != dialog.DialogCode.Accepted:
-                if not dialog.browse_external:
-                    return
-                path, _ = QFileDialog.getOpenFileName(
-                    self, "Insert stamp preset", self._last_dir("project"), "Stamp presets (*.stamp-preset)"
-                )
-            else:
-                path = dialog.selected_path()
-        else:
-            path, _ = QFileDialog.getOpenFileName(
-                self, "Insert stamp preset", self._last_dir("project"), "Stamp presets (*.stamp-preset)"
+        if not catalog:
+            self._notify(
+                "There are no saved presets",
+                "Select a stamp you have placed and choose Save preset. It is kept "
+                "here, ready to put on the next part.",
             )
-        if path is None or not str(path):
+            return
+        path = catalog[0].path
+        if self.interactive:
+            dialog = dialogs.PresetLibraryDialog(catalog, self, delete=self._delete_preset)
+            if dialog.exec() != dialog.DialogCode.Accepted:
+                return
+            path = dialog.selected_path()
+        if path is None:
             return
         try:
             feature = load_preset(path, Path(self._last_dir("project")) / ".stamp_presets")
@@ -1962,6 +1975,17 @@ class MainWindow(QMainWindow):
         self.viewport.set_selection_mode("face")
         self.selection_box.setCurrentIndex(0)
         self.statusBar().showMessage("Click the face for the preset. Press Esc to cancel.")
+
+    def _delete_preset(self, path: str) -> bool:
+        """Forget a preset, and say whether it is really gone."""
+        from stamp.io.presets import delete_preset
+
+        try:
+            delete_preset(path)
+        except OSError as exc:
+            self._notify("Stamp could not delete the preset", str(exc))
+            return False
+        return True
 
     def pick_alignment_edge(self) -> None:
         if self.document.base is None or self.document.base.mode != "solid" or self.selected_feature is None:

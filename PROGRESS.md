@@ -912,6 +912,29 @@ that loop exists.
 Checked by reading the exported file back with lib3mf: base plus both colour
 bodies, and a colour group holding all three.
 
+## v1.7.0 - presets Stamp keeps, and a wheel that only scrolls
+
+Two things the user asked for after living with the app.
+
+Saving a preset asked where to put the file, and inserting one asked where to
+find it - a filing job for something that only ever went to one place. Saving
+now asks for a name, writes it to the library, and says so in the status bar;
+the picker lists what is there, with search and a Delete button, and never
+offers a file dialog. The archives are still ordinary files in the application
+data folder, so a preset can be carried to another machine by hand. A preset
+placed from the library also keeps its own name rather than arriving as
+"... copy", since the name is the one thing the user chose about it.
+
+The wheel changed whatever the pointer crossed. A spin box, a drop-down and a
+slider all take a wheel they were never given, so scrolling the properties panel
+edited a depth here and a rotation there, silently - "I've been changing things
+automatically far too often". One event filter on the application now holds the
+wheel back from a control that has not been clicked into or tabbed to, which
+covers the panel, the ribbon and every dialog, including ones written later. The
+panel behind the field is scrolled by hand rather than by passing the event on,
+because a scroll area hands a wheel it is given straight back down to the widget
+under the pointer - which is the field that just refused it.
+
 ## What a release is allowed to publish
 
 A signed feed is only worth the care taken over what gets signed, and four ways

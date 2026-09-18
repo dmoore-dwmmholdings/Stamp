@@ -1,4 +1,14 @@
-"""Portable single-feature presets and the per-user preset library."""
+"""Single-feature presets, kept in Stamp's own library.
+
+A preset is somewhere to put a stamp you will want again - the same serial, the
+same logo at the same depth - so saving one asks for a name and nothing else.
+The file it becomes lives in Stamp's application data folder, which is also
+where the picker reads from, because being asked where to put it and then being
+asked to find it again is a filing job nobody wanted.
+
+The format is still a portable archive, so a preset can be copied between
+machines by hand.
+"""
 
 from __future__ import annotations
 
@@ -42,6 +52,22 @@ def _feature_tags(feature: Feature) -> tuple[str, ...]:
     return tuple(dict.fromkeys(tag.replace("_", " ") for tag in tags))
 
 
+def safe_name(name: str) -> str:
+    """*name* as a file name, with what a file system will not take taken out."""
+    cleaned = "".join("-" if ch in '<>:"/\\|?*' else ch for ch in name).strip(" .")
+    return cleaned[:80] or "preset"
+
+
+def library_path(name: str) -> Path:
+    """Where a preset called *name* lives in the library."""
+    return library_dir() / (safe_name(name) + EXTENSION)
+
+
+def delete_preset(path: str | Path) -> None:
+    """Remove a preset from the library.  A preset already gone is not an error."""
+    Path(path).unlink(missing_ok=True)
+
+
 def library_dir() -> Path:
     root = Path(QStandardPaths.writableLocation(QStandardPaths.StandardLocation.AppDataLocation))
     folder = root / "presets"
@@ -76,7 +102,9 @@ def load_preset(path: str | Path, extraction_dir: str | Path) -> Feature:
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_bytes(archive.read(assets[0]))
             feature.profile.source_path = str(target)
-    feature = feature.copy_with_new_id()
+    # Its own name, not "... copy": the name is what the preset was saved as, and
+    # it is what the user will look for in the tree.
+    feature = feature.copy_with_new_id(feature.name)
     # A preset must be placed deliberately on its new part.
     feature.placement.anchor = Anchor()
     return feature
@@ -111,6 +139,7 @@ def list_preset_info() -> list[PresetInfo]:
 
 
 __all__ = [
-    "EXTENSION", "PresetInfo", "library_dir", "list_preset_info", "list_presets", "load_preset",
-    "preset_info", "save_preset",
+    "EXTENSION", "PresetInfo", "delete_preset", "library_dir", "library_path",
+    "list_preset_info", "list_presets", "load_preset", "preset_info", "safe_name",
+    "save_preset",
 ]
