@@ -852,6 +852,32 @@ review also asked for a child model's `unit` to be applied. lib3mf ignores it,
 reading a child's numbers in the root's unit, so Stamp does the same and a test
 pins it.
 
+## v1.6.4 - artwork that stays on the part
+
+Reported as "the profile I place often does not show - sometimes it is there for
+a while and then goes away". Two causes, both in the view rather than the
+geometry: the artwork was being cut all along.
+
+The footprint was drawn for the *selected* feature only, so any click that
+dropped the selection took the artwork off the part. Every enabled feature draws
+its own footprint now, keyed by feature id; the selected one still gets the
+translucent tool solid over it.
+
+The footprint also lies exactly on the face it is placed on, and shares its
+depth. A solid part is pushed back by the polygon offset that its boundary edges
+need, so the artwork won there by luck. A mesh part is drawn without boundary
+edges, gets no offset, and the surface won about half the time - which is why a
+slicer 3MF was the file it failed on, and why turning the view made it come and
+go. Overlays now carry a negative polygon offset of their own and are drawn in
+front whatever they sit on.
+
+`tools/shot.py` came out of chasing it. It builds the window off every screen
+with `WA_ShowWithoutActivating` and dumps the OpenCascade view's own frame
+buffer, so the 3D view can be photographed - from several angles in one run -
+without taking the pointer or the keyboard from whoever is using the machine.
+The container's `docker/shot.sh` grabs the widget instead, which is why the 3D
+view is black there.
+
 ## What a release is allowed to publish
 
 A signed feed is only worth the care taken over what gets signed, and four ways
