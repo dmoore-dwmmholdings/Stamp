@@ -37,7 +37,7 @@ def _pair(text: str) -> tuple[float, float]:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("out", help="where to write the PNG")
-    parser.add_argument("--part", required=True, help="the part file to open")
+    parser.add_argument("--part", help="the part file to open")
     parser.add_argument("--profile", help="artwork to place on it")
     parser.add_argument("--place", type=_point, help="x,y,z on the face to place it on")
     parser.add_argument("--project", help="open a .stamp project instead of placing")
@@ -49,6 +49,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--size", default="1200x800", help="window size, WxH")
     parser.add_argument("--wait", type=float, default=90.0, help="seconds to allow")
     args = parser.parse_args(argv)
+    if bool(args.part) == bool(args.project):
+        parser.error("pass one of --part or --project")
 
     from PySide6.QtCore import Qt
     from PySide6.QtWidgets import QApplication
@@ -97,22 +99,30 @@ def main(argv: list[str] | None = None) -> int:
     shots = [out] + [
         out.with_name(f"{out.stem}-{i + 2}{out.suffix}") for i in range(len(args.rotate))
     ]
-    window.viewport.screenshot(str(shots[0]))
+    # Every shot is checked: a view that never started dumps nothing, and a run
+    # that prints paths to files it did not write is worse than one that fails.
+    written = [window.viewport.screenshot(str(shots[0]))]
     for turn, path in zip(args.rotate, shots[1:], strict=True):
         window.viewport.rotate_by(*turn)
         settle(0.6)
-        window.viewport.screenshot(str(path))
+        written.append(window.viewport.screenshot(str(path)))
 
-    for path in shots:
-        print(path)
-    return 0
+    for ok, path in zip(written, shots, strict=True):
+        print(path if ok else f"{path}: the view could not be dumped")
+    return 0 if all(written) else 1
 
 
 def _place(window, point: tuple[float, float, float]) -> None:
-    """Put the pending artwork on whatever the view shows at *point*."""
-    from PySide6.QtCore import QPoint
+    """Put the pending artwork on whatever the view shows at *point*.
 
-    from stamp.core.refs import face_center, face_normal_at, faces_of, surface_kind
+    The face comes from the viewport's own pick, not from a search for a face
+    whose centre shares the point's height: that is what a click does, so it
+    lands on the face actually facing the camera there - a side face included -
+    rather than on some other face at the same level.
+    """
+    from OCP.TopAbs import TopAbs_ShapeEnum
+    from OCP.TopoDS import TopoDS
+    from PySide6.QtCore import QPoint
 
     view = window.viewport.view
     x, y = view.Convert(*view.Project(*point))
@@ -120,14 +130,13 @@ def _place(window, point: tuple[float, float, float]) -> None:
     if window.document.base is not None and window.document.base.mode == "mesh":
         window._on_mesh_picked()
         return
-    for face in faces_of(window.document.base.runtime):
-        if surface_kind(face) != "plane":
-            continue
-        center = face_center(face)
-        if abs(center[2] - point[2]) < 1e-6 and face_normal_at(face, center)[2] > 0.9:
-            window._create_feature(window._pending_profile, face, point)
-            return
-    raise SystemExit(f"no face to place on at {point}")
+    picked = window.viewport.pick_at(int(x), int(y))
+    if picked is None or picked[0].ShapeType() != TopAbs_ShapeEnum.TopAbs_FACE:
+        raise SystemExit(f"nothing to place on at {point}")
+    shape, where = picked
+    window._create_feature(
+        window._pending_profile, TopoDS.Face_s(shape), (where.X(), where.Y(), where.Z())
+    )
 
 
 if __name__ == "__main__":

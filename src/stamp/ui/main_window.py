@@ -3123,7 +3123,10 @@ class MainWindow(QMainWindow):
         self._show_inspection_overlay(update=False)
 
         feature = self.selected_feature
-        if not self._preview_on or self._last_result is None:
+        # "Show the export" draws the part mirrored and scaled, and the overlays
+        # are in the document's own space.  Drawn there they would sit beside the
+        # part rather than on it, so while that view is up there are none.
+        if self._show_transformed or not self._preview_on or self._last_result is None:
             self.viewport.context and self.viewport.context.UpdateCurrentViewer()
             return
 
@@ -3227,7 +3230,13 @@ class MainWindow(QMainWindow):
         self.viewport.erase(CLEARANCE_KEY, update=False)
         feature = self.selected_feature
         result = self._last_result.result_for(feature.id) if feature and self._last_result else None
-        if not self.action_inspection.isChecked() or feature is None or result is None or result.tool is None:
+        if (
+            self._show_transformed  # the part on screen is not in this space
+            or not self.action_inspection.isChecked()
+            or feature is None
+            or result is None
+            or result.tool is None
+        ):
             if update and self.viewport.context:
                 self.viewport.context.UpdateCurrentViewer()
             return
@@ -3479,6 +3488,7 @@ class MainWindow(QMainWindow):
         self._show_transformed = bool(on)
         if self._last_result is not None and self._last_result.geometry is not None:
             self._display_geometry(self._last_result.geometry, self._last_result.mode)
+        self._show_preview()
         self._refresh_status()
 
     def _after_transform_changed(self) -> None:
@@ -3486,6 +3496,7 @@ class MainWindow(QMainWindow):
         self._refresh_properties()
         if self._last_result is not None and self._last_result.geometry is not None:
             self._display_geometry(self._last_result.geometry, self._last_result.mode)
+        self._show_preview()
         self._refresh_status()
 
     def _refresh_transform_actions(self) -> None:

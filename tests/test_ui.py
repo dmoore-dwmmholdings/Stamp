@@ -2287,6 +2287,20 @@ class TestMeshPicking:
         assert window.viewport.is_overlay(f"footprint:{feature.id}")
         assert window.viewport.is_overlay("preview")
 
+    def test_the_export_view_takes_the_overlays_off(self, window, qtbot, fixtures):
+        """"Show the export" draws a mirrored, scaled part the overlays do not follow."""
+        window.add_profile(fixtures / "logo.svg")
+        self._aim(window, (30.0, 20.0, 8.0))
+        window._on_mesh_picked()
+        self._settle(qtbot, window)
+        feature = window.document.features[0]
+
+        window.set_show_transformed(True)
+        assert not window.viewport.has(f"footprint:{feature.id}")
+        assert not window.viewport.has("preview")
+        window.set_show_transformed(False)
+        assert window.viewport.has(f"footprint:{feature.id}")
+
     def test_turning_the_preview_off_takes_the_artwork_off(
         self, window, qtbot, fixtures
     ):

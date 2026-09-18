@@ -878,6 +878,11 @@ without taking the pointer or the keyboard from whoever is using the machine.
 The container's `docker/shot.sh` grabs the widget instead, which is why the 3D
 view is black there.
 
+A review of that work found one more of the same kind: "Show the export" draws
+the part mirrored and scaled, while the overlays are in the document's own
+space, so they would have sat beside the part rather than on it. There are none
+while that view is up, and they come back when it is switched off.
+
 ## What a release is allowed to publish
 
 A signed feed is only worth the care taken over what gets signed, and four ways
